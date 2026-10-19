@@ -1,9 +1,21 @@
 # 第一级上机验证清单
 
 状态：**待用户上机验证，第二级未开始。**
-适用于第一级验证工具的首次提交及本次文档补充。源码commit以服务器实际 `git rev-parse HEAD` 和结果包manifest为准。
-本次补充只改文档，无需因文档变更额外重复已经完成的硬件测试；当前尚未收到首次硬件测试结果。
+适用于更新为BF16缓存基线后的第一级验证工具。源码commit以服务器实际 `git rev-parse HEAD` 和结果包manifest为准。
+本次修改原生模型case的缓存配置，需验证新的BF16基线；当前尚未收到首次硬件测试结果。
 本级不修改生产推理路径，不启用ReplaySSM。
+
+## 本次基线精度更新
+
+原生AR/MTP的激活、SSM state及卷积缓存均采用BF16：
+`dtype=bfloat16`、`mamba_ssm_cache_dtype=bfloat16`、`mamba_cache_dtype=bfloat16`。
+这与后续Replay checkpoint的存储精度分别记录，不启用论文低精度Replay checkpoint功能。
+旧commit的FP32 SSM结果不能替代本次BF16基线结果。
+
+本次提交上机需以最新commit运行下方TP4/TP8矩阵；逐一核对四个模型case的JSON中
+`engine_kwargs.mamba_ssm_cache_dtype` 与 `engine_kwargs.mamba_cache_dtype` 均为 `bfloat16`，
+并保留加载日志以核对实际缓存配置。若实现拒绝BF16或日志显示强制改写dtype，反馈为本级待修复问题。
+现有gating/L2Norm探针的FP32参考计算不变，它不表示持久SSM缓存为FP32。
 
 ## 本地检查
 
@@ -47,17 +59,17 @@ git status --short
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-tp4-r1 --dry-run
+    --output /tmp/replayssm-level1-bf16-tp4-r1 --dry-run
 
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-tp4-r1
+    --output /tmp/replayssm-level1-bf16-tp4-r1
 
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 8 --runner v1 \
-    --output /tmp/replayssm-level1-tp8-r1
+    --output /tmp/replayssm-level1-bf16-tp8-r1
 ```
 
 脚本失败即停止并保留结果包。先回传失败证据，我们修复本级后再重试；不要把未执行项勾为通过。
@@ -72,10 +84,10 @@ python scripts/replayssm/run_level1.py \
 |---|---|---|---|
 | environment | [ ] | [ ] | 版本、CANN证据、FLA API/加载路径匹配，可见卡数满足TP |
 | operators | [ ] | [ ] | 每张逻辑卡现有gating/L2Norm的eager与参考对齐，修改输入后的图重放对齐 |
-| ar_eager | [ ] | [ ] | 原生AR完成warmup和生成，无异常，输出非空 |
-| ar_graph | [ ] | [ ] | 原生AR生成通过，并在日志或补充证据中确认模型图capture/replay实际发生 |
-| mtp_eager | [ ] | [ ] | 原生MTP生成通过，实际draft计数大于0 |
-| mtp_graph | [ ] | [ ] | MTP生成及draft计数通过，target图执行有证据；本级drafter为eager |
+| ar_eager | [ ] | [ ] | BF16双缓存配置核对，原生AR完成warmup和生成，无异常，输出非空 |
+| ar_graph | [ ] | [ ] | BF16双缓存配置核对，原生AR生成通过，模型图capture/replay有实际证据 |
+| mtp_eager | [ ] | [ ] | BF16双缓存配置核对，原生MTP生成通过，实际draft计数大于0 |
+| mtp_graph | [ ] | [ ] | BF16双缓存配置核对，MTP生成及draft计数通过，target图执行有证据；drafter为eager |
 
 算子自动容差为 `atol=5e-3, rtol=1e-2`，完整模型质量与Replay精度不在本级结论内。
 模型图状态目前记录为 `REQUESTED_NOT_INSTRUMENTED`，仅此字段或capture配置不能作为模型图通过证据。
@@ -84,8 +96,8 @@ python scripts/replayssm/run_level1.py \
 
 ## 回传材料与确认
 
-- [ ] TP4结果包：`/tmp/replayssm-level1-tp4-r1.tar.gz`。
-- [ ] TP8结果包：`/tmp/replayssm-level1-tp8-r1.tar.gz`。
+- [ ] TP4结果包：`/tmp/replayssm-level1-bf16-tp4-r1.tar.gz`。
+- [ ] TP8结果包：`/tmp/replayssm-level1-bf16-tp8-r1.tar.gz`。
 - [ ] 说明模型图实际执行证据所在文件/日志行，或明确标注尚无证据。
 - [ ] 如失败，提供第一个失败case、完整traceback、退出码以及重试前后的环境差异。
 
@@ -96,6 +108,7 @@ python scripts/replayssm/run_level1.py \
 硬件精确型号 / 单卡HBM / TP：
 CANN / torch / torch_npu / Triton-Ascend / FLA：
 模型权重版本 / runner / 参数调整：
+四个模型case的SSM state与Mamba cache dtype核对结果：
 TP4与TP8结果包：
 第一个失败case（若有）：
 AR及MTP target图capture/replay证据（或待确认）：

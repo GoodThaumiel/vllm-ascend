@@ -3,6 +3,11 @@
   "vllm_release": "0.30.0",
   "ascend_branch": "releases/v0.30.0",
   "cann_release": "9.2.0",
+  "native_baseline": {
+    "dtype": "bfloat16",
+    "mamba_cache_dtype": "bfloat16",
+    "mamba_ssm_cache_dtype": "bfloat16"
+  },
   "current_level": 1,
   "user_confirmation": "PENDING",
   "next_level_allowed": false,
@@ -14,5 +19,5 @@
     "5": "NOT_STARTED"
   },
   "dflash": "DEFERRED_UNTIL_MTP_ACCEPTED",
-  "low_precision_ssm": "OUT_OF_SCOPE"
+  "low_precision_replay_checkpoint": "OUT_OF_SCOPE"
 }

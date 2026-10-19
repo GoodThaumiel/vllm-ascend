@@ -3,6 +3,8 @@
 当前交付：**第一级，等待服务器验证与用户确认。第二级尚未开始。**
 
 基线固定为 vLLM 0.30.0 + 本仓 `releases/v0.30.0`、CANN **9.2.0**、910B4、TP4/TP8。
+原生AR/MTP推理显式使用 `dtype=bfloat16`、`mamba_cache_dtype=bfloat16` 和
+`mamba_ssm_cache_dtype=bfloat16`，对应BF16激活、卷积缓存与SSM state。
 本仓分支起点为 `ff97be249d179636c1b538b85115541d2b63ce43`。源码快照、pip版本和实际加载路径都需记录，不能只看版本号。
 
 ## 五级范围
@@ -35,7 +37,8 @@
 - 新增通用Replay计算采用Triton-Ascend，有基础则增量开发；以图模式为目标。
 - recurrent/verify/flush等热点优先考虑AscendC，在匹配FLA源码上增量开发；不以语言保证性能。
 - 复用现有AscendC卷积、prefill及Triton控制kernel，不为了档位纯度重写所有算子。
-- checkpoint FP32，本期不做低精度SSM或双checkpoint精度分离。
+- Replay checkpoint仍按FP32设计，本期不做论文低精度Replay checkpoint或双checkpoint精度分离。
+  原生推理的BF16 SSM/卷积缓存是用户部署基线，与Replay checkpoint档位分别记录。
 
 ## 第一级做什么
 
@@ -43,7 +46,7 @@
 
 1. `environment`：核查包版本、可见NPU数、CANN版本文件、FLA API与实际模块路径。
 2. `operators`：在目标TP对应的每张逻辑卡上检查现有GDN gating和L2Norm；eager与torch参考比较，再capture/replay。capture之后修改静态输入，排除旧输出造成的伪通过。
-3. `ar_eager`：原生AR，FP32 SSM，无Replay。
+3. `ar_eager`：原生AR，BF16 SSM与卷积缓存，无Replay。
 4. `ar_graph`：原生AR，请求 `FULL_DECODE_ONLY`。
 5. `mtp_eager`：原生MTP，默认S=3，检查实际draft计数大于0。
 6. `mtp_graph`：target请求 `FULL_DECODE_ONLY`；drafter保持eager，和本仓Qwen教程一致。
@@ -81,7 +84,7 @@ git rev-parse HEAD
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-tp4 \
+    --output /tmp/replayssm-level1-bf16-tp4 \
     --dry-run
 ```
 
@@ -91,7 +94,7 @@ dry-run不检查硬件、不创建通过报告。确认路径后运行：
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-tp4
+    --output /tmp/replayssm-level1-bf16-tp4
 ```
 
 TP4完成后，在同样环境中运行TP8：
@@ -100,10 +103,11 @@ TP4完成后，在同样环境中运行TP8：
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 8 --runner v1 \
-    --output /tmp/replayssm-level1-tp8
+    --output /tmp/replayssm-level1-bf16-tp8
 ```
 
 仅需使用部分卡时，在启动前按已有部署规范设置可见设备；`--tp`使用进程看到的逻辑卡。
+AR与MTP四个模型case均显式使用BF16 SSM与卷积缓存，结果JSON的 `engine_kwargs` 记录这两个参数。
 默认显存使用比例0.85、上下文4096、batch最多2、生成64 tokens。可用 `--memory-utilization` 降低比例。
 OOM、通信或算子错误应返回失败包，不要不记录地反复修改参数。
 每case默认超时1800秒，可通过 `--timeout` 调整。卡数不足会在环境步骤停止。

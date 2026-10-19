@@ -56,15 +56,20 @@ class AcceptanceGateTests(unittest.TestCase):
             records = cann_versions([info, info, Path(folder) / "missing"])
             self.assertEqual(records, [{"path": str(info.resolve()), "version": "9.2.0_20260930220649"}])
 
-    def test_baseline_never_enables_replay_or_low_precision_state(self):
-        for case in CASES[2:]:
-            kwargs = model_kwargs("/model", 4, case, "v1", 0.85, 3)
-            self.assertEqual(kwargs["mamba_ssm_cache_dtype"], "float32")
-            self.assertNotIn("use_replayssm", kwargs)
-            self.assertFalse(kwargs["enable_prefix_caching"])
-            self.assertEqual(kwargs["enforce_eager"], case.endswith("eager"))
-            if case.startswith("mtp"):
-                self.assertEqual(kwargs["speculative_config"]["method"], "qwen3_5_mtp")
+    def test_native_baseline_uses_explicit_bf16_caches_without_replay(self):
+        for tp in (4, 8):
+            for runner in ("v1", "v2"):
+                for case in CASES[2:]:
+                    with self.subTest(tp=tp, runner=runner, case=case):
+                        kwargs = model_kwargs("/model", tp, case, runner, 0.85, 3)
+                        self.assertEqual(kwargs["dtype"], "bfloat16")
+                        self.assertEqual(kwargs["mamba_cache_dtype"], "bfloat16")
+                        self.assertEqual(kwargs["mamba_ssm_cache_dtype"], "bfloat16")
+                        self.assertNotIn("use_replayssm", kwargs)
+                        self.assertFalse(kwargs["enable_prefix_caching"])
+                        self.assertEqual(kwargs["enforce_eager"], case.endswith("eager"))
+                        if case.startswith("mtp"):
+                            self.assertEqual(kwargs["speculative_config"]["method"], "qwen3_5_mtp")
 
     def test_child_exit_failure_overrides_passed_json(self):
         with tempfile.TemporaryDirectory() as folder:
