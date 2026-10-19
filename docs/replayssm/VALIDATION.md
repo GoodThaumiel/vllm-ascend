@@ -29,7 +29,7 @@
 纯文档修改需标明无需新增硬件测试，当前级别尚未完成的硬件清单仍保留。
 同一级修复先重跑失败项与受影响回归项；跨级推进仍需用户明确确认。
 
-当前清单：[第一级上机验证清单](checklists/LEVEL1.md)。首次代码提交也适用此清单。
+当前清单：[第一级上机验证清单](checklists/LEVEL1.md)。验收以当前commit和清单为准；旧版离线报告保留，不能替代服务验证。
 
 ## 实现档位
 
@@ -42,14 +42,22 @@
 
 ## 第一级做什么
 
-`scripts/replayssm/run_level1.py` 依次启动6个独立子进程，避免同一进程连续装载多个模型导致显存残留：
+`scripts/replayssm/run_level1.py` 依次运行6个独立case。四个模型case均启动独立的 **vllm serve**，
+通过HTTP验证后关闭服务，再运行下一项；环境与单算子探针继续独立执行。
+服务使用当前Python环境调用 `python -m vllm.entrypoints.cli.main serve`，与 `vllm serve` 的console entrypoint一致，
+不使用离线 `LLM.generate` 进行模型验收。
 
 1. `environment`：核查包版本、可见NPU数、CANN版本文件、FLA API与实际模块路径。
 2. `operators`：在目标TP对应的每张逻辑卡上检查现有GDN gating和L2Norm；eager与torch参考比较，再capture/replay。capture之后修改静态输入，排除旧输出造成的伪通过。
 3. `ar_eager`：原生AR，BF16 SSM与卷积缓存，无Replay。
 4. `ar_graph`：原生AR，请求 `FULL_DECODE_ONLY`。
-5. `mtp_eager`：原生MTP，默认S=3，检查实际draft计数大于0。
+5. `mtp_eager`：原生MTP，默认S=3，检查请求前后实际draft计数增量大于0。
 6. `mtp_graph`：target请求 `FULL_DECODE_ONLY`；drafter保持eager，和本仓Qwen教程一致。
+
+每个服务先通过 `/health` 和带本次唯一模型别名的 `/v1/models` 核对，再向 `/v1/completions`
+发送两条合成prompt的预热与正式请求，核对返回token IDs、batch完整性及usage。
+MTP从 `/metrics` 的 `vllm:spec_decode_num_drafts_total` 检查请求后的正增量，最多等待30秒供指标刷新。
+这一级使用非流式completion接口；chat模板、流式接口及生产负载另行验证。
 
 第一级不是Replay实现，也不是精度或性能结论。短文本只证明原生路径能运行；性能数字仅供诊断。
 现有算子图探针不等于完整模型图证明；模型case记录 `REQUESTED_NOT_INSTRUMENTED`，需结合日志确认capture/replay实际发生。
@@ -84,17 +92,17 @@ git rev-parse HEAD
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-bf16-tp4 \
+    --output /tmp/replayssm-level1-serve-bf16-tp4 \
     --dry-run
 ```
 
-dry-run不检查硬件、不创建通过报告。确认路径后运行：
+dry-run会展示worker命令和实际serve命令模板，不检查硬件、不创建通过报告。确认路径后运行：
 
 ```bash
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-bf16-tp4
+    --output /tmp/replayssm-level1-serve-bf16-tp4
 ```
 
 TP4完成后，在同样环境中运行TP8：
@@ -103,7 +111,7 @@ TP4完成后，在同样环境中运行TP8：
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 8 --runner v1 \
-    --output /tmp/replayssm-level1-bf16-tp8
+    --output /tmp/replayssm-level1-serve-bf16-tp8
 ```
 
 仅需使用部分卡时，在启动前按已有部署规范设置可见设备；`--tp`使用进程看到的逻辑卡。
@@ -111,6 +119,11 @@ AR与MTP四个模型case均显式使用BF16 SSM与卷积缓存，结果JSON的 `
 默认显存使用比例0.85、上下文4096、batch最多2、生成64 tokens。可用 `--memory-utilization` 降低比例。
 OOM、通信或算子错误应返回失败包，不要不记录地反复修改参数。
 每case默认超时1800秒，可通过 `--timeout` 调整。卡数不足会在环境步骤停止。
+服务仅绑定 `127.0.0.1`，默认端口18080，端口被占用时拒绝运行；可通过 `--port` 指定空闲端口。
+默认服务就绪超时1200秒（`--startup-timeout`），每个HTTP请求超时180秒（`--request-timeout`），
+外层 `--timeout` 限制整个case，最先触发的超时生效。图编译耗时长时需相应调整并记录。
+完成、失败或外层超时后清理本次worker进程组中的服务/TP子进程；请核对无残留再开始下一轮。
+脚本不会连接已有部署服务，不复用未知服务的健康检查或指标。
 结果目录和同名tar包必须不存在；重试用新目录，保留失败证据。
 
 当前先验证v1路径。若实际商发明确使用v2，可另开结果目录用 `--runner v2` 跑同一矩阵；不将v1通过当作v2通过。
@@ -122,7 +135,9 @@ OOM、通信或算子错误应返回失败包，不要不记录地反复修改�
 - `manifest.json`：源码commit、运行参数和模型路径。
 - `environment.json`：版本、CANN证据、FLA签名和实际加载路径。
 - `operators.json`：各卡现有算子eager/图重放结果。
-- 各模型case的JSON与完整日志；未执行的case不会伪造记录。
+- 各模型case的JSON：包含 `validation_mode=vllm_serve_http`、实际serve命令、engine参数、HTTP耗时和draft增量。
+- `*.server.log` 服务完整日志、`*.request.json` 请求、`*.warmup.json` 与 `*.generation.json` HTTP响应。
+- `*.metrics-before.log`、`*.metrics-after.log` 保存原始Prometheus指标；未执行的case不会伪造记录。
 - 完成或失败后生成的同名 `.tar.gz`，可直接作为反馈包。
 
 返回TP4/TP8的结果包，说明精确910B4型号、单卡HBM、是否实际看到模型capture/replay，以及任何手动环境调整。

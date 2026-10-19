@@ -12,12 +12,13 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from level1_common import CASES, summarize, write_json
+from level1_common import CASES, model_kwargs, serve_command, stop_process_group, summarize, write_json
 
 
 def run_case(command: list[str], output: Path, case: str, timeout: int, env: dict) -> dict:
     report_path = output / f"{case}.json"
     started = time.monotonic()
+    process = None
     try:
         with (output / f"{case}.log").open("w") as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -49,6 +50,9 @@ def run_case(command: list[str], output: Path, case: str, timeout: int, env: dic
         return record
     except OSError as exc:
         return {"case": case, "status": "FAILED", "error": str(exc)}
+    finally:
+        if process is not None:
+            stop_process_group(process.pid)
 
 
 def main() -> int:
@@ -62,10 +66,15 @@ def main() -> int:
     parser.add_argument("--memory-utilization", type=float, default=0.85)
     parser.add_argument("--spec-tokens", type=int, default=3, choices=(1, 3))
     parser.add_argument("--timeout", type=int, default=1800, help="Timeout per isolated case, seconds")
+    parser.add_argument("--port", type=int, default=18080, help="Free loopback port for owned vllm serve processes")
+    parser.add_argument("--startup-timeout", type=int, default=1200, help="Server readiness timeout, seconds")
+    parser.add_argument("--request-timeout", type=int, default=180, help="Timeout per HTTP request, seconds")
     parser.add_argument("--dry-run", action="store_true", help="Print commands only; does not validate hardware")
     args = parser.parse_args()
     if not 0 < args.memory_utilization < 1 or args.timeout <= 0:
         parser.error("memory-utilization must be in (0, 1) and timeout must be positive")
+    if not 1 <= args.port <= 65535 or args.startup_timeout <= 0 or args.request_timeout <= 0:
+        parser.error("port must be in [1, 65535] and HTTP timeouts must be positive")
     model = args.model.expanduser().resolve()
     if not (model / "config.json").is_file():
         parser.error("model must be a local directory containing config.json")
@@ -95,11 +104,29 @@ def main() -> int:
             str(args.memory_utilization),
             "--spec-tokens",
             str(args.spec_tokens),
+            "--port",
+            str(args.port),
+            "--startup-timeout",
+            str(args.startup_timeout),
+            "--request-timeout",
+            str(args.request_timeout),
         ]
         for case in CASES
     }
+    serve_commands = {
+        case: serve_command(
+            model_kwargs(str(model), args.tp, case, args.runner, args.memory_utilization, args.spec_tokens),
+            args.port,
+            f"replayssm-level1-{case}-UNIQUE_PER_RUN",
+        )
+        for case in CASES[2:]
+    }
     if args.dry_run:
-        print(json.dumps({"status": "DRY_RUN_NOT_VALIDATED", "commands": commands}, indent=2))
+        print(
+            json.dumps(
+                {"status": "DRY_RUN_NOT_VALIDATED", "commands": commands, "serve_commands": serve_commands}, indent=2
+            )
+        )
         return 0
     output.mkdir(parents=True, exist_ok=False)
     repo = Path(__file__).resolve().parents[2]
@@ -117,7 +144,9 @@ def main() -> int:
         "tp": args.tp,
         "runner": args.runner,
         "cann_required": "9.2.0",
+        "model_validation_mode": "vllm_serve_http",
         "commands": commands,
+        "serve_command_templates": serve_commands,
     }
     write_json(output / "manifest.json", manifest)
     env = os.environ.copy()

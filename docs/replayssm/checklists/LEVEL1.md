@@ -1,8 +1,8 @@
 # 第一级上机验证清单
 
 状态：**待用户上机验证，第二级未开始。**
-适用于更新为BF16缓存基线后的第一级验证工具。源码commit以服务器实际 `git rev-parse HEAD` 和结果包manifest为准。
-本次修改原生模型case的缓存配置，需验证新的BF16基线；当前尚未收到首次硬件测试结果。
+适用于 **vllm serve + HTTP** 方式的BF16基线验证。源码commit以服务器实际 `git rev-parse HEAD` 和结果包manifest为准。
+本次将原生模型case从离线LLM接口切换为独立serve服务，需重新验证服务启动、请求和指标；当前尚未收到首次硬件测试结果。
 本级不修改生产推理路径，不启用ReplaySSM。
 
 ## 本次基线精度更新
@@ -10,7 +10,7 @@
 原生AR/MTP的激活、SSM state及卷积缓存均采用BF16：
 `dtype=bfloat16`、`mamba_ssm_cache_dtype=bfloat16`、`mamba_cache_dtype=bfloat16`。
 这与后续Replay checkpoint的存储精度分别记录，不启用论文低精度Replay checkpoint功能。
-旧commit的FP32 SSM结果不能替代本次BF16基线结果。
+旧commit的FP32 SSM结果及离线LLM报告不能替代本次BF16服务基线结果。
 
 本次提交上机需以最新commit运行下方TP4/TP8矩阵；逐一核对四个模型case的JSON中
 `engine_kwargs.mamba_ssm_cache_dtype` 与 `engine_kwargs.mamba_cache_dtype` 均为 `bfloat16`，
@@ -29,9 +29,12 @@
 git diff --check
 ```
 
-CPU测试覆盖报告完整性、版本门槛、失败/超时处理、dry-run与人工确认门槛；不覆盖NPU算子、通信、模型精度或性能。
+CPU测试覆盖报告完整性、版本门槛、失败/超时处理、dry-run与人工确认门槛，
+并以本地假服务测试真实回环HTTP、服务就绪、请求错误、端口冲突、进程清理及MTP计数增量。
+假服务只验证工具，不覆盖真实vllm serve、NPU算子、通信、模型精度或性能。
 
-本次本地执行结果：13个CPU测试通过；compileall、Ruff检查与格式检查、`git diff --check`通过。
+本次本地执行结果：28个CPU测试、compileall、Ruff检查与格式检查、`git diff --check`通过。
+需要允许本机监听127.0.0.1临时端口才能运行HTTP测试；开发方已在允许回环端口的环境运行通过。
 仓库全量入口 `bash format.sh ci` 已尝试，但本机缺少 `pre-commit`，未完成全量hook检查，不记为通过。
 所有NPU检查尚未运行。
 
@@ -43,6 +46,7 @@ CPU测试覆盖报告完整性、版本门槛、失败/超时处理、dry-run与
 - [ ] source实际CANN **9.2.0** 的环境脚本，记录torch/torch_npu、Triton-Ascend、FLA版本。
 - [ ] 准备本地Qwen3.6-27B权重及其原生MTP配置；记录权重版本和config，不下载或改写模型。
 - [ ] TP4与TP8顺序执行，分别确保4/8张可用卡；输出目录和同名tar包必须尚不存在。
+- [ ] 本机回环端口18080空闲，或通过 `--port` 改为空闲端口；验证脚本自行启动和停止服务。
 
 具体软件版本与安装限制见[验证流程](../VALIDATION.md)。依赖不匹配时返回证据，先修复第一级环境。
 
@@ -59,22 +63,60 @@ git status --short
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-bf16-tp4-r1 --dry-run
+    --output /tmp/replayssm-level1-serve-bf16-tp4-r1 --dry-run
 
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 4 --runner v1 \
-    --output /tmp/replayssm-level1-bf16-tp4-r1
+    --output /tmp/replayssm-level1-serve-bf16-tp4-r1
 
 python scripts/replayssm/run_level1.py \
     --model /path/to/Qwen3.6-27B \
     --tp 8 --runner v1 \
-    --output /tmp/replayssm-level1-bf16-tp8-r1
+    --output /tmp/replayssm-level1-serve-bf16-tp8-r1
 ```
 
 脚本失败即停止并保留结果包。先回传失败证据，我们修复本级后再重试；不要把未执行项勾为通过。
 显存不足或通信失败也按失败项反馈，记录所有手动调整。默认MTP speculative tokens=3；改为1需单独记录。
 若商发采用v2 runner，需另开目录以 `--runner v2` 运行相同矩阵，v1结果不替代v2验收。
+
+矩阵脚本会实际启动四次vllm serve，完成健康检查、预热和生成后逐一关闭，不需要提前手动启动服务。
+启动默认最多等1200秒，每个HTTP请求最多等180秒，整个case最多等1800秒；
+可分别调整 `--startup-timeout`、`--request-timeout`、`--timeout`，记录调整值。
+
+### 直接使用vllm serve排查
+
+下面是MTP graph项的等价启动命令，便于直接排查上线形式；完整验收运行上面的矩阵脚本以生成结果包。
+在第一个终端启动，使用当前部署Python环境中的 `vllm`：
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=0 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve /path/to/Qwen3.6-27B \
+    --host 127.0.0.1 --port 18080 --served-model-name replayssm-level1 \
+    --tensor-parallel-size 4 --pipeline-parallel-size 1 \
+    --dtype bfloat16 --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype bfloat16 \
+    --mamba-cache-mode none --no-enable-prefix-caching --enable-chunked-prefill \
+    --language-model-only --max-model-len 4096 --max-num-seqs 2 \
+    --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 \
+    --no-async-scheduling --seed 42 --distributed-executor-backend mp \
+    --no-enforce-eager --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3,"enforce_eager":true}'
+```
+
+在第二个终端检查和请求：
+
+```bash
+curl --fail-with-body http://127.0.0.1:18080/health
+curl --fail-with-body http://127.0.0.1:18080/v1/models
+curl --fail-with-body http://127.0.0.1:18080/metrics > /tmp/replayssm-serve-metrics-before.txt
+curl --fail-with-body http://127.0.0.1:18080/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"replayssm-level1","prompt":["请用两句话解释什么是矩阵乘法。","Write a short Python function that adds two integers."],"temperature":0,"seed":42,"max_tokens":64,"ignore_eos":true,"return_token_ids":true,"stream":false}'
+```
+
+重复生成请求完成预热和正式检查；待统计刷新后再次获取 `/metrics`，比较
+`vllm:spec_decode_num_drafts_total` 增量。手动排查结束在第一个终端Ctrl+C关闭服务并检查残留进程，
+再运行自动矩阵，避免端口和显存冲突。自动脚本不关闭其他已部署服务。
 
 ## 检查矩阵和通过条件
 
@@ -84,10 +126,10 @@ python scripts/replayssm/run_level1.py \
 |---|---|---|---|
 | environment | [ ] | [ ] | 版本、CANN证据、FLA API/加载路径匹配，可见卡数满足TP |
 | operators | [ ] | [ ] | 每张逻辑卡现有gating/L2Norm的eager与参考对齐，修改输入后的图重放对齐 |
-| ar_eager | [ ] | [ ] | BF16双缓存配置核对，原生AR完成warmup和生成，无异常，输出非空 |
-| ar_graph | [ ] | [ ] | BF16双缓存配置核对，原生AR生成通过，模型图capture/replay有实际证据 |
-| mtp_eager | [ ] | [ ] | BF16双缓存配置核对，原生MTP生成通过，实际draft计数大于0 |
-| mtp_graph | [ ] | [ ] | BF16双缓存配置核对，MTP生成及draft计数通过，target图执行有证据；drafter为eager |
+| ar_eager | [ ] | [ ] | BF16双缓存配置核对，serve就绪，HTTP预热与生成返回完整batch、token IDs及匹配usage |
+| ar_graph | [ ] | [ ] | BF16双缓存与HTTP生成通过，服务日志中模型图capture/replay有实际证据 |
+| mtp_eager | [ ] | [ ] | BF16双缓存与HTTP生成通过，/metrics的draft计数增量大于0 |
+| mtp_graph | [ ] | [ ] | BF16双缓存、HTTP生成及draft增量通过，target图执行有证据；drafter为eager |
 
 算子自动容差为 `atol=5e-3, rtol=1e-2`，完整模型质量与Replay精度不在本级结论内。
 模型图状态目前记录为 `REQUESTED_NOT_INSTRUMENTED`，仅此字段或capture配置不能作为模型图通过证据。
@@ -96,9 +138,11 @@ python scripts/replayssm/run_level1.py \
 
 ## 回传材料与确认
 
-- [ ] TP4结果包：`/tmp/replayssm-level1-bf16-tp4-r1.tar.gz`。
-- [ ] TP8结果包：`/tmp/replayssm-level1-bf16-tp8-r1.tar.gz`。
+- [ ] TP4结果包：`/tmp/replayssm-level1-serve-bf16-tp4-r1.tar.gz`。
+- [ ] TP8结果包：`/tmp/replayssm-level1-serve-bf16-tp8-r1.tar.gz`。
 - [ ] 说明模型图实际执行证据所在文件/日志行，或明确标注尚无证据。
+- [ ] 四项报告包含 `validation_mode=vllm_serve_http`、实际serve命令、服务日志、HTTP响应和指标前后快照。
+- [ ] 确认每项服务退出后端口释放，无本次服务/TP进程残留或异常占用显存；如有则返回进程信息及日志。
 - [ ] 如失败，提供第一个失败case、完整traceback、退出码以及重试前后的环境差异。
 
 可按以下模板反馈；日志发出前可审阅，脚本不会自动上传：

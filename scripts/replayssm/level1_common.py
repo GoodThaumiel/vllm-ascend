@@ -3,7 +3,12 @@
 """Dependency-free contracts for user-operated ReplaySSM validation."""
 
 import json
+import os
 import re
+import signal
+import sys
+import time
+from contextlib import suppress
 from pathlib import Path
 
 CASES = ("environment", "operators", "ar_eager", "ar_graph", "mtp_eager", "mtp_graph")
@@ -95,3 +100,40 @@ def model_kwargs(model: str, tp: int, case: str, runner: str, memory: float, spe
             "enforce_eager": True,
         }
     return kwargs
+
+
+def serve_command(kwargs: dict, port: int, model_name: str) -> list[str]:
+    # Invoke the same entrypoint as `vllm serve`, using the active Python env.
+    command = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", kwargs["model"]]
+    command.extend(["--host", "127.0.0.1", "--port", str(port), "--served-model-name", model_name])
+    for name, value in kwargs.items():
+        if name == "model":
+            continue
+        # This legacy CLI flag is store_true, not BooleanOptionalAction.
+        if name == "disable_log_stats":
+            if value:
+                command.append("--disable-log-stats")
+            continue
+        flag = name.replace("_", "-")
+        if isinstance(value, bool):
+            command.append(f"--{'' if value else 'no-'}{flag}")
+        else:
+            command.extend([f"--{flag}", json.dumps(value) if isinstance(value, dict) else str(value)])
+    return command
+
+
+def stop_process_group(group_id: int, grace_seconds: float = 15) -> None:
+    """Clean up owned worker/server descendants even if the leader has exited."""
+    try:
+        os.killpg(group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(group_id, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    with suppress(ProcessLookupError):
+        os.killpg(group_id, signal.SIGKILL)

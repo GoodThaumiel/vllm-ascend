@@ -9,11 +9,11 @@ import json
 import os
 import platform
 import subprocess
-import time
 import traceback
 from pathlib import Path
 
-from level1_common import CASES, EXPECTED_PACKAGES, cann_versions, matches_version, model_kwargs, write_json
+from level1_common import CASES, EXPECTED_PACKAGES, cann_versions, matches_version, write_json
+from level1_serve import run_serve_case
 
 
 def environment(args) -> dict:
@@ -164,51 +164,6 @@ def operators(args) -> dict:
     }
 
 
-def model_case(args) -> dict:
-    import torch
-    import torch_npu  # noqa: F401
-    from vllm import LLM, SamplingParams
-
-    kwargs = model_kwargs(args.model, args.tp, args.case, args.runner, args.memory_utilization, args.spec_tokens)
-    started = time.monotonic()
-    llm = LLM(**kwargs)
-    loaded_seconds = time.monotonic() - started
-    prompts = ["请用两句话解释什么是矩阵乘法。", "Write a short Python function that adds two integers."]
-    sampling = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True)
-    llm.generate(prompts, sampling, use_tqdm=False)
-    torch.npu.synchronize()
-    started = time.monotonic()
-    outputs = llm.generate(prompts, sampling, use_tqdm=False)
-    torch.npu.synchronize()
-    seconds = time.monotonic() - started
-    if len(outputs) != len(prompts) or any(not item.outputs or not item.outputs[0].token_ids for item in outputs):
-        raise RuntimeError("Native baseline returned an empty or incomplete batch")
-    metrics = []
-    for metric in llm.get_metrics():
-        item = {"name": metric.name}
-        for key in ("value", "values"):
-            value = getattr(metric, key, None)
-            if value is not None:
-                item[key] = value.tolist() if hasattr(value, "tolist") else value
-        metrics.append(item)
-    generated = [{"token_ids": list(item.outputs[0].token_ids), "text": item.outputs[0].text} for item in outputs]
-    if args.case.startswith("mtp"):
-        drafts = [metric.get("value", 0) for metric in metrics if metric["name"] == "vllm:spec_decode_num_drafts"]
-        if not drafts or sum(drafts) <= 0:
-            raise RuntimeError("MTP was requested but no positive speculative draft counter was observed")
-    return {
-        "status": "PASSED",
-        "engine_kwargs": kwargs,
-        "load_seconds": loaded_seconds,
-        "generation_seconds": seconds,
-        "outputs": generated,
-        "metrics": metrics,
-        "output_tokens_per_second": sum(len(item["token_ids"]) for item in generated) / seconds,
-        "model_graph_dispatch": "REQUESTED_NOT_INSTRUMENTED" if args.case.endswith("_graph") else "EAGER",
-        "scope": "Short native smoke run; timing is diagnostic, not a performance benchmark.",
-    }
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=CASES, required=True)
@@ -218,10 +173,15 @@ def main() -> int:
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--memory-utilization", type=float, required=True)
     parser.add_argument("--spec-tokens", type=int, required=True)
+    parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--startup-timeout", type=int, default=1200)
+    parser.add_argument("--request-timeout", type=int, default=180)
     args = parser.parse_args()
     record = {"case": args.case, "status": "FAILED"}
     try:
-        function = environment if args.case == "environment" else operators if args.case == "operators" else model_case
+        function = (
+            environment if args.case == "environment" else operators if args.case == "operators" else run_serve_case
+        )
         record.update(function(args))
         write_json(args.report, record)
     except Exception as exc:

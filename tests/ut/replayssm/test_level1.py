@@ -113,6 +113,42 @@ class AcceptanceGateTests(unittest.TestCase):
             self.assertEqual(record["status"], "FAILED")
             self.assertIn("Timed out", record["error"])
 
+    def test_worker_exit_and_timeout_clean_up_owned_descendants(self):
+        for hang in (False, True):
+            with self.subTest(hang=hang), tempfile.TemporaryDirectory() as folder:
+                output = Path(folder)
+                child = "\n".join(
+                    [
+                        "import signal, sys, time",
+                        "from pathlib import Path",
+                        "def stop(*args):",
+                        "    Path(sys.argv[2]).write_text('stopped')",
+                        "    raise SystemExit(0)",
+                        "signal.signal(signal.SIGTERM, stop)",
+                        "Path(sys.argv[1]).write_text('ready')",
+                        "while True: time.sleep(0.05)",
+                    ]
+                )
+                parent = "\n".join(
+                    [
+                        "import json, subprocess, sys, time",
+                        "from pathlib import Path",
+                        "root = Path(sys.argv[1])",
+                        f"subprocess.Popen([sys.executable, '-c', {child!r}, str(root/'ready'), str(root/'stopped')])",
+                        "deadline = time.monotonic() + 3",
+                        "while not (root/'ready').exists():",
+                        "    if time.monotonic() > deadline: raise RuntimeError('fixture child did not start')",
+                        "    time.sleep(0.01)",
+                        "(root/'environment.json').write_text(json.dumps({'case':'environment','status':'PASSED'}))",
+                        "while True: time.sleep(0.05)" if hang else "raise SystemExit(0)",
+                    ]
+                )
+                record = run_case(
+                    [sys.executable, "-c", parent, folder], output, "environment", 1 if hang else 5, os.environ.copy()
+                )
+                self.assertEqual(record["status"], "FAILED" if hang else "PASSED")
+                self.assertTrue((output / "stopped").is_file(), "owned descendant must receive cleanup signal")
+
     def test_dry_run_requires_no_torch_and_creates_no_pass_report(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -137,7 +173,10 @@ class AcceptanceGateTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)["status"], "DRY_RUN_NOT_VALIDATED")
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["status"], "DRY_RUN_NOT_VALIDATED")
+            self.assertEqual(set(plan["serve_commands"]), set(CASES[2:]))
+            self.assertTrue(all(command[3] == "serve" for command in plan["serve_commands"].values()))
             self.assertFalse(output.exists())
 
 

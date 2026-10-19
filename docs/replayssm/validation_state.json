@@ -3,6 +3,7 @@
   "vllm_release": "0.30.0",
   "ascend_branch": "releases/v0.30.0",
   "cann_release": "9.2.0",
+  "model_validation_mode": "vllm_serve_http",
   "native_baseline": {
     "dtype": "bfloat16",
     "mamba_cache_dtype": "bfloat16",
