@@ -61,7 +61,8 @@ request slot复用时，调用方必须重置checkpoint和cursor；旧历史数�
 CUDA参考的三维grid被展平为一维`NV * B * HV`，满足Triton-Ascend启动约束。
 
 当前是**正确性候选**，每个输出V tile启动一个program，尚未按AI Core数量做persistent任务循环。
-首版用于验证`tl.cumsum + tl.dot + runtime flush branch`在CANN 9.2.0/triton-ascend 3.2.2上的编译和图行为。
+第三版用于验证`tl.cumsum + 显式remask后的tl.dot + runtime flush branch`在
+CANN 9.2.0/triton-ascend 3.2.2上的融合编译、精度和图行为。
 通过后再根据实测决定：
 
 1. Triton路径增加核数钳制和任务循环；
@@ -72,7 +73,7 @@ CUDA参考的三维grid被展平为一维`NV * B * HV`，满足Triton-Ascend启�
 
 | 项目 | 当前判断 | 需要的外部验证 |
 |---|---|---|
-| Triton编译 | 中风险 | 910B4上确认runtime分支、`tl.cumsum`和二维`tl.dot`能编译 |
+| Triton编译 | 中风险 | 隔离构造已确认；仍需910B4上确认第三版融合kernel能编译和执行 |
 | checkpoint二维写回 | 中风险 | Qwen K/V=128时mask为完整tile；仍需检查flush后的全量state误差 |
 | NPUGraph | 中风险 | capture后改变输入和flush flag，确认三次replay不是旧输出 |
 | 精度 | 中风险 | 与模拟BF16/FP16存储的参考比较，并单独记录相对直接FP32递推的漂移 |
@@ -81,31 +82,38 @@ CUDA参考的三维grid被展平为一维`NV * B * HV`，满足Triton-Ascend启�
 
 L2.1上机步骤与通过条件见[第二级清单](checklists/LEVEL2.md)。
 
-## L2.1首轮故障与第二版设计
+## L2.1硬件诊断与第三版设计
 
 commit `26dd021293bf52d2743329ddb1c6f3c2afe48688`的首轮TP4验证先暴露了
 Triton-Ascend 3.2.2的链式布尔AST限制。将三操作数`and`拆成两个二操作数节点后kernel能够编译，
 但在step 0第一次同步时稳定触发`507014` AI Core timeout，同时报告AICore、AIVector和MTE错误。
 `write_pos=0`时历史cache读取均被mask，这使历史数据越界成为较弱解释；故障发生在进入精度比较之前。
 
-第二版正式内核移除`tl.cumsum`，改用最多64次的编译期循环、`get_element`和向量`tl.where`构造
-inclusive prefix。仓库已有两个独立证据指出同版本`tl.cumsum`在A2/A3上可产生错误结果或Vector Core trap：
-`sparse_index_remap.py`使用串行compaction规避，sampling mask文档也禁用基于cumsum的动态scatter。
-常用capacity=16，因此当前选择稳定性优先；硬件通过后再评估该串行前缀是否需要改成AscendC或其他实现。
+commit `16107d811`的六个隔离探针改变了首轮判断：`tl.cumsum`、串行prefix、普通dot、运行时分支和
+masked二维I/O均能独立运行；只有`masked_zero_dot`错误。第二版采用的串行prefix虽然独立通过，却在
+完整融合kernel中降低为不支持的`hivm.hir.copy`，使TP4在编译阶段失败。第三版因此恢复首版已能融合编译的
+`tl.cumsum`。隔离通过不等于已证明它在融合执行时无问题，但现有证据不再支持把首轮timeout直接归因于它。
 
-第二版还正式纳入用户首轮验证时完成的链式布尔兼容修改。它不改变接口、dtype、缓存布局和数学口径，
-仍属于**低侵入性算子修复**。没有进入模型、cache allocator、metadata builder或scheduler。
+`masked_zero_dot`进一步由commit `4c003b4ac`的六路探针定界为方向性缺陷：只有归约维masked load作为
+`tl.dot`左操作数时失败；右操作数mask及四种单kernel显式清零方案均通过。由于`BC`可能向上取整并超过
+物理cache capacity，第三版先按物理容量mask安全加载`d_cache`，再以`tl.where`显式清零逻辑无效历史和V尾行，
+随后才将其作为dot左操作数。这对应已通过的`remask_after_masked_load`路径，保留原矩阵方向和单kernel结构，
+不增加中间物化存储。
+
+第三版也纳入用户发现的探针runner参数修复：父进程为子进程补传argparse要求的`--output`，实际子结果仍写入
+`--child-report`。以上修改均不改变接口、dtype、缓存布局和数学口径，仍属于**低侵入性算子修复**；没有进入
+模型、cache allocator、metadata builder或scheduler。
 
 为避免下一次只能从整核超时反推，新增六个单构造探针，并将每个探针绑定到独立逻辑卡、并行执行：
 
 | 探针 | 隔离的问题 |
 |---|---|
 | `cumsum` | 原生`tl.cumsum`在长度16时是否直接trap或错算 |
-| `serial_prefix` | 正式内核采用的`get_element + tl.where`替代路径 |
+| `serial_prefix` | `get_element + tl.where`替代路径；隔离通过但融合编译失败 |
 | `dot` | Replay实际tile `[64,16] @ [16,64]` |
 | `masked_zero_dot` | step 0历史长度为0时，全mask输入进入同shape `tl.dot` |
 | `runtime_branch` | device标量控制的运行时if两个分支 |
 | `masked_2d_io` | `[64,64]` tile的尾部masked二维load/store |
 
-这些探针是**诊断代码**，不会进入生产调用路径。某个探针失败不自动证明整核只存在该一个问题，
-但能决定下一版应继续保留Triton构造、拆kernel，还是提前把对应热点迁移到AscendC。
+这些探针是**诊断代码**，不会进入生产调用路径。第三版仍需重新完成TP4/TP8整核编译、精度、flush/reset和
+NPUGraph验证；探针通过不能单独证明融合kernel已修复，也不能证明首轮`507014`只有一个根因。

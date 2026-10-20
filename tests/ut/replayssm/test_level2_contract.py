@@ -68,19 +68,30 @@ class ReplaySSMARContractTests(unittest.TestCase):
             command = probe_child_command(probe, device, Path(f"/tmp/{probe}.json"))
             self.assertEqual(command[command.index("--child-probe") + 1], probe)
             self.assertEqual(command[command.index("--child-device") + 1], str(device))
+            self.assertEqual(command[command.index("--output") + 1], "/tmp")
 
         self.assertEqual(len(MASKED_DOT_PROBES), len(set(MASKED_DOT_PROBES)))
         for device, probe in enumerate(MASKED_DOT_PROBES):
             command = masked_dot_child_command(probe, device, Path(f"/tmp/{probe}.json"))
             self.assertEqual(command[command.index("--child-probe") + 1], probe)
             self.assertEqual(command[command.index("--child-device") + 1], str(device))
+            self.assertEqual(command[command.index("--output") + 1], "/tmp")
 
-    def test_production_kernel_avoids_known_cumsum_trap(self):
+    def test_production_kernel_avoids_unsupported_serial_prefix_copy(self):
         source = (
             Path(__file__).resolve().parents[3] / "vllm_ascend" / "ops" / "triton" / "fla" / "replayssm_ar.py"
         ).read_text()
-        self.assertNotIn("tl." + "cumsum(", source)
-        self.assertIn("get_element(b_g_all", source)
+        self.assertIn("tl.cumsum(b_g_all", source)
+        self.assertNotIn("get_element(b_g_all", source)
+
+    def test_production_kernel_clears_left_dot_operand_after_load(self):
+        source = (
+            Path(__file__).resolve().parents[3] / "vllm_ascend" / "ops" / "triton" / "fla" / "replayssm_ar.py"
+        ).read_text()
+        self.assertIn("d_load_mask = mask_v[:, None] & cache_in_bounds[None, :]", source)
+        self.assertIn("b_d_masked = tl.load(p_d_main, mask=d_load_mask", source)
+        self.assertIn("b_d_all = tl.where(mask_v[:, None] & cache_valid[None, :], b_d_masked", source)
+        self.assertNotIn("tl.load(p_d_main, mask=mask_v[:, None] & cache_valid[None, :]", source)
 
 
 if __name__ == "__main__":

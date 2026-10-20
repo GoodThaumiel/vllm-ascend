@@ -1,6 +1,6 @@
 # 第二级上机验证清单
 
-状态：**L2.1首版发生可复现AI Core超时；移除`tl.cumsum`的第二版及并行诊断探针待上机，尚未允许开始第三级。**
+状态：**L2.1已定位串行prefix融合编译回归和左`tl.dot`操作数masked-load缺陷；第三版修复候选待TP4/TP8上机，尚未允许开始第三级。**
 
 本级验证Replay AR的BF16 checkpoint、FP16 `d/k`与FP32 `g`历史缓存、flush/reset语义、Triton-Ascend实现和图兼容。
 测试基线固定为[开发基线](../BASELINE.md)。每个实现提交会在本清单追加对应命令与通过条件；
@@ -40,10 +40,10 @@ commit `26dd021293bf52d2743329ddb1c6f3c2afe48688`在CANN 9.2.0、triton-ascend 3
 - 故障发生在任何精度比较或NPUGraph capture之前，TP8未运行；
 - 本级保持`next_level_allowed=false`。
 
-第二版移除正式内核中的`tl.cumsum`，采用固定上界串行prefix，并新增可并行运行的隔离探针。
-详细依据见[Level 2 AR设计](../LEVEL2_AR_DESIGN.md#l21首轮故障与第二版设计)。
+第二版曾移除正式内核中的`tl.cumsum`，采用固定上界串行prefix，并新增可并行运行的隔离探针。
+详细依据见[Level 2 AR设计](../LEVEL2_AR_DESIGN.md#l21硬件诊断与第三版设计)。
 
-## L2.1第二版：先运行并行诊断探针
+## L2.1诊断探针与第二版结果
 
 在8卡均空闲时，以下命令会同时启动六个独立子进程，分别绑定逻辑卡0到5。每个探针使用独立
 `TRITON_CACHE_DIR`，一个设备发生trap不会阻止其他设备生成报告：
@@ -73,10 +73,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/replayssm/run_level2_triton_probe
     --output /tmp/replayssm-level2-triton-probes-r1b
 ```
 
-每个构造会连续launch多次，以覆盖已知的重复launch trap。探针通过口径：`serial_prefix`、两个dot、运行时分支和
-masked二维I/O必须通过。`cumsum`用于确认后端特征；
-它失败或timeout是有效诊断结果，不阻止测试已移除该构造的第二版整核。返回`summary.json`以及所有失败探针的
-JSON/log；探针造成设备错误后，确认所有卡恢复空闲和健康，再运行整核。
+每个构造会连续launch多次，以覆盖已知的重复launch trap。该命令保留用于问题复现；当前结果如下。
 
 ### commit 16107d8探针结果
 
@@ -88,10 +85,14 @@ CANN 9.2.0 / triton-ascend 3.2.2的六卡并行结果如下：
   `tl.dot`没有保持零值语义。正式kernel的step 0恰好命中该构造；
 - Cannbot约束库也明确记录masked load的`other`在相关Ascend路径不可靠，建议在参与后续计算前用
   `tl.where(mask, x, 0.0)`显式清零；本轮探针同时验证该建议及其他保底写法；
-- 本轮源码状态包含`M scripts/replayssm/run_level2_triton_probes.py`，所以结果只作为诊断证据，
-  不作为干净源码验收。需保留并回传该文件的`git diff`，后续新探针使用独立脚本，不覆盖此修改。
+- 本轮源码状态包含`M scripts/replayssm/run_level2_triton_probes.py`。修改内容已确认是子进程命令漏传
+  argparse必需的`--output`；本修复已把同一修正纳入两个探针runner并增加CPU契约测试；
+- 同一commit的TP4整核在编译阶段失败：串行prefix的自引用`tl.where`在融合上下文降低成不支持的
+  `hivm.hir.copy`。隔离`serial_prefix`通过不能代表它与dot和运行时分支融合后可编译；TP8未运行；
+- 因此正式kernel恢复已能在首版融合kernel中编译的`tl.cumsum`。隔离probe也证明不能继续把首版
+  `507014`直接归因于`tl.cumsum`；首版超时的精确原因仍未最终证明。
 
-暂不运行第二版整核。先在独立逻辑卡上并行比较六种规避路径：load后`where`、load后乘mask、
+commit `4c003b4ac`随后在独立逻辑卡上并行比较六种规避路径：load后`where`、load后乘mask、
 masked load后再次select、只mask左/右操作数，以及两kernel物化后再dot。每种路径覆盖有效长度
 `0/7/16`并重复launch四次：
 
@@ -106,20 +107,29 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/replayssm/run_level2_masked_dot_p
     --output /tmp/replayssm-level2-masked-dot-probes-r1
 ```
 
-返回`summary.json`和所有失败探针的JSON/log。选择规则依次为：通过全部shape的单kernel路径、改动最小、
-UB/指令开销最低；只有单kernel路径全部失败时，才采用`materialize_then_dot`两kernel保底。选定后再修改正式kernel，
-并重新执行TP4/TP8整核清单。
+结果为`where_after_load`、`multiply_after_load`、`remask_after_masked_load`、`masked_b_only`和
+`materialize_then_dot`全部通过；只有`masked_a_only`失败，valid length 0时619/4096个元素错误，最大绝对误差41。
+这证明缺陷具有方向性：归约维masked load直接作为`tl.dot`左操作数不可靠，右操作数路径正常。
 
-## L2.1第二版：Replay AR Triton整核
+正式kernel选择单kernel的`remask_after_masked_load`：`BC`可能向上取整并超过物理cache capacity，因此先按
+物理容量mask安全加载，再以`tl.where`显式清零逻辑无效历史和V尾行，最后转换回dot输入dtype。它不交换矩阵方向，
+不依赖右操作数的mask间接消除左侧无效数据，也不增加物化kernel。`masked_b_only`虽通过，仍保留为后端定位证据
+而不作为正式实现。
+
+## L2.1第三版：Replay AR Triton整核
 
 这次改动为**低侵入性**：只新增plugin内的算子、缓存契约和独立验证脚本，尚未patch vLLM模型、
 metadata builder、cache allocator或scheduler。若本级算子不通过，不影响原生`vllm serve`路径。
 
-开发方本地已运行36个ReplaySSM CPU测试、`compileall`、Ruff检查/格式检查和`git diff --check`，全部通过。
+开发方本地已运行37个ReplaySSM CPU测试、`compileall`、Ruff检查/格式检查和作用域内`git diff --check`，全部通过。
 本机没有torch、Triton-Ascend和NPU，未导入或编译kernel；`bash format.sh ci`因本机缺少`pre-commit`未完成，
 不记为通过。NPU编译、精度和图行为必须以下述上机结果为准。
 
-完成探针并确认设备健康后，在同一CANN 9.2.0容器中执行：
+拉取包含以下三项修复的提交并确认设备健康后，在同一CANN 9.2.0容器中执行：
+
+- prefix恢复`tl.cumsum`，移除会触发`hivm.hir.copy`的串行自引用select；
+- 左dot操作数改为安全masked load后显式`tl.where`再次清零；
+- 两个并行探针runner补齐子进程必需的`--output`参数。
 
 ```bash
 git switch releases/v0.30.0
@@ -129,11 +139,11 @@ git status --short
 
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/replayssm/run_level2_ar.py \
     --tp 4 --capacity 16 --device-timeout 1200 \
-    --output /tmp/replayssm-level2-ar-tp4-r2
+    --output /tmp/replayssm-level2-ar-tp4-r3
 
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/replayssm/run_level2_ar.py \
     --tp 8 --capacity 16 --device-timeout 1200 \
-    --output /tmp/replayssm-level2-ar-tp8-r2
+    --output /tmp/replayssm-level2-ar-tp8-r3
 ```
 
 脚本按TP几何分别覆盖local key/value heads `(4,12)`和`(2,6)`，并在每张逻辑卡的独立子进程中运行。

@@ -14,8 +14,6 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend.ops.triton.triton_utils import get_element
-
 
 @triton.jit
 def fused_recurrent_gated_delta_rule_replayssm_kernel(
@@ -81,6 +79,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     # input (not derived) so align mode can force a flush mid-buffer.
     b_write_pos = tl.load(write_pos + i_n).to(tl.int32)
     b_is_flush = tl.load(is_flush + i_n) != 0
+    cache_in_bounds = o_c < MAX_CACHE_LEN
     cache_valid = o_c < b_write_pos
 
     # Gate for the current token: decay g, its exp alpha, and the beta mixing weight.
@@ -97,22 +96,24 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     # Replay decay over the committed cache, from the cached per-step gates g.
     p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
     b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
-    # Do not use tl.cumsum here. Triton-Ascend 3.2.2 is known to produce
-    # incorrect values or trap the vector core for cumsum-based kernels on
-    # Ascend A2/A3. Build the inclusive prefix with compile-time scalar lane
-    # extraction instead. BC is bounded by 64, and the common Replay window is
-    # 16, so this is an acceptable correctness-first compatibility path.
-    b_g_prefix = tl.zeros([BC], dtype=tl.float32)
-    b_g_total = 0.0
-    for cache_i in range(BC):
-        b_g_total += get_element(b_g_all, (cache_i,))
-        b_g_prefix = tl.where(o_c == cache_i, b_g_total, b_g_prefix)
+    # The isolated CANN 9.2.0 probe and the first fused candidate both compile
+    # this vector prefix. A scalar get_element/tl.where recurrence is not used:
+    # in the full fused kernel it lowers to an unsupported hivm.hir.copy.
+    b_g_prefix = tl.cumsum(b_g_all, axis=0)
+    b_g_total = tl.sum(b_g_all, axis=0)
     b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
     b_total_decay = tl.exp(b_g_total)
 
     # Cached delta-rule update vectors d (K-independent), scaled by the replay decay.
     p_d_main = d_cache + state_idx * stride_d_slot + ((i_hv * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None])
-    b_d_all = tl.load(p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0).to(tl.float32)
+    # Triton-Ascend 3.2.2 does not reliably preserve ``other=0`` when a
+    # reduction-dimension masked load feeds the left operand of tl.dot. The
+    # logical history length can be smaller than BC, and BC can be padded past
+    # the physical cache capacity. Load only in-bounds storage, then explicitly
+    # select the valid prefix so masked values cannot reach the dot operand.
+    d_load_mask = mask_v[:, None] & cache_in_bounds[None, :]
+    b_d_masked = tl.load(p_d_main, mask=d_load_mask, other=0).to(tl.float32)
+    b_d_all = tl.where(mask_v[:, None] & cache_valid[None, :], b_d_masked, 0.0)
     b_d_scaled_tc = (b_d_all * b_replay_decay[None, :]).to(p_d_main.dtype.element_ty)  # [BV, BC]
 
     # Current token value (for the delta-rule update).

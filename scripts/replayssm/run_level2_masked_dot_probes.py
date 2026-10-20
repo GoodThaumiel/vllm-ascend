@@ -43,6 +43,10 @@ def child_command(probe: str, device: int, report: Path) -> list[str]:
         str(device),
         "--child-report",
         str(report),
+        # --output is unused by child mode, but argparse requires it before
+        # dispatch reaches the child branch.
+        "--output",
+        str(report.parent),
     ]
 
 
