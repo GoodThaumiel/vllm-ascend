@@ -46,5 +46,8 @@ canonical GitCode repository and its installation guide were used instead.
 
 Level 1 uses `ascendc-env-check` to select the CANN/NPU evidence to collect. It
 does not assume the developer has an NPU or infer the exact compiler SoC from a
-generic `npu-smi` chip name. Later levels will load only the skills needed for the
-current operator or graph task, with sources and versions recorded.
+generic `npu-smi` chip name. Level 2 AR uses `triton-op-designer` and
+`triton-op-coding`, together with the pinned knowledge base's global,
+linear-recurrent and gated-delta-rule constraints. Later levels will load only
+the skills needed for the current operator or graph task, with sources and
+versions recorded.

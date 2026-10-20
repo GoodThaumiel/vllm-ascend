@@ -31,6 +31,7 @@
 同一级修复先重跑失败项与受影响回归项；跨级推进仍需用户明确确认。
 
 当前清单：[第二级上机验证清单](checklists/LEVEL2.md)。一级验收以commit `ee9401dc0`的服务轮次为准；旧版离线报告仅保留为历史证据。
+第二级AR算子的数据布局、数学、侵入性和不确定性见[Level 2 AR设计](LEVEL2_AR_DESIGN.md)。
 
 ## 实现档位
 
@@ -38,8 +39,8 @@
 - 新增通用Replay计算采用Triton-Ascend，有基础则增量开发；以图模式为目标。
 - recurrent/verify/flush等热点优先考虑AscendC，在匹配FLA源码上增量开发；不以语言保证性能。
 - 复用现有AscendC卷积、prefill及Triton控制kernel，不为了档位纯度重写所有算子。
-- Replay checkpoint仍按FP32设计，本期不做论文低精度Replay checkpoint或双checkpoint精度分离。
-  原生推理的BF16 SSM/卷积缓存是用户部署基线，与Replay checkpoint档位分别记录。
+- Replay checkpoint沿用BF16 SSM state存储，重建和递推在算子内部升FP32计算；本期不做低于BF16的checkpoint档位。
+  原生推理的BF16 SSM/卷积缓存是用户部署基线；BF16模型的Replay `d/k`历史缓存按原实现使用FP16，`g`使用FP32。
 
 ## 第一级做什么
 

@@ -39,7 +39,8 @@ Python改动由editable checkout直接生效。C++、AscendC、CMake或生成扩
 
 - 入口为`vllm serve`和HTTP请求；离线`LLM.generate`只保留为历史诊断。
 - 原生激活、Mamba conv cache和SSM state均为BF16。
-- Replay checkpoint为FP32；本期不实现论文的低精度checkpoint档位。
+- Replay checkpoint沿用BF16 SSM state存储，算子内部以FP32重建和累加；本期不实现论文中低于BF16的checkpoint档位。
+- BF16模型下Replay `d/k`历史缓存按原实现使用FP16，`g`缓存使用FP32；它们不属于Mamba conv cache dtype配置。
 - MTP优先，DFlash在MTP验收完成后开始。
 - 图模式必须给出实际capture和replay日志，配置字段本身不算证据。
 
