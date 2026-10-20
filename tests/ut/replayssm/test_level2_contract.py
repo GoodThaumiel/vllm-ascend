@@ -15,6 +15,8 @@ SCRIPTS = Path(__file__).resolve().parents[3] / "scripts" / "replayssm"
 sys.path.insert(0, str(SCRIPTS))
 
 from run_level2_ar import child_command as ar_child_command  # noqa: E402
+from run_level2_masked_dot_probes import PROBES as MASKED_DOT_PROBES  # noqa: E402
+from run_level2_masked_dot_probes import child_command as masked_dot_child_command  # noqa: E402
 from run_level2_triton_probes import PROBES  # noqa: E402
 from run_level2_triton_probes import child_command as probe_child_command  # noqa: E402
 
@@ -64,6 +66,12 @@ class ReplaySSMARContractTests(unittest.TestCase):
         self.assertEqual(len(PROBES), len(set(PROBES)))
         for device, probe in enumerate(PROBES):
             command = probe_child_command(probe, device, Path(f"/tmp/{probe}.json"))
+            self.assertEqual(command[command.index("--child-probe") + 1], probe)
+            self.assertEqual(command[command.index("--child-device") + 1], str(device))
+
+        self.assertEqual(len(MASKED_DOT_PROBES), len(set(MASKED_DOT_PROBES)))
+        for device, probe in enumerate(MASKED_DOT_PROBES):
+            command = masked_dot_child_command(probe, device, Path(f"/tmp/{probe}.json"))
             self.assertEqual(command[command.index("--child-probe") + 1], probe)
             self.assertEqual(command[command.index("--child-device") + 1], str(device))
 

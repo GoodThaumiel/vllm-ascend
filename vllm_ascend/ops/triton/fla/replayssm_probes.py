@@ -90,3 +90,154 @@ def masked_2d_io_probe_kernel(
     mask = (offsets_m[:, None] < rows) & (offsets_n[None, :] < cols)
     values = tl.load(x + offsets_m[:, None] * BN + offsets_n[None, :], mask=mask, other=0.0)
     tl.store(out + offsets_m[:, None] * BN + offsets_n[None, :], values, mask=mask)
+
+
+@triton.jit
+def dot_where_after_load_probe_kernel(
+    a,
+    b,
+    out,
+    valid_length,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    offsets_m = tl.arange(0, BM).to(tl.int32)
+    offsets_k = tl.arange(0, BK).to(tl.int32)
+    offsets_n = tl.arange(0, BN).to(tl.int32)
+    active_k = offsets_k < tl.load(valid_length).to(tl.int32)
+    a_raw = tl.load(a + offsets_m[:, None] * BK + offsets_k[None, :])
+    b_raw = tl.load(b + offsets_k[:, None] * BN + offsets_n[None, :])
+    a_tile = tl.where(active_k[None, :], a_raw, 0.0).to(a.dtype.element_ty)
+    b_tile = tl.where(active_k[:, None], b_raw, 0.0).to(b.dtype.element_ty)
+    result = tl.dot(a_tile, b_tile).to(tl.float32)
+    tl.store(out + offsets_m[:, None] * BN + offsets_n[None, :], result)
+
+
+@triton.jit
+def dot_multiply_after_load_probe_kernel(
+    a,
+    b,
+    out,
+    valid_length,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    offsets_m = tl.arange(0, BM).to(tl.int32)
+    offsets_k = tl.arange(0, BK).to(tl.int32)
+    offsets_n = tl.arange(0, BN).to(tl.int32)
+    active_k = offsets_k < tl.load(valid_length).to(tl.int32)
+    a_raw = tl.load(a + offsets_m[:, None] * BK + offsets_k[None, :])
+    b_raw = tl.load(b + offsets_k[:, None] * BN + offsets_n[None, :])
+    a_tile = a_raw * active_k[None, :].to(a.dtype.element_ty)
+    b_tile = b_raw * active_k[:, None].to(b.dtype.element_ty)
+    result = tl.dot(a_tile, b_tile).to(tl.float32)
+    tl.store(out + offsets_m[:, None] * BN + offsets_n[None, :], result)
+
+
+@triton.jit
+def dot_remask_after_masked_load_probe_kernel(
+    a,
+    b,
+    out,
+    valid_length,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    offsets_m = tl.arange(0, BM).to(tl.int32)
+    offsets_k = tl.arange(0, BK).to(tl.int32)
+    offsets_n = tl.arange(0, BN).to(tl.int32)
+    active_k = offsets_k < tl.load(valid_length).to(tl.int32)
+    a_masked = tl.load(
+        a + offsets_m[:, None] * BK + offsets_k[None, :],
+        mask=active_k[None, :],
+        other=0.0,
+    )
+    b_masked = tl.load(
+        b + offsets_k[:, None] * BN + offsets_n[None, :],
+        mask=active_k[:, None],
+        other=0.0,
+    )
+    a_tile = tl.where(active_k[None, :], a_masked, 0.0).to(a.dtype.element_ty)
+    b_tile = tl.where(active_k[:, None], b_masked, 0.0).to(b.dtype.element_ty)
+    result = tl.dot(a_tile, b_tile).to(tl.float32)
+    tl.store(out + offsets_m[:, None] * BN + offsets_n[None, :], result)
+
+
+@triton.jit
+def dot_masked_a_only_probe_kernel(
+    a,
+    b,
+    out,
+    valid_length,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    offsets_m = tl.arange(0, BM).to(tl.int32)
+    offsets_k = tl.arange(0, BK).to(tl.int32)
+    offsets_n = tl.arange(0, BN).to(tl.int32)
+    active_k = offsets_k < tl.load(valid_length).to(tl.int32)
+    a_tile = tl.load(
+        a + offsets_m[:, None] * BK + offsets_k[None, :],
+        mask=active_k[None, :],
+        other=0.0,
+    )
+    b_tile = tl.load(b + offsets_k[:, None] * BN + offsets_n[None, :])
+    result = tl.dot(a_tile, b_tile).to(tl.float32)
+    tl.store(out + offsets_m[:, None] * BN + offsets_n[None, :], result)
+
+
+@triton.jit
+def dot_masked_b_only_probe_kernel(
+    a,
+    b,
+    out,
+    valid_length,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    offsets_m = tl.arange(0, BM).to(tl.int32)
+    offsets_k = tl.arange(0, BK).to(tl.int32)
+    offsets_n = tl.arange(0, BN).to(tl.int32)
+    active_k = offsets_k < tl.load(valid_length).to(tl.int32)
+    a_tile = tl.load(a + offsets_m[:, None] * BK + offsets_k[None, :])
+    b_tile = tl.load(
+        b + offsets_k[:, None] * BN + offsets_n[None, :],
+        mask=active_k[:, None],
+        other=0.0,
+    )
+    result = tl.dot(a_tile, b_tile).to(tl.float32)
+    tl.store(out + offsets_m[:, None] * BN + offsets_n[None, :], result)
+
+
+@triton.jit
+def materialize_masked_dot_operands_probe_kernel(
+    a,
+    b,
+    a_out,
+    b_out,
+    valid_length,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+):
+    offsets_m = tl.arange(0, BM).to(tl.int32)
+    offsets_k = tl.arange(0, BK).to(tl.int32)
+    offsets_n = tl.arange(0, BN).to(tl.int32)
+    active_k = offsets_k < tl.load(valid_length).to(tl.int32)
+    a_tile = tl.load(
+        a + offsets_m[:, None] * BK + offsets_k[None, :],
+        mask=active_k[None, :],
+        other=0.0,
+    )
+    b_tile = tl.load(
+        b + offsets_k[:, None] * BN + offsets_n[None, :],
+        mask=active_k[:, None],
+        other=0.0,
+    )
+    tl.store(a_out + offsets_m[:, None] * BK + offsets_k[None, :], a_tile)
+    tl.store(b_out + offsets_k[:, None] * BN + offsets_n[None, :], b_tile)

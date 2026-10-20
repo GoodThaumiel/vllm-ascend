@@ -78,6 +78,38 @@ masked二维I/O必须通过。`cumsum`用于确认后端特征；
 它失败或timeout是有效诊断结果，不阻止测试已移除该构造的第二版整核。返回`summary.json`以及所有失败探针的
 JSON/log；探针造成设备错误后，确认所有卡恢复空闲和健康，再运行整核。
 
+### commit 16107d8探针结果
+
+CANN 9.2.0 / triton-ascend 3.2.2的六卡并行结果如下：
+
+- `cumsum`、`serial_prefix`、普通`dot`、`runtime_branch`和`masked_2d_io`均通过多次launch；
+- `masked_zero_dot`失败，4096个元素中608个不匹配，最大绝对误差`21.66828155517578`；
+- 因此当前最强故障证据是：归约维动态mask全false时，`tl.load(..., other=0)`的结果直接进入
+  `tl.dot`没有保持零值语义。正式kernel的step 0恰好命中该构造；
+- Cannbot约束库也明确记录masked load的`other`在相关Ascend路径不可靠，建议在参与后续计算前用
+  `tl.where(mask, x, 0.0)`显式清零；本轮探针同时验证该建议及其他保底写法；
+- 本轮源码状态包含`M scripts/replayssm/run_level2_triton_probes.py`，所以结果只作为诊断证据，
+  不作为干净源码验收。需保留并回传该文件的`git diff`，后续新探针使用独立脚本，不覆盖此修改。
+
+暂不运行第二版整核。先在独立逻辑卡上并行比较六种规避路径：load后`where`、load后乘mask、
+masked load后再次select、只mask左/右操作数，以及两kernel物化后再dot。每种路径覆盖有效长度
+`0/7/16`并重复launch四次：
+
+```bash
+git switch releases/v0.30.0
+git pull --ff-only origin releases/v0.30.0
+git rev-parse HEAD
+git status --short
+
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/replayssm/run_level2_masked_dot_probes.py \
+    --devices 0,1,2,3,4,5 \
+    --output /tmp/replayssm-level2-masked-dot-probes-r1
+```
+
+返回`summary.json`和所有失败探针的JSON/log。选择规则依次为：通过全部shape的单kernel路径、改动最小、
+UB/指令开销最低；只有单kernel路径全部失败时，才采用`materialize_then_dot`两kernel保底。选定后再修改正式kernel，
+并重新执行TP4/TP8整核清单。
+
 ## L2.1第二版：Replay AR Triton整核
 
 这次改动为**低侵入性**：只新增plugin内的算子、缓存契约和独立验证脚本，尚未patch vLLM模型、
