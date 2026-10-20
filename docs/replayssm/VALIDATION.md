@@ -32,6 +32,8 @@
 
 当前清单：[第二级上机验证清单](checklists/LEVEL2.md)。一级验收以commit `ee9401dc0`的服务轮次为准；旧版离线报告仅保留为历史证据。
 第二级AR算子的数据布局、数学、侵入性和不确定性见[Level 2 AR设计](LEVEL2_AR_DESIGN.md)。
+L2.1首版commit `26dd021293bf52d2743329ddb1c6f3c2afe48688`在拆分链式布尔表达式后能够编译，
+但step 0稳定触发`507014` AI Core timeout；移除`tl.cumsum`的第二版和并行隔离探针待上机验证。
 
 ## 实现档位
 

@@ -14,7 +14,9 @@ from contract import ReplaySSMARLayout  # noqa: E402
 SCRIPTS = Path(__file__).resolve().parents[3] / "scripts" / "replayssm"
 sys.path.insert(0, str(SCRIPTS))
 
-from run_level2_ar import child_command  # noqa: E402
+from run_level2_ar import child_command as ar_child_command  # noqa: E402
+from run_level2_triton_probes import PROBES  # noqa: E402
+from run_level2_triton_probes import child_command as probe_child_command  # noqa: E402
 
 
 class ReplaySSMARContractTests(unittest.TestCase):
@@ -53,10 +55,24 @@ class ReplaySSMARContractTests(unittest.TestCase):
 
     def test_hardware_probe_isolates_each_npu_in_a_child(self):
         args = Namespace(tp=8, capacity=16)
-        command = child_command(args, 7, Path("/tmp/replayssm-level2/device7.json"))
+        command = ar_child_command(args, 7, Path("/tmp/replayssm-level2/device7.json"))
         self.assertEqual(command[command.index("--child-device") + 1], "7")
         self.assertEqual(command[command.index("--tp") + 1], "8")
         self.assertEqual(command[command.index("--capacity") + 1], "16")
+
+    def test_diagnostic_probes_are_independently_assignable(self):
+        self.assertEqual(len(PROBES), len(set(PROBES)))
+        for device, probe in enumerate(PROBES):
+            command = probe_child_command(probe, device, Path(f"/tmp/{probe}.json"))
+            self.assertEqual(command[command.index("--child-probe") + 1], probe)
+            self.assertEqual(command[command.index("--child-device") + 1], str(device))
+
+    def test_production_kernel_avoids_known_cumsum_trap(self):
+        source = (
+            Path(__file__).resolve().parents[3] / "vllm_ascend" / "ops" / "triton" / "fla" / "replayssm_ar.py"
+        ).read_text()
+        self.assertNotIn("tl." + "cumsum(", source)
+        self.assertIn("get_element(b_g_all", source)
 
 
 if __name__ == "__main__":

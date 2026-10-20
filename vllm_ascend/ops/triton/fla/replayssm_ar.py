@@ -14,6 +14,8 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.ops.triton.triton_utils import get_element
+
 
 @triton.jit
 def fused_recurrent_gated_delta_rule_replayssm_kernel(
@@ -95,8 +97,16 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     # Replay decay over the committed cache, from the cached per-step gates g.
     p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
     b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
-    b_g_prefix = tl.cumsum(b_g_all, axis=0)
-    b_g_total = tl.sum(b_g_all, axis=0)
+    # Do not use tl.cumsum here. Triton-Ascend 3.2.2 is known to produce
+    # incorrect values or trap the vector core for cumsum-based kernels on
+    # Ascend A2/A3. Build the inclusive prefix with compile-time scalar lane
+    # extraction instead. BC is bounded by 64, and the common Replay window is
+    # 16, so this is an acceptable correctness-first compatibility path.
+    b_g_prefix = tl.zeros([BC], dtype=tl.float32)
+    b_g_total = 0.0
+    for cache_i in range(BC):
+        b_g_total += get_element(b_g_all, (cache_i,))
+        b_g_prefix = tl.where(o_c == cache_i, b_g_total, b_g_prefix)
     b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
     b_total_decay = tl.exp(b_g_total)
 
@@ -128,7 +138,8 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     b_state_q = tl.zeros([BV], dtype=tl.float32)
     b_state_k = tl.zeros([BV], dtype=tl.float32)
     cur_kq = tl.zeros([1], dtype=tl.float32)
-    write_k = (not b_is_flush) and (i_v == 0) and (i_hv == i_h * (HV // H))
+    # Triton-Ascend 3.2.2 only accepts two operands in one BoolOp AST node.
+    write_k = ((not b_is_flush) and (i_v == 0)) and (i_hv == i_h * (HV // H))
     for kk in range(NK):
         o_kt = (kk * BKT + tl.arange(0, BKT)).to(tl.int32)
         mask_kt = o_kt < K
