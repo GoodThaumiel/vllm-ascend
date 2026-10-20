@@ -1,5 +1,19 @@
 # Level 2：ReplaySSM AR算子设计
 
+## 当前实现方向
+
+用户回传确认 `24758b71` 在 TP4 device 0 首次整核执行后同步时再次触发 507014，
+尚未到精度比较和 NPUGraph；其根因未被定位，不能将相同错误码直接等同于同一个硬件根因。
+masked-dot 探针提供了局部规避证据，但未解决融合内核超时。
+
+按用户最新要求，当前主线转为 [独立 AscendC 实验目录](../../experimental/replayssm_ar_ascendc/README.md)：
+参考 fla_npu 的状态切片/向量递推与 GVirt-xlite 的独立构建/torch binding/Python 测试布局。
+先独立验证精度、图模式、性能，接受后再接入 `csrc`。本轮只提交 A0/A1 起点，阶段之间由用户验收。
+新接口接收已预处理 BF16 q/k/v 和 FP32 g/beta，flush 为 INT32，
+先用 FP32 向量外积恢复历史，不使用 `tl.dot`。与旧 Triton 接口和舍入差异详见独立目录 README。
+
+下面的数据契约和 Triton 映射描述保留旧实现设计；独立算子的当前契约以其 README 为准。
+
 ## 边界与侵入性
 
 本阶段只在vLLM Ascend plugin新增GDN ReplaySSM AR算子、数据契约和单算子验证工具。

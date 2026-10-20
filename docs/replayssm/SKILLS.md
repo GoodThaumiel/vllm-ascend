@@ -51,3 +51,11 @@ generic `npu-smi` chip name. Level 2 AR uses `triton-op-designer` and
 linear-recurrent and gated-delta-rule constraints. Later levels will load only
 the skills needed for the current operator or graph task, with sources and
 versions recorded.
+
+The standalone L2.1 AscendC iteration uses `ascendc-tiling-design` (reduction
+full-load routing), `ascendc-api-best-practices` (DMA, queue and pipeline
+synchronization, reduction), and `ops-precision-standard` (floating-point golden
+construction). The output gate uses stricter absolute tolerance and an additional
+relative L2 check to prevent a small all-zero output from passing. CPU golden
+tests run locally; CANN compilation, NPU correctness, graphs and timing remain
+user-operated. No hardware pass is inferred from CPU or static checks.

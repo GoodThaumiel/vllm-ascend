@@ -1,6 +1,10 @@
 # 第二级上机验证清单
 
-状态：**L2.1已定位串行prefix融合编译回归和左`tl.dot`操作数masked-load缺陷；第三版修复候选待TP4/TP8上机，尚未允许开始第三级。**
+状态：**Triton 第三版 `24758b71` 在 TP4 device 0 再次 507014，未到精度/图验证。
+按用户要求改为独立 AscendC + torch binding 最小迭代；当前仅待 A0 构建和 A1 smoke。**
+
+当前执行入口为 [L2.1 独立 AscendC 清单](LEVEL2_ASCENDC.md)。以下 Triton 命令保留为历史诊断，
+不作为本轮主线验证。算子通过前不进行框架集成、不进入第三级。
 
 本级验证Replay AR的BF16 checkpoint、FP16 `d/k`与FP32 `g`历史缓存、flush/reset语义、Triton-Ascend实现和图兼容。
 测试基线固定为[开发基线](../BASELINE.md)。每个实现提交会在本清单追加对应命令与通过条件；

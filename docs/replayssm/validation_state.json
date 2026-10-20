@@ -14,10 +14,19 @@
   "next_level_allowed": false,
   "levels": {
     "1": "ACCEPTED_AT_EE9401DC0_CANN_9_2_0_TP4_TP8",
-    "2": "IN_PROGRESS_L2_1_REPAIRED_AR_TP4_TP8_PENDING",
+    "2": "IN_PROGRESS_L2_1_ASCENDC_STANDALONE_A1_PENDING",
     "3": "NOT_STARTED",
     "4": "NOT_STARTED",
     "5": "NOT_STARTED"
+  },
+  "level2_ar_implementation": {
+    "triton_candidate_commit": "24758b71a7d3f3dabec43f1424f47f93c9619a09",
+    "triton_status": "FAILED_DEVICE0_TP4_507014_BEFORE_PRECISION_AND_GRAPH",
+    "timeout_root_cause": "UNRESOLVED_FUSED_KERNEL_FAILURE",
+    "active_candidate": "experimental/replayssm_ar_ascendc",
+    "ascendc_validation": "NOT_COMPILED_OR_RUN_ON_NPU",
+    "framework_integration": "DEFERRED_UNTIL_STANDALONE_ACCEPTED",
+    "checklist": "docs/replayssm/checklists/LEVEL2_ASCENDC.md"
   },
   "dflash": "DEFERRED_UNTIL_MTP_ACCEPTED",
   "low_precision_replay_checkpoint": "OUT_OF_SCOPE"
