@@ -24,8 +24,16 @@ EXPECTED_PACKAGES = {
 def matches_version(actual: str | None, expected: str) -> bool:
     if actual is None:
         return False
-    # Allow a release candidate or local build, but not another release/post.
-    return re.fullmatch(re.escape(expected) + r"(?:(?:rc|a|b)\d+)?(?:\+[^\s]+)?", actual) is not None
+    # Source builds on a release branch may carry PEP 440 pre/dev/local
+    # suffixes.  A post-release expectation (torch-npu in this baseline) is
+    # already exact and must not be weakened to another public version.
+    local = r"(?:\+[^\s]+)?"
+    if re.fullmatch(re.escape(expected) + local, actual) is not None:
+        return True
+    if ".post" in expected:
+        return False
+    development = r"(?:(?:(?:rc|a|b)\d+)(?:\.dev\d+)?|\.dev\d+)"
+    return re.fullmatch(re.escape(expected) + development + local, actual) is not None
 
 
 def cann_versions(paths: list[Path]) -> list[dict[str, str]]:

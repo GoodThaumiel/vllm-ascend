@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import traceback
 from pathlib import Path
 
@@ -95,7 +96,30 @@ def environment(args) -> dict:
     }
 
 
-def operators(args) -> dict:
+def operator_worker_command(args, device: int, report: Path) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--case",
+        "operators",
+        "--model",
+        args.model,
+        "--tp",
+        str(args.tp),
+        "--runner",
+        args.runner,
+        "--report",
+        str(report),
+        "--memory-utilization",
+        str(args.memory_utilization),
+        "--spec-tokens",
+        str(args.spec_tokens),
+        "--device",
+        str(device),
+    ]
+
+
+def operators_on_device(args) -> dict:
     import torch
     import torch_npu  # noqa: F401
 
@@ -103,63 +127,90 @@ def operators(args) -> dict:
     from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
+    device_index = args.device
+    torch.npu.set_device(device_index)
+    init_device_properties_triton()
+    device = f"npu:{device_index}"
+    heads = 48 // args.tp
+    a = torch.linspace(-1, 1, 4 * heads, device=device).reshape(4, heads).to(torch.bfloat16)
+    b = a.clone()
+    a_log = torch.full((heads,), -2.0, device=device)
+    bias = torch.zeros(heads, device=device)
+    x = torch.linspace(-0.5, 0.5, 4 * heads * 128, device=device).reshape(4, heads, 128).to(torch.bfloat16)
+
+    def compute(a=a, b=b, a_log=a_log, bias=bias, x=x):
+        g, beta = fused_gdn_gating_patch(a_log, a, b, bias)
+        return g, beta, l2norm_fwd(x)
+
+    def reference(a=a, b=b, a_log=a_log, bias=bias, x=x):
+        g = -torch.exp(a_log.float())[None, :] * torch.nn.functional.softplus(a.float() + bias.float())
+        beta = torch.sigmoid(b.float()).to(b.dtype)
+        norm = (x.float() / torch.sqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)).to(x.dtype)
+        return g.unsqueeze(0), beta.unsqueeze(0), norm
+
+    for _ in range(3):
+        eager = compute()
+    expected = reference()
+    torch.npu.synchronize()
+    for actual, target in zip(eager, expected, strict=True):
+        torch.testing.assert_close(actual, target, atol=5e-3, rtol=1e-2)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        captured = compute()
+    # Mutate fixed inputs after capture to reject a stale-output pseudo-pass.
+    a.fill_(0.25)
+    b.fill_(-0.25)
+    x.fill_(0.125)
+    expected = reference()
+    for _ in range(3):
+        graph.replay()
+    torch.npu.synchronize()
+    errors = []
+    for actual, target in zip(captured, expected, strict=True):
+        torch.testing.assert_close(actual, target, atol=5e-3, rtol=1e-2)
+        errors.append(float((actual.float() - target.float()).abs().max().cpu()))
+    result = {
+        "device": device_index,
+        "local_value_heads": heads,
+        "status": "PASSED",
+        "graph_replays": 3,
+        "max_abs_errors": errors,
+    }
+    del graph, captured, eager
+    torch.npu.empty_cache()
+    return {
+        "status": "PASSED",
+        "devices": [result],
+        "scope": "Existing gating and L2Norm kernels only; not Replay or recurrent kernel acceptance.",
+    }
+
+
+def operators(args) -> dict:
+    if args.device is not None:
+        return operators_on_device(args)
+
     results = []
-    for device_index in range(args.tp):
-        torch.npu.set_device(device_index)
-        init_device_properties_triton()
-        device = f"npu:{device_index}"
-        heads = 48 // args.tp
-        a = torch.linspace(-1, 1, 4 * heads, device=device).reshape(4, heads).to(torch.bfloat16)
-        b = a.clone()
-        a_log = torch.full((heads,), -2.0, device=device)
-        bias = torch.zeros(heads, device=device)
-        x = torch.linspace(-0.5, 0.5, 4 * heads * 128, device=device).reshape(4, heads, 128).to(torch.bfloat16)
-
-        def compute(a=a, b=b, a_log=a_log, bias=bias, x=x):
-            g, beta = fused_gdn_gating_patch(a_log, a, b, bias)
-            return g, beta, l2norm_fwd(x)
-
-        def reference(a=a, b=b, a_log=a_log, bias=bias, x=x):
-            g = -torch.exp(a_log.float())[None, :] * torch.nn.functional.softplus(a.float() + bias.float())
-            beta = torch.sigmoid(b.float()).to(b.dtype)
-            norm = (x.float() / torch.sqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)).to(x.dtype)
-            return g.unsqueeze(0), beta.unsqueeze(0), norm
-
-        for _ in range(3):
-            eager = compute()
-        expected = reference()
-        torch.npu.synchronize()
-        for actual, target in zip(eager, expected, strict=True):
-            torch.testing.assert_close(actual, target, atol=5e-3, rtol=1e-2)
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph):
-            captured = compute()
-        # Mutate fixed inputs after capture to reject a stale-output pseudo-pass.
-        a.fill_(0.25)
-        b.fill_(-0.25)
-        x.fill_(0.125)
-        expected = reference()
-        for _ in range(3):
-            graph.replay()
-        torch.npu.synchronize()
-        errors = []
-        for actual, target in zip(captured, expected, strict=True):
-            torch.testing.assert_close(actual, target, atol=5e-3, rtol=1e-2)
-            errors.append(float((actual.float() - target.float()).abs().max().cpu()))
-        results.append(
-            {
-                "device": device_index,
-                "local_value_heads": heads,
-                "status": "PASSED",
-                "graph_replays": 3,
-                "max_abs_errors": errors,
-            }
-        )
-        del graph, captured, eager
-        torch.npu.empty_cache()
+    for device in range(args.tp):
+        report = args.report.with_name(f"{args.report.stem}-device{device}.json")
+        log = args.report.with_name(f"{args.report.stem}-device{device}.log")
+        with log.open("w") as stream:
+            completed = subprocess.run(
+                operator_worker_command(args, device, report),
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        if completed.returncode != 0 or not report.is_file():
+            raise RuntimeError(f"operator probe failed on device {device}; see {log}")
+        child = json.loads(report.read_text())
+        if child.get("status") != "PASSED" or len(child.get("devices", [])) != 1:
+            raise RuntimeError(f"operator probe did not pass on device {device}; see {report}")
+        results.extend(child["devices"])
     return {
         "status": "PASSED",
         "devices": results,
+        "process_model": "one subprocess per logical NPU, matching TP workers",
         "scope": "Existing gating and L2Norm kernels only; not Replay or recurrent kernel acceptance.",
     }
 
@@ -176,6 +227,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--startup-timeout", type=int, default=1200)
     parser.add_argument("--request-timeout", type=int, default=180)
+    parser.add_argument("--device", type=int, choices=range(8))
     args = parser.parse_args()
     record = {"case": args.case, "status": "FAILED"}
     try:

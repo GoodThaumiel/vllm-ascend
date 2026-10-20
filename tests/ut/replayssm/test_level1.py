@@ -12,12 +12,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[3] / "scripts" / "replayssm"
 sys.path.insert(0, str(SCRIPTS))
 
 from level1_common import CASES, cann_versions, matches_version, model_kwargs, summarize  # noqa: E402
+from level1_worker import operator_worker_command  # noqa: E402
 from run_level1 import run_case  # noqa: E402
 
 
@@ -45,9 +47,14 @@ class AcceptanceGateTests(unittest.TestCase):
 
     def test_wrong_release_or_torch_npu_post_is_rejected(self):
         self.assertTrue(matches_version("0.30.0rc2+local", "0.30.0"))
+        self.assertTrue(matches_version("0.30.0rc2.dev171+g62cc09b17", "0.30.0"))
+        self.assertTrue(matches_version("0.30.0.dev171+source", "0.30.0"))
+        self.assertTrue(matches_version("0.30.0+empty", "0.30.0"))
+        self.assertTrue(matches_version("2.10.0+cpu", "2.10.0"))
         for value in (None, "0.23.0", "0.30.01", "0.30.0.post1"):
             self.assertFalse(matches_version(value, "0.30.0"))
         self.assertFalse(matches_version("2.10.0.post3", "2.10.0.post4"))
+        self.assertFalse(matches_version("2.10.0.post4.dev1", "2.10.0.post4"))
 
     def test_compiler_version_retains_path_and_full_build_evidence(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -70,6 +77,13 @@ class AcceptanceGateTests(unittest.TestCase):
                         self.assertEqual(kwargs["enforce_eager"], case.endswith("eager"))
                         if case.startswith("mtp"):
                             self.assertEqual(kwargs["speculative_config"]["method"], "qwen3_5_mtp")
+
+    def test_operator_probe_uses_explicit_per_device_child(self):
+        args = Namespace(model="/model", tp=8, runner="v1", memory_utilization=0.85, spec_tokens=3)
+        command = operator_worker_command(args, 7, Path("/tmp/device7.json"))
+        self.assertEqual(command[command.index("--device") + 1], "7")
+        self.assertEqual(command[command.index("--tp") + 1], "8")
+        self.assertEqual(command[command.index("--report") + 1], "/tmp/device7.json")
 
     def test_child_exit_failure_overrides_passed_json(self):
         with tempfile.TemporaryDirectory() as folder:

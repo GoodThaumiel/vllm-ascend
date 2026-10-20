@@ -9,12 +9,12 @@
     "mamba_cache_dtype": "bfloat16",
     "mamba_ssm_cache_dtype": "bfloat16"
   },
-  "current_level": 1,
-  "user_confirmation": "PENDING",
+  "current_level": 2,
+  "user_confirmation": "LEVEL_1_ACCEPTED_2026-10-19",
   "next_level_allowed": false,
   "levels": {
-    "1": "IMPLEMENTED_AWAITING_USER_HARDWARE_VALIDATION",
-    "2": "NOT_STARTED",
+    "1": "ACCEPTED_AT_EE9401DC0_CANN_9_2_0_TP4_TP8",
+    "2": "IN_PROGRESS",
     "3": "NOT_STARTED",
     "4": "NOT_STARTED",
     "5": "NOT_STARTED"
