@@ -30,6 +30,9 @@
 #include <torch_npu/csrc/npu/Module.h>
 #include "ops.h"
 #include "utils.h"
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_AR
+#include "replayssm_ar.h"
+#endif
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "moe/rms_norm_cast/rms_norm_cast_torch_adpt.h"
@@ -2712,6 +2715,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 // Pybind on other platform
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_AR
+    ops.def("replayssm_ar_step_" VLLM_ASCEND_REPLAYSSM_AR_SCHEMA);
+    ops.impl("replayssm_ar_step_", torch::kPrivateUse1, &vllm_ascend::replayssm_ar_step);
+#endif
     ops.def("get_npu_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor?");
     ops.impl("get_npu_view_from_cpu_tensor", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_npu_view_from_cpu_tensor);

@@ -35,6 +35,12 @@ editable安装时，包元数据中的git后缀可能仍指向上次编译commit
 Python改动由editable checkout直接生效。C++、AscendC、CMake或生成扩展改动必须重新构建安装，
 不能只用模块路径证明二进制已经更新。商发包形成后恢复正式版本和构建产物的严格门槛。
 
+独立 AscendC 工程上机补充：CANN `ascendc_library` 将 kernel `.so` 放在 `build/lib/`，
+binding `.so` 位于 `build/`，因此 `BUILD_RPATH` 必须含 `$ORIGIN/lib`；
+不能把未设 `LD_LIBRARY_PATH` 时的加载失败误判为算子失败。
+同时空 `CMAKE_BUILD_TYPE` 会让9.2 legacy merge脚本收到无值的 `--build-type`，需强制设为 Release。
+以上来自用户六组独立测试通过前的服务器构建修复，本次按其补丁固化。
+
 ## 固定推理口径
 
 - 入口为`vllm serve`和HTTP请求；离线`LLM.generate`只保留为历史诊断。

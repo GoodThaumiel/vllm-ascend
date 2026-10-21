@@ -5,6 +5,9 @@
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/npu/Module.h>
 #include "utils.h"
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_AR
+#include "replayssm_ar.h"
+#endif
 
 /*
  * How to write a meta implementation for a custom operator (meta kernel):
@@ -1809,6 +1812,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
 // Pybind on other platform
 namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_AR
+    ops.impl("replayssm_ar_step_", &vllm_ascend::replayssm_ar_step_meta);
+#endif
     ops.impl("get_physical_device_id", &vllm_ascend::meta::get_physical_device_id_meta);
     //Gemma rmsnorm meta implementation
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);

@@ -59,3 +59,11 @@ construction). The output gate uses stricter absolute tolerance and an additiona
 relative L2 check to prevent a small all-zero output from passing. CPU golden
 tests run locally; CANN compilation, NPU correctness, graphs and timing remain
 user-operated. No hardware pass is inferred from CPU or static checks.
+
+The framework packaging iteration uses the repository's existing C++ torch
+binding/Meta pattern and the `torch-custom-ops-guide` mutation semantics: the
+preallocated in-place operator returns no tensors, and Meta performs no compute.
+The actual shared C++ schema/Meta was compiled and tested on CPU, including
+FakeTensor tracing. Graph performance uses the already-tested direct NPUGraph
+capture API; no TorchAir compiler configuration or unsupported hardware API is
+introduced in this iteration.

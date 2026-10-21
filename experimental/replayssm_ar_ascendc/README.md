@@ -2,7 +2,7 @@
 
 本目录是 L2.1 独立验证工程。构建、加载、测试都不依赖 vLLM 的 Python import、安装流程或服务启动。
 目标环境为 Ascend910B4、CANN 9.2.0、torch/torch_npu 2.10；vLLM `0.30.0+empty` 与源码编译的
-vLLM Ascend 0.30.0 基线不变。当前没有接入 serving，验证完成后再通过 `csrc/torch_binding.cpp` 集成。
+vLLM Ascend 0.30.0 基线不变。独立六组测试已由用户确认通过；当前已接入 csrc 构建与 binding，待重编译验证，尚未接入 serving。
 
 ## 本次迭代边界
 
@@ -11,17 +11,18 @@ vLLM Ascend 0.30.0 基线不变。当前没有接入 serving，验证完成后�
 - kernel 仿照 fla_npu 的队列、`[Vtile,K]` 状态分片、向量乘和 K 归约组织；
   构建与 Python 调用测试的分离方式参考 GVirt-xlite。
 - 原生 AR 的单步递推增加 Replay 历史恢复和按 flush 写回；历史恢复采用 FP32 向量外积累加。
-- 没有修改 vLLM、vllm_ascend 模型、scheduler、cache allocator、根构建入口和原生算子。
+- 框架打包阶段修改根 CMake 和 torch binding 注册；没有修改 vLLM、模型 dispatch、scheduler 或 cache allocator。
 - 没有把未验证的 Triton kernel 注册成 fallback；Triton 路径保留作历史诊断。
-- 本目录提供待上机的编译和运行候选，不能用 CPU 测试证明 AscendC 编译或 NPU 正确性。
+- 独立测试已获用户硬件通过反馈；迁移后的框架构建/加载仍需另行验证，不能用 CPU 测试代替。
 
 ## 目录与参考
 
 ```text
 replayssm_ar_ascendc/
   CMakeLists.txt           # AscendC kernel + torch library 独立构建
-  csrc/replayssm_ar.cpp    # AIV-only kernel，不使用 Cube 或跨核等待
-  csrc/torch_binding.cpp  # shape/dtype 校验、当前 NPU stream 启动、mutation schema
+  csrc/torch_binding.cpp  # 独立 namespace；共用根 csrc host/schema/Meta
+  ../../csrc/kernels/replayssm_ar.cpp # 共用且保持已验证内容的 kernel
+  ../../csrc/replayssm_ar.cpp # 共用 host launcher
   lab.py                  # FP64 CPU golden、poison 数据、完整写入边界检查
   run.py                  # 隔离子进程、分阶段上机、事件计时和 JSON 报告
   tests/test_reference.py # 可在 CPU 上运行的 golden/契约/测试工具验证
@@ -116,7 +117,8 @@ cmake -S experimental/replayssm_ar_ascendc \
 cmake --build experimental/replayssm_ar_ascendc/build --parallel 4
 ```
 
-不需要安装或重新编译 vLLM Ascend。输出 `.so` 保留在 build 目录，加载时使用当前 torch_npu stream。
+独立模式不需要安装或重新编译 vLLM Ascend；框架模式必须重编译安装扩展。
+独立输出 `.so` 保留在 build 目录，加载时使用当前 torch_npu stream。
 需要 CMake >=3.20、C++17 编译器、CANN 编译工具、已安装且配套的 torch/torch_npu。
 CPU 开发机可运行以下测试；其不加载 `.so`、torch_npu 或 vLLM：
 
@@ -126,7 +128,8 @@ python3 -m unittest discover -s experimental/replayssm_ar_ascendc/tests -v
 
 ## 上机验证顺序
 
-完整逐级清单见 [独立 AscendC 检查单](../../docs/replayssm/checklists/LEVEL2_ASCENDC.md)。
+历史清单见 [独立 AscendC 检查单](../../docs/replayssm/checklists/LEVEL2_ASCENDC.md)，
+当前下一步见 [框架打包清单](../../docs/replayssm/checklists/LEVEL2_FRAMEWORK.md)。
 默认只运行 smoke，阶段之间不自动升级；使用新的 output 目录保留每轮证据。
 先反馈 smoke 和编译结果，修正并确认通过后再进入 replay 阶段。
 
@@ -149,6 +152,10 @@ graph_perf 阶段验证当前 stream、NPUGraph capture、改变输入/cursor/fl
 
 ## 验证后合入路径
 
-独立目录通过后再把 kernel/launch 声明接入 `csrc/` 的构建和现有 torch binding namespace，
+kernel/host launcher 已迁入根 `csrc/`，独立工程引用同一份源码。框架入口使用
+`--backend framework`，通过现有扩展 `_C_ascend.replayssm_ar_step_` 调用，
 Python 侧由 vllm_ascend 调用注册算子。之后再补模型 dispatch/cache 生命周期和 `vllm serve + HTTP` 验证。
 该阶段仍属于 L2；独立算子测试不能替代后续 TP 通信、MTP 或服务验证。
+
+`--stack-layers 48` 在 graph_perf 阶段增加48套独立状态的图内调用计时；仅用于调用预算，
+不模拟完整模型。`tests/meta/` 可只构建实际共享 schema/Meta 供 CPU 编译和 FakeTensor 测试。

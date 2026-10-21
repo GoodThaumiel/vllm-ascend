@@ -14,7 +14,7 @@
   "next_level_allowed": false,
   "levels": {
     "1": "ACCEPTED_AT_EE9401DC0_CANN_9_2_0_TP4_TP8",
-    "2": "IN_PROGRESS_L2_1_ASCENDC_STANDALONE_A1_PENDING",
+    "2": "IN_PROGRESS_L2_2_FRAMEWORK_OPERATOR_PACKAGING_PENDING",
     "3": "NOT_STARTED",
     "4": "NOT_STARTED",
     "5": "NOT_STARTED"
@@ -23,10 +23,17 @@
     "triton_candidate_commit": "24758b71a7d3f3dabec43f1424f47f93c9619a09",
     "triton_status": "FAILED_DEVICE0_TP4_507014_BEFORE_PRECISION_AND_GRAPH",
     "timeout_root_cause": "UNRESOLVED_FUSED_KERNEL_FAILURE",
-    "active_candidate": "experimental/replayssm_ar_ascendc",
-    "ascendc_validation": "NOT_COMPILED_OR_RUN_ON_NPU",
-    "framework_integration": "DEFERRED_UNTIL_STANDALONE_ACCEPTED",
-    "checklist": "docs/replayssm/checklists/LEVEL2_ASCENDC.md"
+    "active_candidate": "csrc/kernels/replayssm_ar.cpp",
+    "ascendc_validation": "USER_REPORTED_SIX_TEST_GROUPS_PASSED_AT_3FF971B_WITH_CMAKE_RPATH_FIX",
+    "framework_integration": "OPERATOR_BUILD_BINDING_META_PENDING_NPU_REVALIDATION_MODEL_DISPATCH_NOT_STARTED",
+    "checklist": "docs/replayssm/checklists/LEVEL2_FRAMEWORK.md",
+    "hardware_evidence": {
+      "source_commit": "3ff971bfff3197d29586ff472fb6cccada55ed72",
+      "source": "user report in chat; raw JSON/logs not attached in this turn",
+      "replay_us_approx": 150,
+      "native_us_approx": 220,
+      "timing_geometry": "awaiting exact batch/TP/cores/timing mode"
+    }
   },
   "dflash": "DEFERRED_UNTIL_MTP_ACCEPTED",
   "low_precision_replay_checkpoint": "OUT_OF_SCOPE"

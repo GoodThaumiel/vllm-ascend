@@ -54,6 +54,14 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 file(GLOB KERNEL_FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
 
+# Replay AR is validated only on 910B. Other platforms keep their build unchanged.
+set(VLLM_ASCEND_BUILD_REPLAYSSM_AR FALSE)
+if(SOC_VERSION MATCHES "^[Aa]scend910[Bb]")
+    set(VLLM_ASCEND_BUILD_REPLAYSSM_AR TRUE)
+else()
+    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_ar.cpp")
+endif()
+
 set(VLLM_ASCEND_CUSTOM_OP
     ${KERNEL_FILES}
 )
@@ -101,6 +109,11 @@ set(
 )
 
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
+if(VLLM_ASCEND_BUILD_REPLAYSSM_AR)
+  target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_REPLAYSSM_AR)
+  target_include_directories(vllm_ascend_C PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/include")
+  add_dependencies(vllm_ascend_C vllm_ascend_kernels)
+endif()
 if(SOC_VERSION MATCHES "ascend910_93.*")
   target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_SPARSE_KV_OFFLOAD)
   target_link_libraries(vllm_ascend_C PRIVATE OpenMP::OpenMP_CXX)

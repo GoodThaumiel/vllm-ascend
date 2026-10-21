@@ -35,6 +35,21 @@ def load_library(path: Path):
     return torch.ops.replayssm_lab.ar_step_
 
 
+def load_framework():
+    """Initialize the installed plugin once, before tracing or capture."""
+    import importlib
+
+    from vllm_ascend.ops.replayssm.ascendc import replayssm_ar_step
+    from vllm_ascend.utils import enable_custom_op
+
+    if not enable_custom_op():
+        raise RuntimeError("vllm_ascend custom operators could not be enabled")
+    if not hasattr(torch.ops._C_ascend, "replayssm_ar_step_"):
+        raise RuntimeError("rebuild vllm_ascend_C: replayssm_ar_step_ is absent (requires 910B build)")
+    module = importlib.import_module("vllm_ascend.vllm_ascend_C")
+    return replayssm_ar_step, Path(module.__file__).resolve()
+
+
 def invoke(op, case: dict, tile_v: int = 32, cores: int = 1):
     op(*(case[name] for name in INPUT_NAMES), HEAD_DIM**-0.5, tile_v, cores)
 

@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(replayssm_meta_test LANGUAGES CXX)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import torch; print(torch.utils.cmake_prefix_path)"
+  OUTPUT_VARIABLE torch_prefix OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+list(PREPEND CMAKE_PREFIX_PATH "${torch_prefix}")
+find_package(Torch REQUIRED)
+add_library(replayssm_meta_test SHARED binding.cpp)
+target_include_directories(replayssm_meta_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../csrc" ${TORCH_INCLUDE_DIRS})
+target_compile_features(replayssm_meta_test PRIVATE cxx_std_17)
+separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+target_compile_options(replayssm_meta_test PRIVATE ${torch_flags})
+target_link_libraries(replayssm_meta_test PRIVATE ${TORCH_LIBRARIES})

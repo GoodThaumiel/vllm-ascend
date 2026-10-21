@@ -49,6 +49,10 @@ def child_command(args, device, report):
         str(device),
         "--iterations",
         str(args.iterations),
+        "--backend",
+        getattr(args, "backend", "standalone"),
+        "--stack-layers",
+        str(getattr(args, "stack_layers", 0)),
     ]
     if args.native_baseline:
         command.append("--native-baseline")
@@ -192,6 +196,18 @@ def run_graph_perf(op, args, device, save):
         metrics = check_result(clone_case(gpu), golden(cpu), cpu)
         save({"case": f"graph_pos{pos}_flush{int(flush)}", "status": "PASSED", "errors": metrics})
 
+    # Event timing around eager Python calls may include host dispatch gaps.
+    # Report captured replay separately; reset mutations outside timing.
+    pristine_graph = {name: cpu[name].to(device) for name in BUFFER_NAMES}
+
+    def reset_graph_device():
+        for name in BUFFER_NAMES:
+            gpu[name].copy_(pristine_graph[name])
+
+    timing = event_timing(graph.replay, reset_graph_device, args.iterations)
+    check_result(clone_case(gpu), golden(cpu), cpu)
+    save({"case": "perf_graph_single_empty_history_flush", "status": "PASSED", **timing})
+
     for pos, flush in ((0, False), (args.capacity // 2, False), (args.capacity - 1, True)):
         flush = flush or pos == args.capacity - 1
         cpu = make_case(args.tp, args.batch, args.capacity, pos, flush, args.tile_v, seed=910 + pos)
@@ -243,11 +259,56 @@ def run_graph_perf(op, args, device, save):
         check_result(clone_case(gpu), golden(cpu), cpu)
         save({"case": "replay_ar_empty_history_flush", "status": "PASSED", **replay_timing})
 
+    if args.stack_layers:
+        run_layer_stack(op, args, device, save)
+
+
+def run_layer_stack(op, args, device, save):
+    import torch
+    from lab import check_result, clone_case, golden, invoke, make_case
+
+    if args.capacity < 3:
+        raise ValueError("layer-stack benchmark requires capacity >= 3")
+    # Independent allocations preserve a realistic multi-layer working set.
+    # The non-flush append position is outside the read prefix, so repeated
+    # replay is valid without resetting state inside the measured graph.
+    cases = [
+        make_case(args.tp, args.batch, args.capacity, args.capacity // 2, False, args.tile_v, seed=1000 + i)
+        for i in range(args.stack_layers)
+    ]
+    buffers = [clone_case(case, device) for case in cases]
+
+    def call_stack():
+        for case in buffers:
+            invoke(op, case, args.tile_v, args.cores)
+
+    call_stack()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        call_stack()
+    timing = event_timing(graph.replay, lambda: None, args.iterations)
+    for before, after in zip(cases, buffers):
+        check_result(clone_case(after), golden(before), before)
+    save(
+        {
+            "case": "perf_graph_layer_stack",
+            "status": "PASSED",
+            "layers": args.stack_layers,
+            "calls_per_rank_per_replay": args.stack_layers,
+            "graph_ms_p50": timing["device_us_p50"] / 1000,
+            "amortized_layer_us_p50": timing["device_us_p50"] / args.stack_layers,
+            **timing,
+        }
+    )
+
 
 def run_child(args, report):
     record = {
         "status": "RUNNING",
         "stage": args.stage,
+        "backend": args.backend,
+        "stack_layers": args.stack_layers,
         "device": args.child_device,
         "tp_geometry": args.tp,
         "batch": args.batch,
@@ -266,7 +327,7 @@ def run_child(args, report):
     try:
         import torch
         import torch_npu  # noqa: F401
-        from lab import load_library, make_case, ub_bytes
+        from lab import load_framework, load_library, make_case, ub_bytes
 
         record["packages"] = {}
         for name in (
@@ -277,6 +338,7 @@ def run_child(args, report):
             "triton-ascend",
             "fla-npu",
             "flash-linear-attention-npu",
+            "flash-linear-attention-npu-a2",
         ):
             try:
                 record["packages"][name] = importlib.metadata.version(name)
@@ -288,13 +350,14 @@ def run_child(args, report):
         record["source_status"] = subprocess.check_output(
             ["git", "status", "--short"], cwd=Path(__file__).resolve().parent, text=True
         ).splitlines()
-        record["library"] = str(args.library.resolve())
-        record["library_sha256"] = hashlib.sha256(args.library.read_bytes()).hexdigest()
-        kernel_library = args.library.parent / "libreplayssm_ar_kernel.so"
-        if kernel_library.exists():
-            record["kernel_sha256"] = hashlib.sha256(kernel_library.read_bytes()).hexdigest()
+        if args.backend == "standalone":
+            record["library"] = str(args.library.resolve())
+            record["library_sha256"] = hashlib.sha256(args.library.read_bytes()).hexdigest()
+            kernel_library = args.library.parent / "lib/libreplayssm_ar_kernel.so"
+            if kernel_library.exists():
+                record["kernel_sha256"] = hashlib.sha256(kernel_library.read_bytes()).hexdigest()
         cache = args.library.parent / "CMakeCache.txt"
-        if cache.exists():
+        if args.backend == "standalone" and cache.exists():
             record["build_config"] = [
                 line
                 for line in cache.read_text().splitlines()
@@ -308,7 +371,16 @@ def run_child(args, report):
         torch.npu.set_device(args.child_device)
         device = torch.device(f"npu:{args.child_device}")
         record["device_name"] = torch.npu.get_device_name(args.child_device)
-        op = load_library(args.library)
+        if args.backend == "framework":
+            op, artifact = load_framework()
+            record["library"] = str(artifact)
+            record["library_sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            record["framework_kernels"] = [
+                {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in artifact.parent.glob("**/libvllm_ascend_kernels.so")
+            ]
+        else:
+            op = load_library(args.library)
         write_json(report, record)
         if args.stage in ("smoke", "replay", "flush"):
             if args.stage == "smoke":
@@ -347,6 +419,10 @@ def run_child(args, report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=STAGES, default="smoke")
+    parser.add_argument("--backend", choices=("standalone", "framework"), default="standalone")
+    parser.add_argument(
+        "--stack-layers", type=int, default=0, help="Optional independent-layer captured graph benchmark"
+    )
     parser.add_argument("--tp", type=int, choices=(4, 8), default=4, help="Local head geometry; no distributed launch")
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--capacity", type=int, choices=range(1, 65), default=16)
@@ -360,7 +436,13 @@ def main():
     parser.add_argument("--native-baseline", action="store_true")
     parser.add_argument("--child-device", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.batch < 1 or args.batch > 1024 or args.timeout <= 0 or args.iterations < 1:
+    if (
+        args.batch < 1
+        or args.batch > 1024
+        or args.timeout <= 0
+        or args.iterations < 1
+        or not 0 <= args.stack_layers <= 128
+    ):
         parser.error("invalid batch/timeout/iterations")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)

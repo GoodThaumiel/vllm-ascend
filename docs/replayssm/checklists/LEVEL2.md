@@ -1,5 +1,9 @@
 # 第二级上机验证清单
 
+当前状态：用户确认 `3ff971b` 加 CMake/RPATH 修复后的独立六组测试通过；
+当前入口为 [L2.2 框架打包清单](LEVEL2_FRAMEWORK.md)，先验证 F1 扩展编译与注册。
+调用数与性能估算见 [CALL_BUDGET](../CALL_BUDGET.md)。下面是历史候选记录。
+
 状态：**Triton 第三版 `24758b71` 在 TP4 device 0 再次 507014，未到精度/图验证。
 按用户要求改为独立 AscendC + torch binding 最小迭代；当前仅待 A0 构建和 A1 smoke。**
 

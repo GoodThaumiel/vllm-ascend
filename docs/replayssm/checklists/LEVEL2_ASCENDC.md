@@ -1,5 +1,8 @@
 # L2.1 独立 AscendC 上机验证清单
 
+用户已回报 `3ff971b` 加 CMake/RPATH 修复后独立六组通过。此清单保留为验收记录；
+本轮新的工作入口是 [L2.2 框架打包清单](LEVEL2_FRAMEWORK.md)。
+
 本轮只接受独立算子验证。环境沿用 CANN 9.2.0、torch_npu 2.10.0.post4、vLLM `0.30.0+empty`、
 源码编译 vLLM Ascend 0.30.0；BF16 SSM state 与 Mamba cache 基线不变。
 第一轮只跑 **A1 smoke**。每段反馈结果、修正并确认通过后才运行下一段。
