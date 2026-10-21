@@ -3,6 +3,9 @@
 ## 本轮变更与门槛
 
 用户已确认 `3ff971b` 加服务器 CMake 修复后的独立六组测试通过。
+随后回传的 B=2、tile_v=32、cores=8 精确报告确认 TP4/TP8 的 graph 正确性通过；
+匹配空历史 flush Event p50 分别为 Replay 125.61/140.73µs、Native 204.85/224.67µs。
+这些是独立 namespace 的 eager 调用 Event，不替代本清单的框架构建与48层图内计时。
 本轮接受这份反馈，开始打包验证，不将其扩展为整网 Replay 或 SD 验收。
 项目仍停在 Level 2，`next_level_allowed=false`。
 

@@ -24,15 +24,34 @@
     "triton_status": "FAILED_DEVICE0_TP4_507014_BEFORE_PRECISION_AND_GRAPH",
     "timeout_root_cause": "UNRESOLVED_FUSED_KERNEL_FAILURE",
     "active_candidate": "csrc/kernels/replayssm_ar.cpp",
-    "ascendc_validation": "USER_REPORTED_SIX_TEST_GROUPS_PASSED_AT_3FF971B_WITH_CMAKE_RPATH_FIX",
+    "ascendc_validation": "USER_REPORTED_SIX_TEST_GROUPS_AND_TP4_TP8_GRAPH_PERF_PASSED_AT_3FF971B_WITH_CMAKE_RPATH_FIX",
     "framework_integration": "OPERATOR_BUILD_BINDING_META_PENDING_NPU_REVALIDATION_MODEL_DISPATCH_NOT_STARTED",
     "checklist": "docs/replayssm/checklists/LEVEL2_FRAMEWORK.md",
     "hardware_evidence": {
       "source_commit": "3ff971bfff3197d29586ff472fb6cccada55ed72",
-      "source": "user report in chat; raw JSON/logs not attached in this turn",
-      "replay_us_approx": 150,
-      "native_us_approx": 220,
-      "timing_geometry": "awaiting exact batch/TP/cores/timing mode"
+      "source": "user-supplied graph_perf JSON in chat on 2026-10-21",
+      "device": "Ascend910B4",
+      "geometry": {
+        "batch": 2,
+        "capacity": 16,
+        "tile_v": 32,
+        "cores": 8,
+        "iterations": 50
+      },
+      "timing_mode": "NPU Event around eager Python operator call; graph capture/replay correctness also passed",
+      "tp4": {
+        "device": 0,
+        "replay_empty_history_flush_us_p50": 125.61000138521194,
+        "native_empty_history_flush_us_p50": 204.8500031232834,
+        "conditional_48_layer_saving_ms": 3.80352
+      },
+      "tp8": {
+        "device": 1,
+        "replay_empty_history_flush_us_p50": 140.73000103235245,
+        "native_empty_history_flush_us_p50": 224.67000037431717,
+        "conditional_48_layer_saving_ms": 4.02912
+      },
+      "framework_graph_perf": "PENDING_F1_F2_BEFORE_F3"
     }
   },
   "dflash": "DEFERRED_UNTIL_MTP_ACCEPTED",
