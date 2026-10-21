@@ -63,6 +63,7 @@ def fused_gdn_gating_patch(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
+    beta_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
@@ -77,7 +78,13 @@ def fused_gdn_gating_patch(
     ROW_ITER = triton.cdiv(row_per_core, BLK_BATCHES)
 
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    beta_output = torch.empty(
+        1,
+        batch,
+        num_heads,
+        dtype=b.dtype if beta_dtype is None else beta_dtype,
+        device=b.device,
+    )
 
     grid = (progs, seq_len)
     fused_gdn_gating_kernel[grid](

@@ -14,7 +14,7 @@
   "next_level_allowed": false,
   "levels": {
     "1": "ACCEPTED_AT_EE9401DC0_CANN_9_2_0_TP4_TP8",
-    "2": "IN_PROGRESS_L2_2_FRAMEWORK_OPERATOR_PACKAGING_PENDING",
+    "2": "IN_PROGRESS_L2_3_MODEL_AR_DISPATCH_CACHE_LIFECYCLE_PENDING_NPU",
     "3": "NOT_STARTED",
     "4": "NOT_STARTED",
     "5": "NOT_STARTED"
@@ -23,10 +23,17 @@
     "triton_candidate_commit": "24758b71a7d3f3dabec43f1424f47f93c9619a09",
     "triton_status": "FAILED_DEVICE0_TP4_507014_BEFORE_PRECISION_AND_GRAPH",
     "timeout_root_cause": "UNRESOLVED_FUSED_KERNEL_FAILURE",
-    "active_candidate": "csrc/kernels/replayssm_ar.cpp",
+    "active_candidate": "csrc/replayssm_ar.cpp",
     "ascendc_validation": "USER_REPORTED_SIX_TEST_GROUPS_AND_TP4_TP8_GRAPH_PERF_PASSED_AT_3FF971B_WITH_CMAKE_RPATH_FIX",
-    "framework_integration": "OPERATOR_BUILD_BINDING_META_PENDING_NPU_REVALIDATION_MODEL_DISPATCH_NOT_STARTED",
-    "checklist": "docs/replayssm/checklists/LEVEL2_FRAMEWORK.md",
+    "framework_integration": "F1_F2_F3_USER_VALIDATED_AT_2808394_META_AND_NATIVE_SERVE_EVIDENCE_DEFERRED_TO_L2_3",
+    "model_ar_integration": "IMPLEMENTED_PENDING_TP4_TP8_VLLM_SERVE_VALIDATION",
+    "model_ar_scope": "QWEN_GDN_NON_SPEC_AR_CACHE_SHAPE_DTYPE_CURSOR_GRAPH_METADATA_AND_DISPATCH",
+    "model_ar_limitations": [
+      "SPECULATIVE_MTP_AND_DFLASH_REJECTED_UNTIL_SD_LIFECYCLE",
+      "MAMBA_CACHE_MODE_ALL_REJECTED",
+      "KV_CONNECTORS_REJECTED_BY_UPSTREAM_VLLM_REPLAYSSM_VALIDATION"
+    ],
+    "checklist": "docs/replayssm/checklists/LEVEL2_MODEL_AR.md",
     "hardware_evidence": {
       "source_commit": "3ff971bfff3197d29586ff472fb6cccada55ed72",
       "source": "user-supplied graph_perf JSON in chat on 2026-10-21",
@@ -51,7 +58,8 @@
         "native_empty_history_flush_us_p50": 224.67000037431717,
         "conditional_48_layer_saving_ms": 4.02912
       },
-      "framework_graph_perf": "PENDING_F1_F2_BEFORE_F3"
+      "framework_graph_perf": "USER_REPORTED_F1_F2_F3_PASSED_AT_2808394",
+      "framework_report": "user-supplied L2.2 framework validation report in chat on 2026-10-21"
     }
   },
   "dflash": "DEFERRED_UNTIL_MTP_ACCEPTED",

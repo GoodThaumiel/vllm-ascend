@@ -405,6 +405,28 @@
 #       Remove together with fix 8.2 once upstream splits mamba-align pages
 #       without the EAGLE backoff on PD producers.
 #
+# ** 11a. File: platform/patch_replayssm_gdn.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. Qwen3Next/Qwen3.5 GDN static Mamba state layout and
+#      `vllm.config.model.ModelConfig.supports_replayssm`
+#    Why:
+#       vLLM 0.30 owns the common ReplaySSM request lifecycle, but advertises
+#       ReplaySSM only for its Mamba2 implementations. Qwen GDN therefore fails
+#       config validation and allocates only conv/checkpoint state, while the
+#       Ascend Replay AR operator also needs d/k/g history rings.
+#    How:
+#       Scope support to the Qwen3Next/Qwen3.5 architecture names and wrap the
+#       model classes' static state shape/dtype methods. When `use_replayssm` is
+#       enabled, append FP16 d/k and FP32 g rings after the BF16 conv/checkpoint
+#       states. Native configurations keep the original methods unchanged.
+#       Speculative decode and unsupported cache modes fail before allocation.
+#    Related PR (if no, explain why):
+#       No. This is the Ascend plugin integration for the project-local
+#       ReplaySSM operator and has no matching upstream GDN backend yet.
+#    Future Plan:
+#       Replace this patch with a backend/model capability hook once upstream
+#       exposes a general GDN ReplaySSM cache contract.
+#
 # ** 10a. File: platform/patch_mamba_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config`

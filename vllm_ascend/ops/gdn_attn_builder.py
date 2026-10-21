@@ -32,6 +32,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.ops.replayssm.cache import derive_replayssm_ar_cursors
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -391,6 +392,51 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.non_spec_actual_seq_lengths = torch.empty(
                 (sequence_index_capacity + 1,), dtype=torch.int32, device=device
             )
+        self.use_replayssm_ar = self.vllm_config.cache_config.use_replayssm
+        self.replayssm_buffer_len = self.vllm_config.cache_config.replayssm_buffer_len
+        if self.use_replayssm_ar:
+            if self.num_spec > 0:
+                raise ValueError(
+                    "ReplaySSM AR cannot be combined with speculative decoding "
+                    "until the ReplaySSM SD commit/rollback path is enabled"
+                )
+            self.replayssm_write_pos = torch.empty((sequence_index_capacity,), dtype=torch.int32, device=device)
+            self.replayssm_is_flush = torch.empty((sequence_index_capacity,), dtype=torch.int32, device=device)
+
+    def _build_replayssm_ar_metadata(
+        self,
+        m: CommonAttentionMetadata,
+        *,
+        num_decodes: int,
+        graph_request_count: int,
+        use_graph_buffers: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self.use_replayssm_ar or num_decodes <= 0:
+            return None, None
+        decode_base_cpu = m.replayssm_decode_base_cpu
+        seq_lens_cpu = m.seq_lens_cpu_upper_bound
+        if decode_base_cpu is None or seq_lens_cpu is None:
+            raise ValueError("ReplaySSM AR requires CPU decode-base and sequence-length metadata")
+        query_lens_cpu = torch.diff(m.query_start_loc_cpu)[:num_decodes]
+        num_computed_tokens = seq_lens_cpu[:num_decodes] - query_lens_cpu
+        write_pos_cpu, is_flush_cpu = derive_replayssm_ar_cursors(
+            num_computed_tokens=num_computed_tokens,
+            decode_base=decode_base_cpu[:num_decodes],
+            query_lens=query_lens_cpu,
+            buffer_len=self.replayssm_buffer_len,
+            block_size=self.kv_cache_spec.block_size,
+            align_mode=self.vllm_config.cache_config.mamba_cache_mode == "align",
+        )
+        output_rows = graph_request_count if use_graph_buffers else num_decodes
+        self.replayssm_write_pos[:num_decodes].copy_(write_pos_cpu, non_blocking=True)
+        self.replayssm_is_flush[:num_decodes].copy_(is_flush_cpu, non_blocking=True)
+        if output_rows > num_decodes:
+            self.replayssm_write_pos[num_decodes:output_rows].zero_()
+            self.replayssm_is_flush[num_decodes:output_rows].zero_()
+        return (
+            self.replayssm_write_pos[:output_rows],
+            self.replayssm_is_flush[:output_rows],
+        )
 
     def _init_reorder_batch_threshold(
         self,
@@ -928,6 +974,19 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
         )
 
+        use_decode_graph_buffers = (
+            self.use_full_cuda_graph
+            and num_prefills == 0
+            and num_spec_decodes == 0
+            and graph_request_count <= self.decode_cudagraph_max_bs
+        )
+        replayssm_write_pos, replayssm_is_flush = self._build_replayssm_ar_metadata(
+            m,
+            num_decodes=num_decodes,
+            graph_request_count=graph_request_count,
+            use_graph_buffers=use_decode_graph_buffers,
+        )
+
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -951,6 +1010,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
         )
+        # Upstream vLLM 0.30 owns the common ReplaySSM request lifecycle but
+        # its GDN metadata has no AR cursor fields. Dataclasses are not slotted,
+        # so the Ascend backend attaches graph-stable device tensors here.
+        attn_metadata.replayssm_write_pos = replayssm_write_pos
+        attn_metadata.replayssm_is_flush = replayssm_is_flush
         if (
             self.use_full_cuda_graph
             and num_prefills == 0

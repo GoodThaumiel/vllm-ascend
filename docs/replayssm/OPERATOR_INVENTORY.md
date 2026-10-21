@@ -41,10 +41,10 @@ projection
 
 | 编号 | 算子 | 设计来源 | 当前状态 | 还需工作 | 修改性质 |
 |---|---|---|---|---|---|
-| AR1 | 单 token Replay recurrent step | 新 AscendC `replayssm_ar_step_`；计算边界对应 native `recurrent_gated_delta_rule` | 独立算子六组已由用户确认通过；已打包进 `_C_ascend`，等待 framework F1 | framework build/load、F2 回归、F3 48层图内性能 | 新增插件算子，低侵入 |
-| AR2 | AR cursor/flush 元数据 | 原版 ReplaySSM builder 在 host 计算 `position % L` 和 flush | 未接入模型 | 在 Ascend metadata builder 生成固定地址 device tensor | 框架元数据修改，中侵入 |
-| AR3 | Replay ring/checkpoint 分配 | 原版在 GDN state tuple 后追加 d/k/g | 未接入 | 扩展 0.30 Ascend GDN state shape/dtype，纳入 block copy/reuse | cache 布局修改，高侵入 |
-| AR4 | GDN decode dispatch | 用 AR1 替换 non-spec decode 的 native recurrent op | 未接入 | 修改 `AscendGatedDeltaNetAttention._forward_core`，保留 C1-C7 | 模型 dispatch 修改，中侵入 |
+| AR1 | 单 token Replay recurrent step | 新 AscendC `replayssm_ar_step_`；计算边界对应 native `recurrent_gated_delta_rule` | framework F1-F3 已由用户确认通过 | 在真实模型 profile 后决定是否优化 TP4/B16 | 新增插件算子，低侵入 |
+| AR2 | AR cursor/flush 元数据 | 原版 ReplaySSM builder 在 host 计算 `position % L` 和 flush | 已实现，等待 L2.3 上机验证 | 验证 graph padding、恢复、slot 复用和 align block 边界 | 框架元数据修改，中侵入 |
+| AR3 | Replay ring/checkpoint 分配 | 原版在 GDN state tuple 后追加 d/k/g | 已实现五块 cache 契约，等待 L2.3 上机验证 | 验证真实 TP4/TP8 分配和 block copy/reuse | cache 布局修改，高侵入 |
+| AR4 | GDN decode dispatch | 用 AR1 替换 non-spec decode 的 native recurrent op | pure/mixed non-spec decode 已接入，等待 L2.3 上机验证 | `vllm serve` 对照原生 AR；spec 路径仍主动拒绝 | 模型 dispatch 修改，中侵入 |
 
 AR1 当前接口直接接收已经完成 L2 norm 的 BF16 q/k/v，以及 FP32 g/beta。它完成：
 
@@ -106,26 +106,25 @@ metadata 适配到相同接口，而不是再写一套 recurrent kernel；只有
 - TP4/TP8 本地 head 几何、B=2、L=16、tile_v=32、cores=8；
 - 与 FLA native recurrent op 的同边界空历史 flush 性能对照。
 
-尚未覆盖：
+framework F1-F3 已在 commit `2808394` 对应源码上由用户确认通过。尚未覆盖：
 
-- `_C_ascend` 正式 framework namespace 的服务器构建和加载（F1）；
-- C2+C4+C5+AR1 的整条 Qwen GDN decode 调用；
-- AR2-AR4 的缓存分配、metadata、dispatch 和 block 生命周期；
+- C2+C4+C5+AR1 的整条 Qwen GDN decode 模型调用；
+- AR2-AR4 在真实调度中的缓存分配、metadata、dispatch 和 block 生命周期；
 - 真实 TP4/TP8 多进程、B=1/8/16、48层 capture；
 - `vllm serve` 的 Replay AR 输出和长序列生命周期；
 - SD1-SD6、MTP accepted/rejected token、提前 flush 和 rollback；
 - prefix cache、preemption/resume、KV connector 和 cache block copy 对新增 ring 的处理；
 - DFlash。
 
-因此，六组通过可以判定“AR recurrent 算子原型正确且有性能潜力”，不能判定
-“ReplaySSM + AR 功能已完成”。当前顺序仍是 AR1 framework F1-F3，随后完成 AR2-AR4 和
-Replay AR `vllm serve`；确认后再开始 SD1 的独立 AscendC 开发。
+因此，F1-F3 可以判定“AR recurrent 算子已完成 framework 打包且图内可运行”，不能判定
+“ReplaySSM + AR 模型功能已完成”。当前正在验证 AR2-AR4 和 Replay AR `vllm serve`；
+确认后再开始 SD1 的独立 AscendC 开发。
 
 ## 工作量与主要不确定性
 
 | 工作项 | 相对工作量 | 是否依赖上机 | 主要不确定性 |
 |---|---:|---|---|
-| AR1 framework F1-F3 | 小 | 是 | CANN 打包、RPATH、Meta/NPUGraph、批量扩展性 |
+| AR1 framework F1-F3 | 已完成 | 是 | TP4/B16 性能优化推迟到真实模型 profile 后 |
 | AR2-AR4 + AR serve | 中 | 是 | 0.30 cache 生命周期、graph metadata 固定地址、block 复用 |
 | SD1/SD2 独立 AscendC | 大 | 是，多轮探针 | BS×BS 三角计算的 UB/tiling、BF16/FP32误差、flush 分支性能 |
 | SD3/SD4 cursor | 小 | 是 | 同一物理 block 唯一性、图内更新顺序 |

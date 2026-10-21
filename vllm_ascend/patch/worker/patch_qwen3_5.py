@@ -34,6 +34,7 @@ except ImportError:
     Qwen3_5MultiTokenPredictor = None
     IntermediateTensors = None
 
+import vllm_ascend.patch.platform.patch_replayssm_gdn  # noqa: F401
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
@@ -302,8 +303,16 @@ else:
     def _gdn_init_with_packed_weight(self, *args, **kwargs):
         _GDN_ORIGINAL_INIT(self, *args, **kwargs)
         initialize_packed_conv_weight(self)
+        vllm_config = kwargs.get("vllm_config")
+        if vllm_config is None and len(args) >= 2:
+            vllm_config = args[1]
+        if vllm_config is None:
+            raise ValueError("Qwen GDN initialization requires vllm_config")
+        AscendGatedDeltaNetAttention.initialize_replayssm_ar(self, vllm_config)
 
     _GDN_PATCH_TARGET.__init__ = _gdn_init_with_packed_weight
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
+    _GDN_PATCH_TARGET._replayssm_ar_decode = AscendGatedDeltaNetAttention._replayssm_ar_decode
+    _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention.get_state_dtype
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels

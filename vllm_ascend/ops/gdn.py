@@ -28,8 +28,12 @@ from fla_npu.ops.ascendc import (
 from torch import nn
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.utils import replace_parameter
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.triton_utils import triton
@@ -45,6 +49,13 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
+from vllm_ascend.ops.replayssm.ascendc import replayssm_ar_step
+from vllm_ascend.ops.replayssm.cache import (
+    REPLAYSSM_AR_CORES,
+    REPLAYSSM_AR_TILE_V,
+    append_gdn_replayssm_ar_dtypes,
+    append_gdn_replayssm_ar_shapes,
+)
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -307,8 +318,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    ) -> tuple[tuple[int, ...], ...]:
+        base_shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -317,6 +328,99 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+        if not self.cache_config.use_replayssm:
+            return base_shapes
+        return append_gdn_replayssm_ar_shapes(
+            base_shapes,
+            num_k_heads=self.num_k_heads,
+            tp_size=self.tp_size,
+            buffer_len=self.cache_config.replayssm_buffer_len,
+        )
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        base_dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
+        )
+        if not self.cache_config.use_replayssm:
+            return base_dtypes
+        return append_gdn_replayssm_ar_dtypes(
+            base_dtypes,
+            self.model_config.dtype,
+        )
+
+    def initialize_replayssm_ar(self, vllm_config) -> None:
+        """Allocate one graph-stable status workspace per GDN layer."""
+        if not self.cache_config.use_replayssm:
+            return
+        if self.cache_config.mamba_cache_mode not in ("none", "align"):
+            raise ValueError(
+                "ReplaySSM AR supports --mamba-cache-mode none or align; "
+                "mode 'all' does not preserve the Replay ring lifecycle"
+            )
+        if self.num_spec > 0:
+            raise ValueError(
+                "ReplaySSM AR cannot be combined with speculative decoding "
+                "until the ReplaySSM SD commit/rollback path is enabled"
+            )
+        max_rows = vllm_config.scheduler_config.max_num_seqs
+        local_v_heads = self.num_v_heads // self.tp_size
+        tasks_per_row = local_v_heads * (self.head_v_dim // REPLAYSSM_AR_TILE_V)
+        self.register_buffer(
+            "_replayssm_ar_status",
+            torch.empty(
+                max_rows * tasks_per_row,
+                dtype=torch.int32,
+                device=self.A_log.device,
+            ),
+            persistent=False,
+        )
+        logger.info_once(
+            "ReplaySSM AR enabled for Qwen GDN: BF16 conv/checkpoint, "
+            "FP16 d/k rings, FP32 g ring, buffer_len=%d, tile_v=%d, cores=%d",
+            self.cache_config.replayssm_buffer_len,
+            REPLAYSSM_AR_TILE_V,
+            REPLAYSSM_AR_CORES,
+        )
+
+    def _replayssm_ar_decode(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state_indices: torch.Tensor,
+        write_pos: torch.Tensor,
+        is_flush: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        batch = query.shape[1]
+        local_v_heads = self.num_v_heads // self.tp_size
+        tasks_per_row = local_v_heads * (self.head_v_dim // REPLAYSSM_AR_TILE_V)
+        status = self._replayssm_ar_status[: batch * tasks_per_row]
+        replayssm_ar_step(
+            query.squeeze(0).contiguous(),
+            key.squeeze(0).contiguous(),
+            value.squeeze(0).contiguous(),
+            g.squeeze(0).contiguous(),
+            beta.squeeze(0).contiguous(),
+            self.kv_cache[1],
+            self.kv_cache[2],
+            self.kv_cache[3],
+            self.kv_cache[4],
+            state_indices[:batch].contiguous(),
+            write_pos[:batch],
+            is_flush[:batch],
+            output,
+            status,
+            self.head_k_dim**-0.5,
+            REPLAYSSM_AR_TILE_V,
+            REPLAYSSM_AR_CORES,
+        )
+        return output.unsqueeze(0)
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
         return
@@ -637,7 +741,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        use_replayssm_ar = (
+            self.cache_config.use_replayssm and spec_sequence_masks is None and attn_metadata.num_decodes > 0
+        )
+        g, beta = DeviceOperator.fused_gdn_gating(
+            self.A_log,
+            a,
+            b,
+            self.dt_bias,
+            beta_dtype=torch.float32 if use_replayssm_ar else None,
+        )
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g
@@ -694,17 +807,33 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_decode = l2norm_fwd(query_decode.contiguous())
             key_decode = l2norm_fwd(key_decode.contiguous())
-            core_attn_out_decode = recurrent_gated_delta_rule(
-                query_decode.squeeze(0),
-                key_decode.squeeze(0),
-                value_decode.squeeze(0),
-                ssm_state,
-                g=g_non_spec[:, :num_decode_tokens].squeeze(0),
-                beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
-                scale=key_decode.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
-            ).unsqueeze(0)
+            if use_replayssm_ar:
+                write_pos = attn_metadata.replayssm_write_pos
+                is_flush = attn_metadata.replayssm_is_flush
+                assert write_pos is not None and is_flush is not None
+                core_attn_out_decode = self._replayssm_ar_decode(
+                    query=query_decode,
+                    key=key_decode,
+                    value=value_decode,
+                    g=g_non_spec[:, :num_decode_tokens],
+                    beta=beta_non_spec[:, :num_decode_tokens],
+                    state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
+                    write_pos=write_pos,
+                    is_flush=is_flush,
+                    output=core_attn_out[:num_decode_tokens],
+                )
+            else:
+                core_attn_out_decode = recurrent_gated_delta_rule(
+                    query_decode.squeeze(0),
+                    key_decode.squeeze(0),
+                    value_decode.squeeze(0),
+                    ssm_state,
+                    g=g_non_spec[:, :num_decode_tokens].squeeze(0),
+                    beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
+                    scale=key_decode.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
+                ).unsqueeze(0)
         else:
             core_attn_out_decode = None
 
@@ -725,6 +854,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     value_non_spec = value_non_spec[:, num_decode_tokens:]
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
+                if use_replayssm_ar:
+                    beta_non_spec = beta_non_spec.to(value_non_spec.dtype)
 
             use_fla_gdn_prefill = get_pcp_group().world_size == 1 and get_current_hardware_profile().supports(
                 HardwareCapability.FLA_GDN_PREFILL
@@ -816,17 +947,34 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
-            core_attn_out_non_spec = recurrent_gated_delta_rule(
-                query_non_spec.squeeze(0),
-                key_non_spec.squeeze(0),
-                value_non_spec.squeeze(0),
-                ssm_state,
-                g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
-                beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
-                scale=key_non_spec.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=non_spec_state_indices_tensor,
-            ).unsqueeze(0)
+            if use_replayssm_ar:
+                write_pos = attn_metadata.replayssm_write_pos
+                is_flush = attn_metadata.replayssm_is_flush
+                assert g_non_spec is not None and beta_non_spec is not None
+                assert write_pos is not None and is_flush is not None
+                core_attn_out_non_spec = self._replayssm_ar_decode(
+                    query=query_non_spec,
+                    key=key_non_spec,
+                    value=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    state_indices=non_spec_state_indices_tensor,
+                    write_pos=write_pos,
+                    is_flush=is_flush,
+                    output=core_attn_out[: query_non_spec.shape[1]],
+                )
+            else:
+                core_attn_out_non_spec = recurrent_gated_delta_rule(
+                    query_non_spec.squeeze(0),
+                    key_non_spec.squeeze(0),
+                    value_non_spec.squeeze(0),
+                    ssm_state,
+                    g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                    beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                ).unsqueeze(0)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
