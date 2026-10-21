@@ -2,7 +2,8 @@
 
 当前进展：用户确认 `3ff971b` 加 CMake 修复后的独立算子六组测试通过，
 已转入 L2.2 构建/binding/Meta 打包，计算 kernel 保持原样。
-下一步以 [框架打包清单](checklists/LEVEL2_FRAMEWORK.md) 为准；以下 A0/A1 与 Triton 叙述是历史设计。
+下一步以 [框架打包清单](checklists/LEVEL2_FRAMEWORK.md) 为准；AR/SD 完整算子边界、复用决策和
+缺失项见 [算子清单](OPERATOR_INVENTORY.md)。以下 A0/A1 与 Triton 叙述是历史设计。
 
 ## 当前实现方向
 
