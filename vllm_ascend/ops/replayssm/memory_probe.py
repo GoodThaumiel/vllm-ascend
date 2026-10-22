@@ -15,9 +15,9 @@ import torch
 def cache_plan_snapshot(kv_cache_config: Any) -> dict[str, Any]:
     """Account for planned storage and Mamba components without NPU allocations.
 
-    Component bytes describe logical payload, while allocation bytes describe
-    physical backing. In a hybrid cache, summing group pages double-counts
-    overlaid pages; ``kv_cache_tensors`` is the authoritative physical plan.
+    Component bytes describe logical payload. The configured allocation sum
+    can double-count overlaid hybrid groups; deduplicated live view storage
+    and allocator deltas are needed to estimate physical cache residency.
     """
     num_blocks = int(kv_cache_config.num_blocks)
     allocations = kv_cache_config.kv_cache_tensors

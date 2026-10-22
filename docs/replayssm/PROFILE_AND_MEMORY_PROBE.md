@@ -21,7 +21,9 @@ At the current 30.399 ms device-op aggregate, Replay GDN itself is 9.8%; even el
 
 AR retains a full checkpoint and adds D/K/G history. It saves repeated **state writes** between flushes, not the logical persistent-state size. With TP4, L=16, HV=12, H=4 and BF16/FP16/FP32 as configured, one GDN slot adds 48 KiB D + 16 KiB K + 0.75 KiB G = **64.75 KiB logical ring**. Across 48 layers and 1510 slots this is 4.476 GiB of logical payload per rank. Physical growth can be lower or zero if the ring fits existing page padding; cache groups can also overlay the same backing. SD's proposed snapshot/rollback memory saving is separate and is not enabled by current AR dispatch.
 
-The probe logs three different quantities per rank: `logical_state_component_bytes` from shapes, `planned_device_backing_bytes` from `KVCacheConfig.kv_cache_tensors`, and `unique_backing_bytes` from actual cache view storages. It also logs `torch_allocated_bytes` and `torch_reserved_bytes` after weights, after KV initialization, and before/after graph capture. This distinguishes cache payload, page allocation, and graph/allocator overhead. It does not infer process-wide HBM from PyTorch allocator counters; use `npu-smi` alongside it.
+The probe logs three different quantities per rank: `logical_state_component_bytes` from shapes, `planned_device_backing_bytes` as the sum of `KVCacheConfig.kv_cache_tensors` entries, and `unique_backing_bytes` from deduplicated cache view storages. The configured sum may double-count overlaid hybrid allocations; it is **not** a physical HBM total. The probe also logs `torch_allocated_bytes` and `torch_reserved_bytes` after weights, after KV initialization, and before/after graph capture. It does not infer process-wide HBM from PyTorch allocator counters; use `npu-smi` alongside it.
+
+The first same-build TP4 report returned identical native and Replay allocator values at every stage: 12.691 GiB after weights, 24.488 GiB after KV initialization, and 24.492 GiB allocated after graph capture. Both had 1510 blocks and 11.797 GiB of deduplicated cache backing. The configured allocation sum was 47.188 GiB in both runs, four times the deduplicated view storage, so it cannot be read as physical usage. Replay added D/K/G logical components (about 4.476 GiB at 1510 slots and 48 layers) inside the existing padded pages, with no measurable physical cache or graph-pool change in this configuration. Therefore the earlier cross-image ~1 GiB difference is not an AR storage saving.
 
 ## On-machine validation checklist
 
@@ -53,7 +55,7 @@ python scripts/replayssm/summarize_memory_probe.py \
 
 - [ ] Four workers emit `model_loaded`, `kv_cache_initialized`, `graph_capture_before`, `graph_capture_after`; no `ReplaySSM memory probe failed` line.
 - [ ] Record source commit, `vllm`/`vllm-ascend` packages, CANN version, TP and per-rank `num_blocks` for both runs.
-- [ ] Compare `planned_device_backing_bytes` and GDN page sizes first; if `num_blocks` differs, compare per-block geometry before total GiB.
+- [ ] Compare deduplicated `unique_view_backing_bytes`, allocator deltas and GDN page sizes first; treat `planned_device_backing_bytes` as an overlapping plan sum. If `num_blocks` differs, compare per-block geometry before total GiB.
 - [ ] Compare KV initialization and graph capture deltas in `torch_allocated_bytes`/`torch_reserved_bytes`; record idle and post-request `npu-smi` per card.
 - [ ] Confirm one sample GDN view has expected page stride and five components under Replay; report any unexpected full-cache `contiguous` profiler rows separately with shape and call stack.
 - [ ] Once TP4 reports are complete, repeat with `--tensor-parallel-size 8` and eight idle cards; keep every other setting identical between native and Replay TP8 runs.
