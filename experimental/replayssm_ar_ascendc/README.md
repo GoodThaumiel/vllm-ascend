@@ -152,6 +152,9 @@ graph_perf 阶段验证当前 stream、NPUGraph capture、改变输入/cursor/fl
 `--native-baseline` 额外测已安装 fla_npu 普通 AR 与空历史 flush Replay 的同输入对照；
 历史重放路径仅报告原始延迟，不自动推导端到端加速比。测量不包含 norm/gating 预处理、HTTP 和调度。
 当前 Replay 计时包含诊断 status 写入，原生算子无该写入；最终性能优化时需单独评估这项开销。
+`--cache-layout compact|page_strided` 可让 graph_perf 用相同输入对比紧凑 cache 与 vLLM
+共享 page 的 cache 布局；报告记录所选布局。更改布局后应在同卡、同版本、同几何下重测，
+不能把旧的紧凑布局时延直接用于真实 serving 的性能结论。
 
 ## 验证后合入路径
 

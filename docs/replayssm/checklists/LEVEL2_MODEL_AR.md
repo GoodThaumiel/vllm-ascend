@@ -103,11 +103,33 @@ python3 experimental/replayssm_ar_ascendc/run.py \
   --output /tmp/replayssm-l23-page-stride-tp4-r1
 ```
 
-性能和显存预期：新增的只有四个 kernel 标量参数，并把原有 slot offset 乘法的紧凑步长替换为
-runtime stride，算术条数基本不变；没有新增 workspace、NPU tensor 或 cache。TP4 当前 1511
+显存方面，新增的只有四个 kernel 标量参数，并把原有 slot offset 乘法的紧凑步长替换为
+runtime stride；没有新增 workspace、NPU tensor 或 cache。TP4 当前 1511
 slots 时，若采用 `.contiguous()`，单层需要临时复制约 662 MiB，TP8 约 331 MiB，并且还需
-回写 mutation；本实现完全避免这部分开销。实际 kernel p50 仍需用原 graph_perf 测量确认，
-预期变化应落在测试波动内。
+回写 mutation；本实现避免这部分开销。时延变化未知：runtime stride 改变地址计算，page
+间隔也可能影响访存和编译结果；旧的紧凑布局时延不能直接代表 serving。A1 正确性通过后，
+用本轮同一扩展、同一张卡做紧凑/page-strided 成对单算子测试：
+
+```bash
+for tp in 4 8; do
+  for batch in 1 8 16; do
+    for layout in compact page_strided; do
+      python3 experimental/replayssm_ar_ascendc/run.py \
+        --backend framework --stage graph_perf --tp "$tp" --batch "$batch" \
+        --capacity 16 --cores 8 --tile-v 32 --devices 0 --iterations 100 \
+        --cache-layout "$layout" --timeout 1200 \
+        --output "/tmp/replayssm-l23-perf-tp${tp}-b${batch}-${layout}-r1"
+    done
+  done
+done
+```
+
+每对比较 `perf_graph_single_empty_history_flush` 的 p50/p90 和三个 `perf_pos*_flush*`
+的 p50/p90；后者是 NPU Event 包住 eager launch，可能含 host 间隙。先核对每个 report
+的 `cache_layout`、源码 commit、扩展 hash、正确性 case 全部通过；若差异稳定超过 10%，
+同卡交错重跑至少两轮并回传 JSON 与日志，以区分布局影响和测量波动。旧的 125–175 μs
+是不同构建及紧凑布局的数据，只作背景参考。此测试是单卡本地 head 几何，不等同完整 TP
+`vllm serve` 时延；服务端到端时延仍按 A3 单独测。
 
 使用服务器已有模型目录；模型的 architecture 应解析为当前 0.30 的 Qwen3Next/Qwen3.5 GDN
 实现。先用独占端口启动 Replay 服务：

@@ -73,14 +73,18 @@ class ReferenceTests(unittest.TestCase):
             self.assertTrue(expected[name][1, :, 7].isfinite().all())
 
     def test_page_strided_shared_backing_matches_contiguous_reference(self):
-        case = make_case(tp=4, batch=2, position=7)
-        packed = clone_page_strided_case(case)
-        data_ptrs = {packed[name].untyped_storage().data_ptr() for name in BUFFER_NAMES}
-        self.assertEqual(len(data_ptrs), 1)
-        self.assertTrue(all(not packed[name].is_contiguous() for name in BUFFER_NAMES))
-        expected = golden(case)
-        actual = golden(packed)
-        check_result(actual, expected, case)
+        for tp, expected_page_bytes in ((4, 524288), (8, 262144)):
+            with self.subTest(tp=tp):
+                case = make_case(tp=tp, batch=2, position=7)
+                packed = clone_page_strided_case(case)
+                data_ptrs = {packed[name].untyped_storage().data_ptr() for name in BUFFER_NAMES}
+                self.assertEqual(len(data_ptrs), 1)
+                for name in BUFFER_NAMES:
+                    self.assertFalse(packed[name].is_contiguous())
+                    self.assertEqual(packed[name].stride(0) * packed[name].element_size(), expected_page_bytes)
+                expected = golden(case)
+                actual = golden(packed)
+                check_result(actual, expected, case)
 
     def test_capacity_one_flush_and_padding(self):
         case = make_case(tp=8, batch=2, capacity=1, flush=True, padding=True)
@@ -157,11 +161,13 @@ class ReferenceTests(unittest.TestCase):
             library=Path("/tmp/lib.so"),
             iterations=20,
             native_baseline=False,
+            cache_layout="page_strided",
         )
         command = child_command(args, 3, Path("/tmp/results/device3.json"))
         self.assertEqual(command[command.index("--output") + 1], "/tmp/results")
         self.assertEqual(command[command.index("--child-device") + 1], "3")
         self.assertEqual(command[command.index("--stage") + 1], "smoke")
+        self.assertEqual(command[command.index("--cache-layout") + 1], "page_strided")
 
 
 if __name__ == "__main__":

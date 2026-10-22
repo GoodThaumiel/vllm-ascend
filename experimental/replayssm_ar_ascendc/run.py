@@ -51,6 +51,8 @@ def child_command(args, device, report):
         str(args.iterations),
         "--backend",
         getattr(args, "backend", "standalone"),
+        "--cache-layout",
+        getattr(args, "cache_layout", "compact"),
         "--stack-layers",
         str(getattr(args, "stack_layers", 0)),
     ]
@@ -169,10 +171,11 @@ def event_timing(call, reset, iterations):
 
 def run_graph_perf(op, args, device, save):
     import torch
-    from lab import BUFFER_NAMES, check_result, clone_case, golden, invoke, make_case
+    from lab import BUFFER_NAMES, check_result, clone_case, clone_page_strided_case, golden, invoke, make_case
 
+    clone_for_layout = clone_page_strided_case if args.cache_layout == "page_strided" else clone_case
     cpu = make_case(args.tp, args.batch, args.capacity, flush=args.capacity == 1, tile_v=args.tile_v, seed=900)
-    gpu = clone_case(cpu, device)
+    gpu = clone_for_layout(cpu, device)
     # Warm up before capture; test current-stream launch on a nondefault stream.
     stream = torch.npu.Stream(device=device)
     stream.wait_stream(torch.npu.current_stream())
@@ -211,7 +214,7 @@ def run_graph_perf(op, args, device, save):
     for pos, flush in ((0, False), (args.capacity // 2, False), (args.capacity - 1, True)):
         flush = flush or pos == args.capacity - 1
         cpu = make_case(args.tp, args.batch, args.capacity, pos, flush, args.tile_v, seed=910 + pos)
-        gpu = clone_case(cpu, device)
+        gpu = clone_for_layout(cpu, device)
         pristine = {name: gpu[name].clone() for name in BUFFER_NAMES}
 
         def reset(gpu=gpu, pristine=pristine):
@@ -227,7 +230,7 @@ def run_graph_perf(op, args, device, save):
 
         # Only compare the same state/output semantics: empty history + flush.
         cpu = make_case(args.tp, args.batch, args.capacity, 0, True, args.tile_v, seed=950)
-        gpu = clone_case(cpu, device)
+        gpu = clone_for_layout(cpu, device)
         state = gpu["checkpoint"]
         pristine = state.clone()
         lengths = torch.tensor([0] + [1] * args.batch, dtype=torch.int32, device=device)
@@ -265,7 +268,7 @@ def run_graph_perf(op, args, device, save):
 
 def run_layer_stack(op, args, device, save):
     import torch
-    from lab import check_result, clone_case, golden, invoke, make_case
+    from lab import check_result, clone_case, clone_page_strided_case, golden, invoke, make_case
 
     if args.capacity < 3:
         raise ValueError("layer-stack benchmark requires capacity >= 3")
@@ -276,7 +279,8 @@ def run_layer_stack(op, args, device, save):
         make_case(args.tp, args.batch, args.capacity, args.capacity // 2, False, args.tile_v, seed=1000 + i)
         for i in range(args.stack_layers)
     ]
-    buffers = [clone_case(case, device) for case in cases]
+    clone_for_layout = clone_page_strided_case if args.cache_layout == "page_strided" else clone_case
+    buffers = [clone_for_layout(case, device) for case in cases]
 
     def call_stack():
         for case in buffers:
@@ -308,6 +312,7 @@ def run_child(args, report):
         "status": "RUNNING",
         "stage": args.stage,
         "backend": args.backend,
+        "cache_layout": args.cache_layout,
         "stack_layers": args.stack_layers,
         "device": args.child_device,
         "tp_geometry": args.tp,
@@ -434,6 +439,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=STAGES, default="smoke")
     parser.add_argument("--backend", choices=("standalone", "framework"), default="standalone")
+    parser.add_argument(
+        "--cache-layout",
+        choices=("compact", "page_strided"),
+        default="compact",
+        help="Persistent-cache layout for graph_perf (smoke always checks both)",
+    )
     parser.add_argument(
         "--stack-layers", type=int, default=0, help="Optional independent-layer captured graph benchmark"
     )
