@@ -122,6 +122,34 @@ def clone_case(case, device="cpu"):
     return {name: tensor.to(device).clone() for name, tensor in case.items()}
 
 
+def clone_page_strided_case(case, device="cpu"):
+    """Clone a case into vLLM's shared, page-strided state-cache layout."""
+    result = {name: tensor.to(device).clone() for name, tensor in case.items() if name not in BUFFER_NAMES}
+    num_slots = case["checkpoint"].shape[0]
+    region_bytes = {name: case[name][0].numel() * case[name].element_size() for name in BUFFER_NAMES}
+    unaligned_page_bytes = sum(region_bytes.values())
+    page_alignment = 256 * 1024
+    page_bytes = ((unaligned_page_bytes + page_alignment - 1) // page_alignment) * page_alignment
+    raw = torch.empty(num_slots * page_bytes, dtype=torch.uint8, device=device)
+    offset_bytes = 0
+    for name in BUFFER_NAMES:
+        source = case[name]
+        element_size = source.element_size()
+        typed = raw.view(source.dtype)
+        strides = list(source.stride())
+        strides[0] = page_bytes // element_size
+        view = torch.as_strided(
+            typed,
+            size=source.shape,
+            stride=tuple(strides),
+            storage_offset=offset_bytes // element_size,
+        )
+        view.copy_(source.to(device))
+        result[name] = view
+        offset_bytes += region_bytes[name]
+    return result
+
+
 def golden(case: dict):
     """FP64 CPU replay with quantization only at persistent-buffer boundaries.
 

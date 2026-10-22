@@ -18,7 +18,9 @@ class ReplayAR {
   __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
                               GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR positions,
                               GM_ADDR flush, GM_ADDR out, GM_ADDR status, uint32_t batch, uint32_t numSlots,
-                              uint32_t heads, uint32_t valueHeads, uint32_t capacity, uint32_t tileV, float scale) {
+                              uint32_t heads, uint32_t valueHeads, uint32_t capacity,
+                              uint64_t checkpointSlotStride, uint64_t dCacheSlotStride, uint64_t kCacheSlotStride,
+                              uint64_t gCacheSlotStride, uint32_t tileV, float scale) {
     q_.SetGlobalBuffer((__gm__ bfloat16_t*)q);
     k_.SetGlobalBuffer((__gm__ bfloat16_t*)k);
     v_.SetGlobalBuffer((__gm__ bfloat16_t*)v);
@@ -38,6 +40,10 @@ class ReplayAR {
     heads_ = heads;
     valueHeads_ = valueHeads;
     capacity_ = capacity;
+    checkpointSlotStride_ = checkpointSlotStride;
+    dCacheSlotStride_ = dCacheSlotStride;
+    kCacheSlotStride_ = kCacheSlotStride;
+    gCacheSlotStride_ = gCacheSlotStride;
     tileV_ = tileV;
     scale_ = scale;
     tiles_ = V_DIM / tileV;
@@ -97,10 +103,14 @@ class ReplayAR {
         WriteStatus(task, error);
         continue;
       }
-      uint64_t stateOffset = (static_cast<uint64_t>(slot) * valueHeads_ + head) * V_DIM * K_DIM + vStart * K_DIM;
-      uint64_t dOffset = (static_cast<uint64_t>(slot) * valueHeads_ + head) * capacity_ * V_DIM;
-      uint64_t kOffset = (static_cast<uint64_t>(slot) * heads_ + keyHead) * capacity_ * K_DIM;
-      uint64_t gOffset = (static_cast<uint64_t>(slot) * valueHeads_ + head) * capacity_;
+      uint64_t stateOffset = static_cast<uint64_t>(slot) * checkpointSlotStride_ +
+                             static_cast<uint64_t>(head) * V_DIM * K_DIM + vStart * K_DIM;
+      uint64_t dOffset = static_cast<uint64_t>(slot) * dCacheSlotStride_ +
+                         static_cast<uint64_t>(head) * capacity_ * V_DIM;
+      uint64_t kOffset = static_cast<uint64_t>(slot) * kCacheSlotStride_ +
+                         static_cast<uint64_t>(keyHead) * capacity_ * K_DIM;
+      uint64_t gOffset = static_cast<uint64_t>(slot) * gCacheSlotStride_ +
+                         static_cast<uint64_t>(head) * capacity_;
       Load(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
       Load(q_, (static_cast<uint64_t>(row) * heads_ + keyHead) * K_DIM, qLocal_, K_DIM);
       Load(k_, (static_cast<uint64_t>(row) * heads_ + keyHead) * K_DIM, kLocal_, K_DIM);
@@ -283,6 +293,7 @@ class ReplayAR {
   GlobalTensor<float> g_, beta_, gCache_;
   GlobalTensor<int32_t> slots_, positions_, flush_, status_;
   uint32_t batch_, numSlots_, heads_, valueHeads_, capacity_, tileV_, tiles_;
+  uint64_t checkpointSlotStride_, dCacheSlotStride_, kCacheSlotStride_, gCacheSlotStride_;
   float scale_;
 };
 }  // namespace
@@ -291,11 +302,14 @@ extern "C" __global__ __aicore__ void replayssm_ar(GM_ADDR q, GM_ADDR k, GM_ADDR
                                                    GM_ADDR checkpoint, GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache,
                                                    GM_ADDR slots, GM_ADDR positions, GM_ADDR flush, GM_ADDR out,
                                                    GM_ADDR status, uint32_t batch, uint32_t numSlots, uint32_t heads,
-                                                   uint32_t valueHeads, uint32_t capacity, uint32_t tileV,
-                                                   float scale) {
+                                                   uint32_t valueHeads, uint32_t capacity,
+                                                   uint64_t checkpointSlotStride, uint64_t dCacheSlotStride,
+                                                   uint64_t kCacheSlotStride, uint64_t gCacheSlotStride,
+                                                   uint32_t tileV, float scale) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   ReplayAR op;
   op.Init(q, k, v, g, beta, checkpoint, dCache, kCache, gCache, slots, positions, flush, out, status, batch, numSlots,
-          heads, valueHeads, capacity, tileV, scale);
+          heads, valueHeads, capacity, checkpointSlotStride, dCacheSlotStride, kCacheSlotStride, gCacheSlotStride,
+          tileV, scale);
   op.Process();
 }

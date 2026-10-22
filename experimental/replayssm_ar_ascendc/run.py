@@ -59,12 +59,12 @@ def child_command(args, device, report):
     return command
 
 
-def run_single_case(op, cpu_case, args, device, label):
+def run_single_case(op, cpu_case, args, device, label, page_strided=False):
     import torch
-    from lab import check_result, clone_case, golden, invoke
+    from lab import check_result, clone_case, clone_page_strided_case, golden, invoke
 
     expected = golden(cpu_case)
-    device_case = clone_case(cpu_case, device)
+    device_case = clone_page_strided_case(cpu_case, device) if page_strided else clone_case(cpu_case, device)
     print(f"LAUNCH {label}", flush=True)
     begin = time.perf_counter()
     invoke(op, device_case, args.tile_v, args.cores)
@@ -403,6 +403,20 @@ def run_child(args, report):
                 record["active_case"] = label
                 write_json(report, record)
                 save(run_single_case(op, cpu, args, device, label))
+                if args.stage == "smoke" and not pad:
+                    page_label = f"{label}_page_strided"
+                    record["active_case"] = page_label
+                    write_json(report, record)
+                    save(
+                        run_single_case(
+                            op,
+                            cpu,
+                            args,
+                            device,
+                            page_label,
+                            page_strided=True,
+                        )
+                    )
         elif args.stage == "lifecycle":
             run_lifecycle(op, args, device, save)
             run_invalid_metadata(op, args, device, save)

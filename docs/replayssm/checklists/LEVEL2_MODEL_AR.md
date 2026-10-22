@@ -83,6 +83,32 @@ cache 几何确定后的重建中也没有传入此开关。结果是在构造 m
 这些更改仍只涉及 Python；无需重编 C++/AscendC 扩展。停止上一轮服务后拉取新提交，建议删除
 `~/.cache/vllm/torch_compile_cache`，再完整重启 TP worker。
 
+第三轮 capture 已经进入 `_C_ascend.replayssm_ar_step_`，证明上述覆写生命周期问题通过。
+新的失败是 binding 把四块持久 cache 错当作整体连续 tensor。真实 vLLM allocator 将同一 slot
+的 conv/checkpoint/d/k/g 放在共享 page 中，因此四块 Replay view 的内部维度连续，但
+`stride(0)` 等于完整 page，而不是各自的紧凑大小。本轮改为把四个 runtime slot stride 从
+binding 传给 AscendC kernel，cache 直接原位读写；不调用 `.contiguous()`，也不复制回写。
+
+这是 C++/AscendC ABI 内部变更，必须重新构建扩展。新的 framework smoke 会额外运行
+`*_page_strided` case，使用四块 cache 共用一个 backing 的布局复现 serving 条件：
+
+```bash
+COMPILE_CUSTOM_KERNELS=1 SOC_VERSION=ascend910b1 \
+python3 -m pip install --no-build-isolation --no-deps -v -e . \
+  2>&1 | tee /tmp/replayssm-l23-stride-build.log
+
+python3 experimental/replayssm_ar_ascendc/run.py \
+  --backend framework --stage smoke --tp 4 --batch 16 --capacity 16 \
+  --cores 8 --tile-v 32 --devices 0 --timeout 600 \
+  --output /tmp/replayssm-l23-page-stride-tp4-r1
+```
+
+性能和显存预期：新增的只有四个 kernel 标量参数，并把原有 slot offset 乘法的紧凑步长替换为
+runtime stride，算术条数基本不变；没有新增 workspace、NPU tensor 或 cache。TP4 当前 1511
+slots 时，若采用 `.contiguous()`，单层需要临时复制约 662 MiB，TP8 约 331 MiB，并且还需
+回写 mutation；本实现完全避免这部分开销。实际 kernel p50 仍需用原 graph_perf 测量确认，
+预期变化应落在测试波动内。
+
 使用服务器已有模型目录；模型的 architecture 应解析为当前 0.30 的 Qwen3Next/Qwen3.5 GDN
 实现。先用独占端口启动 Replay 服务：
 
@@ -107,6 +133,7 @@ vllm serve "$REPLAYSSM_MODEL" \
 `max_tokens=64` 的请求。至少一个请求生成超过 32 tokens，确保跨过两次 L=16 flush。
 
 - [ ] 服务加载完成；日志显示五块 GDN state，未回退 native recurrent。
+- [ ] framework smoke 的普通 case 与 `page_strided` case 都通过，四块 cache 保持共享 backing。
 - [ ] `[1,4,8,16]` 四个 FULL_DECODE_ONLY capture size 全部完成，不再出现
   `requires CPU decode-base and sequence-length metadata` 或缺失
   `replayssm_decode_base_cpu_tensor`。

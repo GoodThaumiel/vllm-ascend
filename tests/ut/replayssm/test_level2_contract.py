@@ -93,6 +93,24 @@ class ReplaySSMARContractTests(unittest.TestCase):
         self.assertIn("b_d_all = tl.where(mask_v[:, None] & cache_valid[None, :], b_d_masked", source)
         self.assertNotIn("tl.load(p_d_main, mask=mask_v[:, None] & cache_valid[None, :]", source)
 
+    def test_ascendc_kernel_uses_runtime_slot_strides_for_packed_cache(self):
+        root = Path(__file__).resolve().parents[3]
+        host = (root / "csrc/replayssm_ar.cpp").read_text()
+        kernel = (root / "csrc/kernels/replayssm_ar.cpp").read_text()
+        for cache in ("checkpoint", "d_cache", "k_cache", "g_cache"):
+            self.assertIn(f"{cache}.stride(0)", host)
+        for stride in (
+            "checkpointSlotStride_",
+            "dCacheSlotStride_",
+            "kCacheSlotStride_",
+            "gCacheSlotStride_",
+        ):
+            self.assertIn(stride, kernel)
+        self.assertNotIn(
+            "t.device() == q.device() && t.is_contiguous()",
+            host,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

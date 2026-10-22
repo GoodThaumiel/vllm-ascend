@@ -54,7 +54,10 @@ replayssm_ar_ascendc/
 | slots, positions, flush | `[B]` | INT32 |
 | status，原位输出 | `[B*HV*(128/tile_v)]` | INT32 |
 
-所有张量必须连续、在同一卡上，任何写入张量不得与其他参数共享 storage。
+所有张量必须在同一卡上。q/k/v/g/beta、metadata、out 和 status 必须连续；四块持久 cache
+允许采用 vLLM 的共享 page backing：slot 内部维度连续，`stride(0)` 可以包含 page padding，
+并且四块 cache 可以共享 storage 中互不重叠的区间。kernel 从 torch binding 接收各 cache 的
+实际 slot stride，直接在原 view 上读写，不创建连续副本。
 `HV % H == 0`，`1 <= L <= 64`。同一 launch 的正 slot 必须互异；slot 0 为 padding。
 CPU 测试工具检查 slot 唯一性，binding 不从设备读回 metadata；调用方负责该前提。
 flush/cursor 由设备张量控制，不在 host 上用 `.item()` 决策。

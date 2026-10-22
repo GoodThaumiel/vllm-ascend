@@ -14,6 +14,7 @@ from lab import (  # noqa: E402
     BUFFER_NAMES,
     check_result,
     clone_case,
+    clone_page_strided_case,
     golden,
     make_case,
     ub_bytes,
@@ -70,6 +71,16 @@ class ReferenceTests(unittest.TestCase):
         for name in ("d_cache", "k_cache", "g_cache"):
             self.assertTrue(expected[name][1, :, 8:].isnan().all())
             self.assertTrue(expected[name][1, :, 7].isfinite().all())
+
+    def test_page_strided_shared_backing_matches_contiguous_reference(self):
+        case = make_case(tp=4, batch=2, position=7)
+        packed = clone_page_strided_case(case)
+        data_ptrs = {packed[name].untyped_storage().data_ptr() for name in BUFFER_NAMES}
+        self.assertEqual(len(data_ptrs), 1)
+        self.assertTrue(all(not packed[name].is_contiguous() for name in BUFFER_NAMES))
+        expected = golden(case)
+        actual = golden(packed)
+        check_result(actual, expected, case)
 
     def test_capacity_one_flush_and_padding(self):
         case = make_case(tp=8, batch=2, capacity=1, flush=True, padding=True)
