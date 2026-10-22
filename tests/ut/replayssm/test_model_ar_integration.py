@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
+import ast
 import importlib.util
 import unittest
 from pathlib import Path
@@ -20,6 +21,35 @@ SPEC.loader.exec_module(CACHE)
 
 
 class ReplaySSMModelARIntegrationTests(unittest.TestCase):
+    def test_all_npu_input_batch_owners_keep_replayssm_lifecycle(self) -> None:
+        input_batch_source = (ROOT / "vllm_ascend/worker/npu_input_batch.py").read_text()
+        self.assertIn("self.replayssm_decode_base_cpu_tensor = torch.zeros(", input_batch_source)
+        self.assertIn(
+            "self.replayssm_decode_base = self.replayssm_decode_base_cpu_tensor.numpy()",
+            input_batch_source,
+        )
+
+        # Ascend replaces upstream InputBatch construction both before and
+        # after final KV-cache geometry is known. The 310P subclass is audited
+        # as well so every NPU-owned constructor preserves the upstream flag.
+        callsites = (
+            ROOT / "vllm_ascend/worker/model_runner_v1.py",
+            ROOT / "vllm_ascend/_310p/model_runner_310p.py",
+        )
+        seen = 0
+        for path in callsites:
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not isinstance(func, ast.Name) or func.id != "NPUInputBatch":
+                    continue
+                seen += 1
+                keywords = {keyword.arg for keyword in node.keywords}
+                self.assertIn("use_replayssm", keywords, f"missing at {path}:{node.lineno}")
+        self.assertEqual(seen, 4)
+
     def test_decode_base_uses_live_buffer_and_zeroes_capture_dummy(self) -> None:
         live = torch.tensor([17, 33, 0], dtype=torch.int32)
         actual = CACHE.prepare_replayssm_decode_base_cpu(live, is_dummy_run=False)

@@ -633,6 +633,7 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config = getattr(self.vllm_config, "reasoning_config", None),
+            use_replayssm=self.cache_config.use_replayssm,
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
@@ -6190,6 +6191,7 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config = getattr(self.vllm_config, "reasoning_config", None),
+                use_replayssm=self.cache_config.use_replayssm,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

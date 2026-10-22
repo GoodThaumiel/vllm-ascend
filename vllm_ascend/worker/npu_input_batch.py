@@ -38,9 +38,9 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 class NPUInputBatch(InputBatch):
     # main2main compat: `use_replayssm` and `slot_mapping_modes` were
     # added to upstream InputBatch.__init__() in vllm main after 0.26.0.
-    # NPU does not implement Mamba replay-SSM, so the kwargs are only
-    # accepted for interface alignment.
-    # Remove the version gate once 0.26.0 support is dropped.
+    # Keep ReplaySSM's host-side request lifecycle in lockstep with upstream:
+    # inherited add_request/swap_states/condense methods update the numpy view
+    # below whenever ReplaySSM is enabled.
     def __init__(
         self,
         max_num_reqs: int,
@@ -127,6 +127,19 @@ class NPUInputBatch(InputBatch):
             pin_memory=pin_memory,
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        # ReplaySSM decode ring origin. This must be a pinned CPU tensor because
+        # attention metadata consumes it on the host while graph-safe cursor
+        # buffers are copied to the NPU. Allocate it unconditionally, matching
+        # upstream InputBatch, so dummy graph capture and native mode share one
+        # stable class contract.
+        self.replayssm_decode_base_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self.replayssm_decode_base = self.replayssm_decode_base_cpu_tensor.numpy()
 
         # Block table.
         self.block_table = MultiGroupBlockTable(

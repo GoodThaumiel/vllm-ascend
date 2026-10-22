@@ -105,6 +105,7 @@ class NPUModelRunner310(NPUModelRunner):
                 self.vllm_config.speculative_config.num_speculative_tokens if self.vllm_config.speculative_config else 0
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            use_replayssm=self.cache_config.use_replayssm,
         )
         self._acl_format = ACL_FORMAT_FRACTAL_NZ
         logger.info_once("Weight layout uses FRACTAL_NZ.")
@@ -1027,4 +1028,5 @@ class NPUModelRunner310(NPUModelRunner):
                 max_num_blocks_per_req=max_num_blocks,
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                use_replayssm=self.cache_config.use_replayssm,
             )

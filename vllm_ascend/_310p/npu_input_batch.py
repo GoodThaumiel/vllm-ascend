@@ -25,6 +25,7 @@ class NPUInputBatch310(NPUInputBatch):
         num_speculative_tokens: int = 0,
         cp_kv_cache_interleave_size: int = 1,
         kv_cache_groups: list[KVCacheGroupSpec] | None = None,
+        use_replayssm: bool = False,
     ):
         super().__init__(
             max_num_reqs=max_num_reqs,
@@ -43,6 +44,7 @@ class NPUInputBatch310(NPUInputBatch):
             num_speculative_tokens=num_speculative_tokens,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             kv_cache_groups=kv_cache_groups,
+            use_replayssm=use_replayssm,
         )
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,

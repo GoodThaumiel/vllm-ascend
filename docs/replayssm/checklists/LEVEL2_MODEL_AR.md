@@ -61,6 +61,28 @@ A0 已由用户确认通过。首轮 A1 在 capture dummy 构造 GDN metadata �
 修复后 dummy 使用全零 decode base，真实请求继续引用 runner 的 pinned CPU 生命周期缓冲区。
 本修复只改 Python，editable 安装无需重编 C++，但必须停止旧服务并重新拉取、重启全部 worker。
 
+第二轮 capture 暴露了更早一层的覆写缺口：Ascend 的 `NPUInputBatch.__init__` 接收
+`use_replayssm`，但未创建上游 `InputBatch` 的 decode-base tensor；而 910B runner 在初始创建和
+cache 几何确定后的重建中也没有传入此开关。结果是在构造 metadata 前直接报
+`NPUInputBatch has no attribute replayssm_decode_base_cpu_tensor`。本轮同时修复 tensor/NumPy
+视图的拥有权和所有四个 NPU batch 构造点（910B、310P 各两个），避免请求加入、交换、压缩或
+重建后丢失 ring origin。
+
+对 vLLM 0.30 ReplaySSM 状态的覆写审计结果如下：
+
+| 上游状态或入口 | Ascend 覆写 | 处理结果 |
+| --- | --- | --- |
+| `InputBatch.use_replayssm`、decode-base tensor/NumPy 视图 | `NPUInputBatch.__init__` | 本轮补齐；继承的 `add_request/swap_states/condense` 自动维护同一视图 |
+| runner 初始 batch 与 KV 几何变化后的 batch 重建 | `NPUModelRunner`、310P runner | 本轮所有构造点都传 `use_replayssm` |
+| `CommonAttentionMetadata.replayssm_decode_base_cpu` | `AscendCommonAttentionMetadata` 与 `_build_attention_metadata` | dataclass 继承保留字段；上一提交已补真实请求和 dummy capture 传递 |
+| Mamba/GDN 每层 metadata 的 graph-stable cursor | `AscendGDNAttentionMetadataBuilder` | 已拥有固定地址 `write_pos/is_flush` 缓冲并清零 padding |
+| cache bind 后的跨层 tracker 分享 | Ascend `bind_kv_cache*` patch | 已调用上游 `share_replayssm_ring_trackers`；Qwen GDN AR 使用 host cursor，不依赖 Mamba2 tracker |
+| state shape/dtype 与 decode dispatch | Qwen GDN 平台 patch、Ascend GDN 实现 | 已补五块 BF16/FP16/FP32 cache 和 AscendC dispatch |
+| v2 model runner | Ascend v2 patch | 上游 v2 尚无 decode-base request lifecycle；本级 `vllm serve` 继续限定 v1 runner |
+
+这些更改仍只涉及 Python；无需重编 C++/AscendC 扩展。停止上一轮服务后拉取新提交，建议删除
+`~/.cache/vllm/torch_compile_cache`，再完整重启 TP worker。
+
 使用服务器已有模型目录；模型的 architecture 应解析为当前 0.30 的 Qwen3Next/Qwen3.5 GDN
 实现。先用独占端口启动 Replay 服务：
 
@@ -86,7 +108,8 @@ vllm serve "$REPLAYSSM_MODEL" \
 
 - [ ] 服务加载完成；日志显示五块 GDN state，未回退 native recurrent。
 - [ ] `[1,4,8,16]` 四个 FULL_DECODE_ONLY capture size 全部完成，不再出现
-  `requires CPU decode-base and sequence-length metadata`。
+  `requires CPU decode-base and sequence-length metadata` 或缺失
+  `replayssm_decode_base_cpu_tensor`。
 - [ ] 首 token、pos 15 flush、pos 16 重新从 checkpoint 开始时无 C++ 校验或设备错误。
 - [ ] HTTP 返回完整，生成 token 全部有限且服务在请求后继续健康。
 - [ ] 停止服务后 4 卡无残留进程、board 无 error。
