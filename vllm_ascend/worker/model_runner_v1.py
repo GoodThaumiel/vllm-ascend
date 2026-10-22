@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import json
 import logging
 import math
 import sys
@@ -120,6 +121,7 @@ from vllm.v1.worker.utils import (
 )
 
 # yapf: enable
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
@@ -183,6 +185,7 @@ from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
 from vllm_ascend.ops.replayssm.cache import prepare_replayssm_decode_base_cpu
+from vllm_ascend.ops.replayssm.memory_probe import memory_snapshot
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -4379,6 +4382,20 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    def _log_replayssm_memory(self, stage: str, kv_caches: dict[str, Any] | None = None) -> None:
+        if not ascend_envs.VLLM_ASCEND_REPLAYSSM_MEMORY_PROBE:
+            return
+        try:
+            report = memory_snapshot(
+                stage=stage,
+                use_replayssm=self.cache_config.use_replayssm,
+                kv_cache_config=getattr(self, "kv_cache_config", None),
+                kv_caches=kv_caches,
+            )
+            logger.info("REPLAYSSM_MEMORY_JSON %s", json.dumps(report, sort_keys=True))
+        except Exception:
+            logger.exception("ReplaySSM memory probe failed at %s", stage)
+
     def load_model(self) -> None:
         from vllm_ascend.model_executor.warmup.early_kernel_warmup import (
             join_early_kernel_warmup,
@@ -4574,6 +4591,7 @@ class NPUModelRunner(GPUModelRunner):
             "Model runner load_model total time: %.2f seconds",
             load_model_total_time,
         )
+        self._log_replayssm_memory("model_loaded")
 
     def _start_dump_data(self, **kwargs) -> None:
         if self.debugger is None or self._debugger_started:
@@ -4699,6 +4717,7 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
             kv_caches=kv_caches,
         )
+        self._log_replayssm_memory("kv_cache_initialized", kv_caches)
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
@@ -6617,6 +6636,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
+        self._log_replayssm_memory("graph_capture_before")
         parent_module_name = _get_gpu_model_runner_module_name(self)
         self._engram_capture_active = True
         try:
@@ -6629,6 +6649,7 @@ class NPUModelRunner(GPUModelRunner):
         if mgr is not None and self.update_stream is not None:
             mgr.update_stream = self.update_stream
 
+        self._log_replayssm_memory("graph_capture_after")
         return cuda_graph_size
 
     def _prepare_multimodal_fields(self):
