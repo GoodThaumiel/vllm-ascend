@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Run with the optional CPU-only C++ test library path as the sole argument."""
+"""Validate the Replay AR schema and Meta dispatch.
+
+With no argument, discover the installed ``vllm_ascend_C`` extension. A
+CPU-only test library path can still be supplied explicitly for local CI.
+"""
 
 import importlib.util
 import sys
@@ -11,11 +15,25 @@ from pathlib import Path
 class FrameworkMetaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
-            raise unittest.SkipTest("build and pass the CPU-only Meta library to run these checks")
+        if len(sys.argv) > 2:
+            raise ValueError("usage: test_framework_meta.py [meta-library-path]")
+        if len(sys.argv) == 2:
+            library = Path(sys.argv[1])
+            if not library.is_file():
+                raise FileNotFoundError(f"Meta test library does not exist: {library}")
+        else:
+            try:
+                extension = importlib.util.find_spec("vllm_ascend.vllm_ascend_C")
+            except ModuleNotFoundError:
+                extension = None
+            if extension is None or extension.origin is None:
+                raise unittest.SkipTest(
+                    "installed vllm_ascend_C is unavailable; optionally pass a CPU-only Meta test library"
+                )
+            library = Path(extension.origin)
         import torch
 
-        torch.ops.load_library(sys.argv[1])
+        torch.ops.load_library(str(library))
         cls.torch = torch
         root = Path(__file__).resolve().parents[3]
         spec = importlib.util.spec_from_file_location(

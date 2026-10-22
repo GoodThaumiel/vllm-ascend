@@ -167,10 +167,18 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
         self.assertEqual(result.shape, (1, batch, value_heads, dim))
         args = replay.call_args.args
         self.assertTrue(all(actual is expected for actual, expected in zip(args[5:9], layer.kv_cache[1:5])))
-        self.assertIs(args[9], state_indices)
-        self.assertIs(args[10], write_pos)
-        self.assertIs(args[11], is_flush)
+        # Slicing/contiguous may return a distinct Tensor object depending on
+        # the backend. The operator contract is its metadata and values, not
+        # Python object identity.
+        for actual, expected in zip(args[9:12], (state_indices, write_pos, is_flush)):
+            torch.testing.assert_close(actual.cpu(), expected.cpu())
+            self.assertEqual(actual.dtype, torch.int32)
+            self.assertEqual(actual.device, expected.device)
+            self.assertTrue(actual.is_contiguous())
         self.assertIs(args[12], output)
+        self.assertEqual(args[13].shape, (batch * value_heads * 4,))
+        self.assertEqual(args[13].dtype, torch.int32)
+        self.assertEqual(args[13].device, output.device)
 
 
 if __name__ == "__main__":

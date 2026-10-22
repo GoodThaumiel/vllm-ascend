@@ -41,11 +41,14 @@ python3 -m unittest tests.ut.replayssm.test_model_ar_integration -v
 python3 -m unittest tests.ut.replayssm.test_level2_contract tests.ut.replayssm.test_call_budget -v
 ```
 
-同时补齐 L2.2 遗留的 Meta 证据。若 CPU-only Meta `.so` 的构建方式与上一轮一致，执行：
+同时补齐 L2.2 遗留的 Meta 证据。服务器会自动发现本轮安装的 `vllm_ascend_C`：
 
 ```bash
-python3 tests/ut/replayssm/test_framework_meta.py /path/to/libreplayssm_ar_meta_test.so
+python3 tests/ut/replayssm/test_framework_meta.py
 ```
+
+只有本地 CPU CI 使用独立 Meta `.so` 时才显式传入其真实路径；不存在的路径现在会直接失败，
+不会再以 skip 退出 0。
 
 - [ ] 安装版本指向本轮 commit，`vllm_ascend_C` 与 kernel `.so` 为本轮重编译产物。
 - [ ] cache/cursor 单测通过；Meta/FakeTensor 只推导通过。
