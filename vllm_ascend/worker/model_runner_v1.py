@@ -182,6 +182,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
+from vllm_ascend.ops.replayssm.cache import prepare_replayssm_decode_base_cpu
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -3616,6 +3617,13 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        replayssm_decode_base_cpu = None
+        if self.cache_config.use_replayssm:
+            replayssm_decode_base_cpu = prepare_replayssm_decode_base_cpu(
+                self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded],
+                is_dummy_run=offload_dummy,
+            )
+
         req_doc_ranges = None
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
@@ -3665,6 +3673,7 @@ class NPUModelRunner(GPUModelRunner):
             # proposer checks to distinguish async/non-async behavior.
             _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
+            replayssm_decode_base_cpu=replayssm_decode_base_cpu,
             # TODO
             seq_lens_cpu=seq_lens_cpu,
             # TODO

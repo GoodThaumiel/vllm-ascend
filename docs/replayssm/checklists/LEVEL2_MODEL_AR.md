@@ -56,6 +56,11 @@ python3 tests/ut/replayssm/test_framework_meta.py
 
 ## A1：TP4 Replay AR `vllm serve` 首次启动
 
+A0 已由用户确认通过。首轮 A1 在 capture dummy 构造 GDN metadata 时发现 Ascend runner
+没有同步 vLLM 0.30 新增的 `replayssm_decode_base_cpu` 字段；失败发生在 kernel launch 前。
+修复后 dummy 使用全零 decode base，真实请求继续引用 runner 的 pinned CPU 生命周期缓冲区。
+本修复只改 Python，editable 安装无需重编 C++，但必须停止旧服务并重新拉取、重启全部 worker。
+
 使用服务器已有模型目录；模型的 architecture 应解析为当前 0.30 的 Qwen3Next/Qwen3.5 GDN
 实现。先用独占端口启动 Replay 服务：
 
@@ -80,6 +85,8 @@ vllm serve "$REPLAYSSM_MODEL" \
 `max_tokens=64` 的请求。至少一个请求生成超过 32 tokens，确保跨过两次 L=16 flush。
 
 - [ ] 服务加载完成；日志显示五块 GDN state，未回退 native recurrent。
+- [ ] `[1,4,8,16]` 四个 FULL_DECODE_ONLY capture size 全部完成，不再出现
+  `requires CPU decode-base and sequence-length metadata`。
 - [ ] 首 token、pos 15 flush、pos 16 重新从 checkpoint 开始时无 C++ 校验或设备错误。
 - [ ] HTTP 返回完整，生成 token 全部有限且服务在请求后继续健康。
 - [ ] 停止服务后 4 卡无残留进程、board 无 error。

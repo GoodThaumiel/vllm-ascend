@@ -12,6 +12,24 @@ REPLAYSSM_AR_TILE_V = 32
 REPLAYSSM_AR_CORES = 8
 
 
+def prepare_replayssm_decode_base_cpu(
+    decode_base_cpu: torch.Tensor,
+    *,
+    is_dummy_run: bool,
+) -> torch.Tensor:
+    """Return the request ring origin used by Ascend attention metadata.
+
+    Real execution must preserve the runner-owned pinned buffer. Graph warmup
+    and capture use synthetic requests, so their ring origin is always zero
+    and must not inherit stale request state from the input batch.
+    """
+    if decode_base_cpu.device.type != "cpu" or decode_base_cpu.dtype != torch.int32 or decode_base_cpu.dim() != 1:
+        raise ValueError("ReplaySSM decode base must be a 1D CPU int32 tensor")
+    if is_dummy_run:
+        return torch.zeros_like(decode_base_cpu)
+    return decode_base_cpu
+
+
 def append_gdn_replayssm_ar_dtypes(
     base_dtypes: tuple[torch.dtype, ...],
     model_dtype: torch.dtype,

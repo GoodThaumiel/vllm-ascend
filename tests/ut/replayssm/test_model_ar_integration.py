@@ -20,6 +20,16 @@ SPEC.loader.exec_module(CACHE)
 
 
 class ReplaySSMModelARIntegrationTests(unittest.TestCase):
+    def test_decode_base_uses_live_buffer_and_zeroes_capture_dummy(self) -> None:
+        live = torch.tensor([17, 33, 0], dtype=torch.int32)
+        actual = CACHE.prepare_replayssm_decode_base_cpu(live, is_dummy_run=False)
+        self.assertIs(actual, live)
+
+        dummy = CACHE.prepare_replayssm_decode_base_cpu(live, is_dummy_run=True)
+        self.assertIsNot(dummy, live)
+        torch.testing.assert_close(dummy, torch.zeros_like(live))
+        torch.testing.assert_close(live, torch.tensor([17, 33, 0], dtype=torch.int32))
+
     def test_qwen_tp4_tp8_cache_contract_uses_bf16_checkpoint_and_fp16_ring(self) -> None:
         base_dtypes = (torch.bfloat16, torch.bfloat16)
         self.assertEqual(
