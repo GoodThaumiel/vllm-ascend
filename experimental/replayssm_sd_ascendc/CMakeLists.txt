@@ -26,7 +26,7 @@ if(NOT ASCENDC_CMAKE_DIR)
 endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
 
-ascendc_library(replayssm_sd_verify_kernel SHARED csrc/replayssm_sd_verify.cpp)
+ascendc_library(replayssm_sd_verify_kernel SHARED ../../csrc/kernels/replayssm_sd_verify.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(
@@ -40,9 +40,10 @@ execute_process(
 find_library(TORCH_NPU_LIB torch_npu PATHS "${torch_npu_root}/lib" NO_DEFAULT_PATH REQUIRED)
 find_library(ASCENDCL_LIB ascendcl PATHS "${ASCEND_CANN_PACKAGE_PATH}/lib64" NO_DEFAULT_PATH REQUIRED)
 
-add_library(replayssm_sd_torch SHARED csrc/torch_binding.cpp)
+add_library(replayssm_sd_torch SHARED csrc/torch_binding.cpp ../../csrc/replayssm_sd.cpp)
 add_dependencies(replayssm_sd_torch replayssm_sd_verify_kernel)
 target_include_directories(replayssm_sd_torch PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../csrc"
     "${CMAKE_CURRENT_BINARY_DIR}/include"
     "${torch_npu_root}/include"
     "${torch_npu_root}/.."
@@ -52,6 +53,7 @@ separate_arguments(torch_cxx_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 target_compile_options(replayssm_sd_torch PRIVATE ${torch_cxx_flags} -O2 -Wall)
 target_link_libraries(replayssm_sd_torch PRIVATE
     replayssm_sd_verify_kernel ${TORCH_LIBRARIES} "${TORCH_NPU_LIB}" "${ASCENDCL_LIB}")
+target_compile_definitions(replayssm_sd_torch PRIVATE VLLM_ASCEND_ENABLE_REPLAYSSM_SD)
 # ascendc_library writes the kernel under build/lib; the binding remains in build/.
 set_target_properties(replayssm_sd_torch PROPERTIES
     BUILD_RPATH "$ORIGIN;$ORIGIN/lib;${TORCH_INSTALL_PREFIX}/lib;${torch_npu_root}/lib;${ASCEND_CANN_PACKAGE_PATH}/lib64"

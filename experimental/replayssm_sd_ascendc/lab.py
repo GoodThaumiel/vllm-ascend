@@ -211,8 +211,16 @@ def check_result(actual: dict[str, torch.Tensor], expected: dict[str, torch.Tens
     return errors
 
 
-def invoke(case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40) -> None:
-    torch.ops.replayssm_sd_lab.verify_(
+def invoke(case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, backend: str = "lab") -> None:
+    if backend == "lab":
+        op = torch.ops.replayssm_sd_lab.verify_
+    elif backend == "framework":
+        from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_verify
+
+        op = replayssm_sd_verify
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
+    op(
         *(
             case[name]
             for name in (

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Validate the Replay AR schema and Meta dispatch.
+"""Validate the Replay AR/SD schemas and Meta dispatch.
 
 With no argument, discover the installed ``vllm_ascend_C`` extension. A
 CPU-only test library path can still be supplied explicitly for local CI.
@@ -42,6 +42,7 @@ class FrameworkMetaTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         cls.wrapper = staticmethod(module.replayssm_ar_step)
+        cls.sd_wrapper = staticmethod(module.replayssm_sd_verify)
 
     def arguments(self, device):
         t = self.torch
@@ -91,6 +92,54 @@ class FrameworkMetaTests(unittest.TestCase):
         graph = make_fx(forward, tracing_mode="fake")(*args)
         self.assertTrue(
             any(node.target == self.torch.ops._C_ascend.replayssm_ar_step_.default for node in graph.graph.nodes)
+        )
+
+    def sd_arguments(self, device):
+        t = self.torch
+        tensor = lambda shape, dtype: t.empty(shape, dtype=dtype, device=device)
+        bf, fp, half, integer = t.bfloat16, t.float32, t.float16, t.int32
+        return [
+            tensor((2, 4, 4, 128), bf),
+            tensor((2, 4, 4, 128), bf),
+            tensor((2, 4, 12, 128), bf),
+            tensor((2, 4, 12), fp),
+            tensor((2, 4, 12), fp),
+            tensor((4, 12, 128, 128), bf),
+            tensor((4, 12, 32, 128), half),
+            tensor((4, 4, 32, 128), half),
+            tensor((4, 12, 32), fp),
+            tensor((2,), integer),
+            tensor((2,), integer),
+            tensor((2,), integer),
+            tensor((2,), integer),
+            tensor((2, 4, 12, 128), bf),
+            tensor((96,), integer),
+            128**-0.5,
+            32,
+            40,
+        ]
+
+    def test_sd_schema_and_meta_dispatch(self):
+        schema = self.torch.ops._C_ascend.replayssm_sd_verify_.default._schema
+        self.assertEqual(
+            [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write],
+            [6, 7, 8, 13, 14],
+        )
+        self.assertEqual(len(schema.returns), 0)
+        self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta")))
+
+    def test_sd_fake_tensor_tracing_retains_operator(self):
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        args = self.sd_arguments("cpu")
+
+        def forward(*values):
+            self.sd_wrapper(*values)
+            return values[13]
+
+        graph = make_fx(forward, tracing_mode="fake")(*args)
+        self.assertTrue(
+            any(node.target == self.torch.ops._C_ascend.replayssm_sd_verify_.default for node in graph.graph.nodes)
         )
 
 

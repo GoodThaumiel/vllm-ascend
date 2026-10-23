@@ -9,13 +9,13 @@
     "mamba_cache_dtype": "bfloat16",
     "mamba_ssm_cache_dtype": "bfloat16"
   },
-  "current_level": 2,
+  "current_level": 3,
   "user_confirmation": "LEVEL_1_ACCEPTED_2026-10-19",
   "next_level_allowed": false,
   "levels": {
     "1": "ACCEPTED_AT_EE9401DC0_CANN_9_2_0_TP4_TP8",
     "2": "IN_PROGRESS_L2_3_MODEL_AR_DISPATCH_CACHE_LIFECYCLE_PENDING_NPU",
-    "3": "NOT_STARTED",
+    "3": "L3_1_ISOLATED_SD_VERIFY_USER_REPORTED_18_GRAPH_PERF_CASES_PASSED_FRAMEWORK_PACKAGING_PENDING",
     "4": "NOT_STARTED",
     "5": "NOT_STARTED"
   },
@@ -68,6 +68,20 @@
       "framework_graph_perf": "USER_REPORTED_F1_F2_F3_PASSED_AT_2808394",
       "framework_report": "user-supplied L2.2 framework validation report in chat on 2026-10-21"
     }
+  },
+  "level3_sd_verify": {
+    "isolated_candidate_commit": "869b961c92d4c833e4ed9af2052e22d6488ca390",
+    "hardware_report": "user-supplied 18-case graph replay perf summary on 2026-10-22",
+    "status": "USER_REPORTED_TP4_TP8_B1_B32_B64_CORES8_20_40_ALL_PASSED",
+    "environment": "Ascend910B4 CANN9.2.0 torch_npu2.10.0.post4 vllm0.30.0+empty",
+    "scope": "NON_FLUSH_T1_T4_HISTORY0_7_12_PAGE_STRIDED_TILE32",
+    "tp4_b32_c40_pos7_t4_us_p50": 986.15,
+    "tp4_b32_c40_pos12_t4_us_p50": 1302.61,
+    "tp8_b32_c40_pos7_t4_us_p50": 525.16,
+    "tp8_b32_c40_pos12_t4_us_p50": 684.45,
+    "reported_max_abs_error": 0.000122,
+    "next_gate": "FRAMEWORK_PACKAGING_THEN_NATIVE_VS_REPLAY_SD_OPERATOR_PROFILE",
+    "serving_limitations": "FLUSH_CURSOR_COMMIT_RESET_AND_MTP_DISPATCH_NOT_YET_IMPLEMENTED"
   },
   "dflash": "DEFERRED_UNTIL_MTP_ACCEPTED",
   "low_precision_replay_checkpoint": "OUT_OF_SCOPE"

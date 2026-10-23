@@ -72,7 +72,7 @@ Qwen3.6 的 MTP draft layer 是 full attention；Replay 算子运行在 target �
 
 | 编号 | 算子 | 最接近的已有实现 | 实现决策 | 状态 | 修改性质 |
 |---|---|---|---|---|---|
-| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | 独立 AscendC 实验目录先验证非 flush `T≤4` 的输出型计算与 d/k/g 写入；通过后再决定框架封装和性能 tiling | L3.1 CPU 数学测试通过，待 910B4 编译/运行 | 新增插件算子，高工作量 |
+| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | AscendC 非 flush `T≤4` 输出型计算与 d/k/g 写入；共用内核和 launcher 纳入 `_C_ascend` 扩展 | L3.1 用户回传 18 组 NPU graph/perf 全过；框架打包待上机 | 新增插件算子，高工作量 |
 | SD2 | flush/compact specialization | 原论文仓与 SD1 共源，分别 launch verify/flush specialization | 首版保留 verify/flush 两个 AscendC specialization，由一个 torch binding 包装；避免在图外读取 `is_flush` | 缺失 | 新增插件算子，中高工作量 |
 | SD3 | accepted-token cursor commit | 原论文仓 `_advance_gdn_spec_cursors_kernel` | 用小型 AscendC vector kernel 更新 block-keyed `write_pos/cache_base/is_flush` | 缺失 | 新增插件算子，低工作量 |
 | SD4 | 新请求/恢复时 cursor reset | 原论文仓 `_reset_gdn_replayssm_spec_cursors_kernel` | 用小型 AscendC vector kernel；首版与 SD3 分开，验证后可融合一次 launch | 缺失 | 新增插件算子，低工作量 |
@@ -121,7 +121,8 @@ framework F1-F3 已在 commit `2808394` 对应源码上由用户确认通过。�
 因此，F1-F3 可以判定“AR recurrent 算子已完成 framework 打包且图内可运行”，不能判定
 “ReplaySSM + AR 性能目标已完成”。用户已在同容器测试发现 AR 相对 baseline 的回退，并确认
 32 并发、约 32k 输入时因显存出现 waiting；项目优先转向 SD 容量与 MTP 吞吐。SD1 的独立
-AscendC 开发已经开始，但 L3.1 非 flush 验证通过前，不把它接入 `vllm serve`。
+AscendC 非 flush 核已获 L3.1 用户上机通过报告，现进入框架打包和原生对照阶段；flush 与
+accepted-token cursor 尚未实现，因此暂不接入 `vllm serve` 的 SD dispatch。
 
 ## 工作量与主要不确定性
 

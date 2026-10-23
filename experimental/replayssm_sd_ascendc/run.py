@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import os
@@ -31,6 +32,7 @@ def parse_args() -> argparse.Namespace:
         "--library", type=Path, default=Path(__file__).resolve().parent / "build/libreplayssm_sd_torch.so"
     )
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--backend", choices=("lab", "framework"), default="lab")
     parser.add_argument("--tp", type=int, choices=(4, 8), default=4)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32), default=32)
@@ -68,7 +70,7 @@ def _run_once(args, device, pos, length, base, seed, padding=False):
     cpu = _cpu_case(args, pos, length, base, seed, padding=padding)
     expected = recurrent_golden(cpu)
     gpu = _device_case(cpu, device, args.layout)
-    invoke(gpu, tile_v=args.tile_v, cores=args.cores)
+    invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
     torch.npu.synchronize()
     actual = clone_case(gpu)
     return check_result(actual, expected)
@@ -79,11 +81,11 @@ def _graph_case(args, device, perf=False):
 
     cpu = _cpu_case(args, 7, 4, 29, 157)
     gpu = _device_case(cpu, device, args.layout)
-    invoke(gpu, tile_v=args.tile_v, cores=args.cores)
+    invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        invoke(gpu, tile_v=args.tile_v, cores=args.cores)
+        invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
     records = []
     for pos, length, base, padding in (
         (0, 1, 0, False),
@@ -155,6 +157,7 @@ def main() -> None:
         "cores": args.cores,
         "effective_cores": min(args.cores, args.batch * (48 // args.tp) * (128 // args.tile_v)),
         "layout": args.layout,
+        "backend": args.backend,
         "status": "FAILED",
         "cases": [],
     }
@@ -177,9 +180,17 @@ def main() -> None:
         import torch_npu  # noqa: F401
 
         torch.npu.set_device(args.device)
-        torch.ops.load_library(str(args.library.resolve()))
-        report["library"] = str(args.library.resolve())
-        report["library_sha256"] = hashlib.sha256(args.library.read_bytes()).hexdigest()
+        if args.backend == "lab":
+            torch.ops.load_library(str(args.library.resolve()))
+            library = args.library.resolve()
+        else:
+            from vllm_ascend.utils import enable_custom_op
+
+            if not enable_custom_op() or not hasattr(torch.ops._C_ascend, "replayssm_sd_verify_"):
+                raise RuntimeError("Rebuild vllm_ascend_C with Replay SD for Ascend910B")
+            library = Path(importlib.import_module("vllm_ascend.vllm_ascend_C").__file__).resolve()
+        report["library"] = str(library)
+        report["library_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
         device = f"npu:{args.device}"
         if args.stage in ("smoke", "all"):
             for pos, length, base, padding in (

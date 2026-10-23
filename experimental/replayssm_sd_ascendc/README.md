@@ -1,6 +1,6 @@
 # L3.1: independent AscendC GDN speculative verify pilot
 
-This directory is intentionally independent of the vLLM Ascend extension. It registers `torch.ops.replayssm_sd_lab.verify_` from its own binding, so a failed CANN compilation or device run cannot affect the working AR/native serving paths. The target is Ascend910B4, CANN 9.2.0, BF16 checkpoint/model tensors, FP16 d/k ring, FP32 g ring, TP4/TP8 local head geometry.
+This directory retains an independent build and `torch.ops.replayssm_sd_lab.verify_` entry for diagnosis. After the L3.1 device validation, its kernel and C++ launcher are shared with the vLLM Ascend extension, which registers `_C_ascend.replayssm_sd_verify_`. The target is Ascend910B4, CANN 9.2.0, BF16 checkpoint/model tensors, FP16 d/k ring, FP32 g ring, TP4/TP8 local head geometry. Neither entry is connected to MTP serving until flush and cursor lifecycle are implemented.
 
 ## Scope and math
 

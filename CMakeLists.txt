@@ -54,12 +54,15 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 file(GLOB KERNEL_FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
 
-# Replay AR is validated only on 910B. Other platforms keep their build unchanged.
+# Replay AR and non-flush SD verify target only 910B. Other platforms keep their build unchanged.
 set(VLLM_ASCEND_BUILD_REPLAYSSM_AR FALSE)
+set(VLLM_ASCEND_BUILD_REPLAYSSM_SD FALSE)
 if(SOC_VERSION MATCHES "^[Aa]scend910[Bb]")
     set(VLLM_ASCEND_BUILD_REPLAYSSM_AR TRUE)
+    set(VLLM_ASCEND_BUILD_REPLAYSSM_SD TRUE)
 else()
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_ar.cpp")
+    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify.cpp")
 endif()
 
 set(VLLM_ASCEND_CUSTOM_OP
@@ -111,6 +114,11 @@ set(
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
 if(VLLM_ASCEND_BUILD_REPLAYSSM_AR)
   target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_REPLAYSSM_AR)
+  target_include_directories(vllm_ascend_C PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/include")
+  add_dependencies(vllm_ascend_C vllm_ascend_kernels)
+endif()
+if(VLLM_ASCEND_BUILD_REPLAYSSM_SD)
+  target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_REPLAYSSM_SD)
   target_include_directories(vllm_ascend_C PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/include")
   add_dependencies(vllm_ascend_C vllm_ascend_kernels)
 endif()

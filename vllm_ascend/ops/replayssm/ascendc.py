@@ -49,3 +49,51 @@ def replayssm_ar_step(
         tile_v,
         cores,
     )
+
+
+def replayssm_sd_verify(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    checkpoint: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    slots: torch.Tensor,
+    positions: torch.Tensor,
+    bases: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    status: torch.Tensor,
+    scale: float,
+    tile_v: int = 32,
+    cores: int = 40,
+) -> None:
+    """Verify a non-flush MTP window through the framework-owned SD op.
+
+    All outputs and ring buffers are supplied by the caller. The fixed four-token
+    layout and runtime lengths make this call graph-capturable; accepted-token
+    commit and flush are separate stages and are not performed here.
+    """
+    torch.ops._C_ascend.replayssm_sd_verify_(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        checkpoint,
+        d_cache,
+        k_cache,
+        g_cache,
+        slots,
+        positions,
+        bases,
+        lengths,
+        out,
+        status,
+        scale,
+        tile_v,
+        cores,
+    )
