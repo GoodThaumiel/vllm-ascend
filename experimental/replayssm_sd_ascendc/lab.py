@@ -10,6 +10,7 @@ import torch
 
 MAX_TOKENS = 4
 MAX_HISTORY = 16
+MAX_WINDOW = MAX_HISTORY + MAX_TOKENS
 HEAD_DIM = 128
 CACHE_NAMES = ("checkpoint", "d_cache", "k_cache", "g_cache")
 
@@ -30,8 +31,8 @@ def make_case(
         raise ValueError("Invalid TP, batch, or ring length")
     if not 0 <= position <= MAX_HISTORY or not 1 <= length <= MAX_TOKENS:
         raise ValueError("Invalid history position or verify length")
-    if position + length > MAX_HISTORY or not 0 <= base < ring_len:
-        raise ValueError("This pilot only supports a non-flush window")
+    if position + length > min(MAX_WINDOW, ring_len) or not 0 <= base < ring_len:
+        raise ValueError("This pilot requires the verify window to fit the physical ring")
     if tile_v not in (16, 32):
         raise ValueError("Invalid tile_v")
     generator = torch.Generator().manual_seed(seed)
@@ -112,8 +113,8 @@ def _validate_row(case: dict[str, torch.Tensor], row: int) -> tuple[int, int, in
     ring_len = case["d_cache"].shape[2]
     if slot <= 0 or slot >= case["checkpoint"].shape[0]:
         raise ValueError("Golden requires a valid non-padding slot")
-    if pos < 0 or length < 1 or length > MAX_TOKENS or pos + length > MAX_HISTORY:
-        raise ValueError("Golden requires a non-flush verify window")
+    if pos < 0 or pos > MAX_HISTORY or length < 1 or length > MAX_TOKENS or pos + length > min(MAX_WINDOW, ring_len):
+        raise ValueError("Golden requires a verify window that fits the physical ring")
     if base < 0 or base >= ring_len:
         raise ValueError("Invalid circular base")
     return slot, pos, base, length

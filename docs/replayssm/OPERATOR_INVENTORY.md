@@ -72,10 +72,10 @@ Qwen3.6 的 MTP draft layer 是 full attention；Replay 算子运行在 target �
 
 | 编号 | 算子 | 最接近的已有实现 | 实现决策 | 状态 | 修改性质 |
 |---|---|---|---|---|---|
-| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | AscendC 非 flush `T≤4` 输出型计算与 d/k/g 写入；共用内核和 launcher 纳入 `_C_ascend` 扩展 | L3.1 用户回传 18 组 NPU graph/perf 全过；框架打包待上机 | 新增插件算子，高工作量 |
-| SD2 | flush/compact specialization | 原论文仓与 SD1 共源，分别 launch verify/flush specialization | 首版保留 verify/flush 两个 AscendC specialization，由一个 torch binding 包装；避免在图外读取 `is_flush` | 缺失 | 新增插件算子，中高工作量 |
-| SD3 | accepted-token cursor commit | 原论文仓 `_advance_gdn_spec_cursors_kernel` | 用小型 AscendC vector kernel 更新 block-keyed `write_pos/cache_base/is_flush` | 缺失 | 新增插件算子，低工作量 |
-| SD4 | 新请求/恢复时 cursor reset | 原论文仓 `_reset_gdn_replayssm_spec_cursors_kernel` | 用小型 AscendC vector kernel；首版与 SD3 分开，验证后可融合一次 launch | 缺失 | 新增插件算子，低工作量 |
+| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | AscendC `T≤4` 输出与 d/k/g 写入；扩展到 history≤16、history+T≤20；主扩展已注册 | L3.1 用户回传旧非 flush 窗口 18 组 graph/perf 全过；新窗口待上机 | 新增插件算子，高工作量 |
+| SD2 | flush/compact | 原论文仓 SD1 同源的 flush specialization | 首版先执行 SD1，再用独立 AscendC compact 折叠旧已接受历史；graph 中固定两次 launch，按 per-row flush 路由 | 独立算子、CPU golden 与主扩展注册已完成，待 CANN/NPU | 新增插件算子，中高工作量 |
+| SD3 | accepted-token cursor commit | 原论文仓 `_advance_gdn_spec_cursors_kernel` | AscendC 更新 block-keyed `write_pos/cache_base/is_flush`；与 reset 共用一个入口 | 独立算子、CPU golden 与主扩展注册已完成，待 CANN/NPU | 新增插件算子，低工作量 |
+| SD4 | 新请求/恢复时 cursor reset | 原论文仓 `_reset_gdn_replayssm_spec_cursors_kernel` | SD3 算子的 `do_reset` 分支；reset 覆盖旧 accepted | CPU golden 已完成，待 CANN/NPU | 同 SD3，无额外 kernel |
 | SD5 | spec output merge | 0.30 Ascend 的 `index_copy_`/现有 GDN merge | 原样复用，profile 后再决定是否融合 | 未接 Replay，但无需新算子 | 框架调用修改，低侵入 |
 | SD6 | MTP accepted-count/scheduler | vLLM 0.30 MTP/spec scheduler 和 Ascend metadata builder | 原样复用 accepted count；只把它接到 SD3 和现有 conv | 未接 Replay | metadata 接线，中侵入 |
 
@@ -114,15 +114,17 @@ framework F1-F3 已在 commit `2808394` 对应源码上由用户确认通过。�
 - AR2-AR4 在真实调度中的缓存分配、metadata、dispatch 和 block 生命周期；
 - 真实 TP4/TP8 多进程、B=1/8/16、48层 capture；
 - `vllm serve` 的 Replay AR 输出和长序列生命周期；
-- SD1-SD6、MTP accepted/rejected token、提前 flush 和 rollback；
+- SD1-SD4 在主扩展中的 CANN/NPUGraph 验证、MTP accepted/rejected token、提前 flush 和 rollback；
 - prefix cache、preemption/resume、KV connector 和 cache block copy 对新增 ring 的处理；
 - DFlash。
 
 因此，F1-F3 可以判定“AR recurrent 算子已完成 framework 打包且图内可运行”，不能判定
 “ReplaySSM + AR 性能目标已完成”。用户已在同容器测试发现 AR 相对 baseline 的回退，并确认
 32 并发、约 32k 输入时因显存出现 waiting；项目优先转向 SD 容量与 MTP 吞吐。SD1 的独立
-AscendC 非 flush 核已获 L3.1 用户上机通过报告，现进入框架打包和原生对照阶段；flush 与
-accepted-token cursor 尚未实现，因此暂不接入 `vllm serve` 的 SD dispatch。
+AscendC 非 flush 核已获 L3.1 用户上机通过报告；flush compact 与 accepted-token cursor 的
+独立实现及框架注册已写入源码，但尚无 CANN/NPU 编译和图捕获验证，因此暂不接入 `vllm serve`
+的 SD dispatch。compact 与原论文单一 flush specialization 的计算分解不同，flush 时先 verify
+再折叠旧历史，必须以设备 profile 确认额外读写和 launch 的成本。
 
 ## 工作量与主要不确定性
 

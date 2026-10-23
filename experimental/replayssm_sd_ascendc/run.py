@@ -93,6 +93,7 @@ def _graph_case(args, device, perf=False):
         (7, 3, 30, False),
         (7, 4, 29, False),
         (12, 4, 31, False),
+        (16, 4, 31, False),
         (7, 4, 30, True),
     ):
         cpu = _cpu_case(args, pos, length, base, seed=160 + pos, padding=padding)
@@ -113,7 +114,7 @@ def _graph_case(args, device, perf=False):
         return {"graph_cases": records}
 
     timings = {}
-    for pos, length, base in ((0, 1, 0), (7, 4, 29), (12, 4, 31)):
+    for pos, length, base in ((0, 1, 0), (7, 4, 29), (12, 4, 31), (16, 4, 31)):
         pristine = _cpu_case(args, pos, length, base, seed=177 + pos)
         pristine_device = {name: tensor.to(device) for name, tensor in pristine.items()}
         for name in pristine:
@@ -199,6 +200,7 @@ def main() -> None:
                 (7, 3, 30, False),
                 (7, 4, 29, False),
                 (12, 4, 31, False),
+                (16, 4, 31, False),
                 (7, 4, 30, True),
             ):
                 errors = _run_once(args, device, pos, length, base, 101 + pos, padding=padding)

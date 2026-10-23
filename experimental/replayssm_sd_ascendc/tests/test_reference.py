@@ -52,8 +52,9 @@ class SDReferenceTests(unittest.TestCase):
 
     def test_window_boundary_and_invalid_geometry(self):
         self.assertEqual(recurrent_golden(make_case(position=12, length=4))["out"].shape[1], 4)
-        with self.assertRaisesRegex(ValueError, "non-flush"):
-            make_case(position=13, length=4)
+        self.assertEqual(recurrent_golden(make_case(position=16, length=4, ring_len=32))["out"].shape[1], 4)
+        with self.assertRaisesRegex(ValueError, "physical ring"):
+            make_case(position=13, length=4, ring_len=16)
         with self.assertRaisesRegex(ValueError, "Invalid TP"):
             make_case(tp=3)
 

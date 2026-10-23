@@ -97,3 +97,59 @@ def replayssm_sd_verify(
         tile_v,
         cores,
     )
+
+
+def replayssm_sd_compact(
+    checkpoint: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    slots: torch.Tensor,
+    positions: torch.Tensor,
+    bases: torch.Tensor,
+    flush: torch.Tensor,
+    status: torch.Tensor,
+    tile_v: int = 32,
+    cores: int = 40,
+) -> None:
+    """Fold committed SD history into BF16 checkpoint on flush rows."""
+    torch.ops._C_ascend.replayssm_sd_compact_(
+        checkpoint,
+        d_cache,
+        k_cache,
+        g_cache,
+        slots,
+        positions,
+        bases,
+        flush,
+        status,
+        tile_v,
+        cores,
+    )
+
+
+def replayssm_sd_cursor(
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    accepted: torch.Tensor,
+    slots: torch.Tensor,
+    do_reset: torch.Tensor,
+    status: torch.Tensor,
+    logical_limit: int = 20,
+    max_spec_len: int = 4,
+    ring_len: int = 32,
+) -> None:
+    """Commit accepted SD tokens or reset first-decode block-keyed cursors."""
+    torch.ops._C_ascend.replayssm_sd_cursor_(
+        write_pos,
+        cache_base,
+        is_flush,
+        accepted,
+        slots,
+        do_reset,
+        status,
+        logical_limit,
+        max_spec_len,
+        ring_len,
+    )

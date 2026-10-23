@@ -36,6 +36,12 @@
 #ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD
 #include "replayssm_sd.h"
 #endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_COMPACT
+#include "replayssm_sd_compact.h"
+#endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_CURSOR
+#include "replayssm_sd_cursor.h"
+#endif
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "moe/rms_norm_cast/rms_norm_cast_torch_adpt.h"
@@ -2725,6 +2731,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 #ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD
     ops.def("replayssm_sd_verify_" VLLM_ASCEND_REPLAYSSM_SD_SCHEMA);
     ops.impl("replayssm_sd_verify_", torch::kPrivateUse1, &vllm_ascend::replayssm_sd_verify);
+#endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_COMPACT
+    ops.def("replayssm_sd_compact_" VLLM_ASCEND_REPLAYSSM_SD_COMPACT_SCHEMA);
+    ops.impl("replayssm_sd_compact_", torch::kPrivateUse1, &vllm_ascend::replayssm_sd_compact);
+#endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_CURSOR
+    ops.def("replayssm_sd_cursor_" VLLM_ASCEND_REPLAYSSM_SD_CURSOR_SCHEMA);
+    ops.impl("replayssm_sd_cursor_", torch::kPrivateUse1, &vllm_ascend::replayssm_sd_cursor);
 #endif
     ops.def("get_npu_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor?");
     ops.impl("get_npu_view_from_cpu_tensor", c10::DispatchKey::CompositeExplicitAutograd,

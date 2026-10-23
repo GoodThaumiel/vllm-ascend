@@ -43,6 +43,8 @@ class FrameworkMetaTests(unittest.TestCase):
         spec.loader.exec_module(module)
         cls.wrapper = staticmethod(module.replayssm_ar_step)
         cls.sd_wrapper = staticmethod(module.replayssm_sd_verify)
+        cls.sd_compact_wrapper = staticmethod(module.replayssm_sd_compact)
+        cls.sd_cursor_wrapper = staticmethod(module.replayssm_sd_cursor)
 
     def arguments(self, device):
         t = self.torch
@@ -141,6 +143,48 @@ class FrameworkMetaTests(unittest.TestCase):
         self.assertTrue(
             any(node.target == self.torch.ops._C_ascend.replayssm_sd_verify_.default for node in graph.graph.nodes)
         )
+
+    def test_sd_compact_schema_and_meta(self):
+        t = self.torch
+        bf, half, fp, integer = t.bfloat16, t.float16, t.float32, t.int32
+        args = [
+            t.empty((3, 12, 128, 128), dtype=bf, device="meta"),
+            t.empty((3, 12, 32, 128), dtype=half, device="meta"),
+            t.empty((3, 4, 32, 128), dtype=half, device="meta"),
+            t.empty((3, 12, 32), dtype=fp, device="meta"),
+            *(t.empty((2,), dtype=integer, device="meta") for _ in range(4)),
+            t.empty((96,), dtype=integer, device="meta"),
+            32,
+            40,
+        ]
+        schema = t.ops._C_ascend.replayssm_sd_compact_.default._schema
+        self.assertEqual(
+            [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write],
+            [0, 8],
+        )
+        self.assertIsNone(self.sd_compact_wrapper(*args))
+
+    def test_sd_cursor_schema_and_meta(self):
+        t = self.torch
+        integer = t.int32
+        args = [
+            t.empty((3,), dtype=integer, device="meta"),
+            t.empty((3,), dtype=integer, device="meta"),
+            t.empty((3,), dtype=t.int8, device="meta"),
+            t.empty((2,), dtype=integer, device="meta"),
+            t.empty((2,), dtype=integer, device="meta"),
+            t.empty((2,), dtype=t.int8, device="meta"),
+            t.empty((2,), dtype=integer, device="meta"),
+            20,
+            4,
+            32,
+        ]
+        schema = t.ops._C_ascend.replayssm_sd_cursor_.default._schema
+        self.assertEqual(
+            [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write],
+            [0, 1, 2, 6],
+        )
+        self.assertIsNone(self.sd_cursor_wrapper(*args))
 
 
 if __name__ == "__main__":

@@ -299,7 +299,7 @@ def main() -> None:
         for batch in args.batches:
             for length in args.lengths:
                 for position in args.positions:
-                    if position + length > 16:
+                    if position + length > min(20, args.ring):
                         continue
                     try:
                         case = run_case(args, batch, context, length, position)

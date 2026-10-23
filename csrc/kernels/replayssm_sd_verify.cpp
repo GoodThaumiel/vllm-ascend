@@ -10,6 +10,7 @@ constexpr uint32_t K_DIM = 128;
 constexpr uint32_t V_DIM = 128;
 constexpr uint32_t MAX_HISTORY = 16;
 constexpr uint32_t MAX_TOKENS = 4;
+constexpr uint32_t MAX_WINDOW = MAX_HISTORY + MAX_TOKENS;
 constexpr uint32_t FP32_BLOCK = 8;
 
 // L3.1 non-flush pilot: one AIV task owns (request, value head, V tile).
@@ -101,8 +102,9 @@ class ReplaySDVerify {
           error = 4;
         }
       } else if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY) || length < 1 ||
-                 length > static_cast<int32_t>(MAX_TOKENS) || pos + length > static_cast<int32_t>(MAX_HISTORY)) {
-        error = 2;  // non-flush window only
+                 length > static_cast<int32_t>(MAX_TOKENS) || pos + length > static_cast<int32_t>(MAX_WINDOW) ||
+                 pos + length > static_cast<int32_t>(ringLen_)) {
+        error = 2;  // history plus speculative tokens must fit the physical ring
       } else if (base < 0 || base >= static_cast<int32_t>(ringLen_)) {
         error = 3;
       }

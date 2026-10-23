@@ -11,6 +11,12 @@
 #ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD
 #include "replayssm_sd.h"
 #endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_COMPACT
+#include "replayssm_sd_compact.h"
+#endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_CURSOR
+#include "replayssm_sd_cursor.h"
+#endif
 
 /*
  * How to write a meta implementation for a custom operator (meta kernel):
@@ -1820,6 +1826,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
 #endif
 #ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD
     ops.impl("replayssm_sd_verify_", &vllm_ascend::replayssm_sd_verify_meta);
+#endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_COMPACT
+    ops.impl("replayssm_sd_compact_", &vllm_ascend::replayssm_sd_compact_meta);
+#endif
+#ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_CURSOR
+    ops.impl("replayssm_sd_cursor_", &vllm_ascend::replayssm_sd_cursor_meta);
 #endif
     ops.impl("get_physical_device_id", &vllm_ascend::meta::get_physical_device_id_meta);
     //Gemma rmsnorm meta implementation
