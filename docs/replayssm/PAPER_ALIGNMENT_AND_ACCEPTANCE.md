@@ -1,6 +1,6 @@
 # ReplaySSM AR/SD：论文与原 vLLM 实现的优化点、Ascend 验收方向
 
-本文件以本地 `replayssm.pdf`（*ReplaySSM: Cache SSM Inputs, Not State*，第 4、5、7 节及附录 B/C/E）和 `ReplaySSM-main` 的 GDN 实现为依据。目标是对齐机制与收益方向，不把 H100/B300、FP32 state、单卡模型的速度倍率当作 Ascend910B4、TP4/TP8、BF16 state 的硬门槛。我们的主模型是 Qwen3.6-27B GDN；先 AR，后 MTP+SD，DFlash 后置，双精度/低精度 checkpoint 暂不纳入。
+本文件以本地 `replayssm.pdf`（*ReplaySSM: Cache SSM Inputs, Not State*，第 4、5、7 节及附录 B/C/E）和 `ReplaySSM-main` 的 GDN 实现为依据。目标是对齐机制与收益方向，不把 H100/B300、FP32 state、单卡模型的速度倍率当作 Ascend910B4、TP4/TP8、BF16 state 的硬门槛。我们的主模型是 Qwen3.6-27B GDN；AR 功能保留但性能优化暂缓，优先 MTP+SD，DFlash 后置，双精度/低精度 checkpoint 暂不纳入。
 
 ## 论文实际优化了什么
 
@@ -29,7 +29,7 @@ SD 有两种与 AR 不同的收益来源：消除 `T` 份 state 快照对显存�
 
 ## 最终验收的主次顺序
 
-1. **语义与生命周期先通过。** 同一输入下，native/Replay 的输出在约定 BF16 容差内；跨多个 `L=16` 窗口、flush、slot 复用、prefill→decode、graph capture/replay 正确。SD 另测全部接受、全部拒绝、部分接受、短 draft、flush 边界和恢复后重用；accepted length 与原生 MTP 接近，生成内容/质量无异常。先通过 L2 AR，再开展 L3 SD，维持逐级验证。
+1. **语义与生命周期先通过。** 同一输入下，native/Replay 的输出在约定 BF16 容差内；跨多个 `L=16` 窗口、flush、slot 复用、prefill→decode、graph capture/replay 正确。SD 另测全部接受、全部拒绝、部分接受、短 draft、flush 边界和恢复后重用；accepted length 与原生 MTP 接近，生成内容/质量无异常。AR1 提速不是 SD 的依赖；L3 SD 从独立算子开始，每一级上机验证后再接下一层。
 2. **AR 机制证据。** 逐层记录 full-state read/write 次数和 HBM bytes：非 flush 不写 checkpoint，flush 才写；缓存尾部不应被误读。把 ring 的读写也计入摊销总流量。对 `L=8/16/32`、ring 位置 0/8/15 和 BF16 state 做 profiling；预期存在写流量下降，性能最优 `L` 由 910B4 实测决定。
 3. **AR 服务收益。** 在同一源码、CANN、权重、TP、cache 布局和图配置下，比较 `vllm serve` 的 native/Replay；分别报告 GDN 算子摊销 p50/p90、整网 TPOT p50/p95、生成 tokens/s。按 BS=1/8/16/32 与可承载的更高并发，以及 4k/8k/32k 上下文分层。BS1 可接近持平，不要求复制论文的高并发倍率；若高并发依然慢，视为性能目标未达成，不因流量下降就判通过。
 4. **SD 机制证据。** 同一个 MTP drafter、`T=2/4/6/8` 和相近 accepted length 下，核对 target 每轮不生成/保存 `T` 份完整 checkpoint；非 flush 约一次 checkpoint 读、零次 full-state 写，flush 增加一次写。记录 snapshot/ring/graph backing、`num_blocks`、最大可服务并发，以及随 `T` 的 verify kernel 时延曲线。只比较真实物理 backing 和实际可用并发，避免把重叠 page 的逻辑尺寸相加。

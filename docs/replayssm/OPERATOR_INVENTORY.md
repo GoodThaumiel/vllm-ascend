@@ -58,9 +58,11 @@ AR1 当前接口直接接收已经完成 L2 norm 的 BF16 q/k/v，以及 FP32 g/
 所以两者的 Python 签名不同，但 recurrent 数学边界一致。
 
 当前 AR1 是通过独立 AscendC 实现完成的，不是对 FLA 原生 RGDR 源文件的逐行补丁。
-它已在匹配边界的 B=2 microbenchmark 中快于 native，因此不回退重写。若 F3 显示 B=8/16、
-48层图内扩展性不足，优化版应复用 FLA 原生 `recurrent_gated_delta_rule` 的 tiling、DMA 和
-Cube/Vector 调度结构，再增量加入 checkpoint+ring replay，而不是重新设计公共计算部分。
+早期 B=2 eager Event 对照不能代表图内模型性能。用户后续在同容器开关 Replay AR 的服务测试
+报告 baseline 快约 8%；roofline 与 batch 扫描表明本机 native recurrent 算子偏 vector compute
+bound，Replay AR 算子各 batch 均较慢且差距随 batch 增大。AR1 性能优化暂缓，保留功能和独立
+测试作为对照；不把 AR1 提速设为进入 SD 的前提。若未来恢复 AR 优化，应重新评估输出型公式
+与 FLA 原生 tiling，而不是以减少 state 写流量必然换来提速作为假设。
 
 ## ReplaySSM + SD（MTP 优先）
 
@@ -70,7 +72,7 @@ Qwen3.6 的 MTP draft layer 是 full attention；Replay 算子运行在 target �
 
 | 编号 | 算子 | 最接近的已有实现 | 实现决策 | 状态 | 修改性质 |
 |---|---|---|---|---|---|
-| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | 注册新的 AscendC Replay SD 接口；从 FLA RGDR 的 tiling/DMA/矩阵计算增量派生，加入 checkpoint+ring 重建、spec 内三角修正和 d/k/g 写入 | 缺失 | 新增插件算子，高工作量 |
+| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | 独立 AscendC 实验目录先验证非 flush `T≤4` 的输出型计算与 d/k/g 写入；通过后再决定框架封装和性能 tiling | L3.1 CPU 数学测试通过，待 910B4 编译/运行 | 新增插件算子，高工作量 |
 | SD2 | flush/compact specialization | 原论文仓与 SD1 共源，分别 launch verify/flush specialization | 首版保留 verify/flush 两个 AscendC specialization，由一个 torch binding 包装；避免在图外读取 `is_flush` | 缺失 | 新增插件算子，中高工作量 |
 | SD3 | accepted-token cursor commit | 原论文仓 `_advance_gdn_spec_cursors_kernel` | 用小型 AscendC vector kernel 更新 block-keyed `write_pos/cache_base/is_flush` | 缺失 | 新增插件算子，低工作量 |
 | SD4 | 新请求/恢复时 cursor reset | 原论文仓 `_reset_gdn_replayssm_spec_cursors_kernel` | 用小型 AscendC vector kernel；首版与 SD3 分开，验证后可融合一次 launch | 缺失 | 新增插件算子，低工作量 |
@@ -117,8 +119,9 @@ framework F1-F3 已在 commit `2808394` 对应源码上由用户确认通过。�
 - DFlash。
 
 因此，F1-F3 可以判定“AR recurrent 算子已完成 framework 打包且图内可运行”，不能判定
-“ReplaySSM + AR 模型功能已完成”。当前正在验证 AR2-AR4 和 Replay AR `vllm serve`；
-确认后再开始 SD1 的独立 AscendC 开发。
+“ReplaySSM + AR 性能目标已完成”。用户已在同容器测试发现 AR 相对 baseline 的回退，并确认
+32 并发、约 32k 输入时因显存出现 waiting；项目优先转向 SD 容量与 MTP 吞吐。SD1 的独立
+AscendC 开发已经开始，但 L3.1 非 flush 验证通过前，不把它接入 `vllm serve`。
 
 ## 工作量与主要不确定性
 

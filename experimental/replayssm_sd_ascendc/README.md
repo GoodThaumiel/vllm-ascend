@@ -1,0 +1,69 @@
+# L3.1: independent AscendC GDN speculative verify pilot
+
+This directory is intentionally independent of the vLLM Ascend extension. It registers `torch.ops.replayssm_sd_lab.verify_` from its own binding, so a failed CANN compilation or device run cannot affect the working AR/native serving paths. The target is Ascend910B4, CANN 9.2.0, BF16 checkpoint/model tensors, FP16 d/k ring, FP32 g ring, TP4/TP8 local head geometry.
+
+## Scope and math
+
+The first gate is **non-flush** target verification with `T=1..4` and at most 16 committed records. Inputs `q/k/v` are `[B,4,H or HV,128]`, with preprocessed `g/beta` `[B,4,HV]`; `lengths[B]` masks inactive tokens. The checkpoint is `[slots,HV,128,128]`, and the physical d/k/g ring has 16/32/64 positions. `positions[B]` counts valid committed records and `bases[B]` gives the physical circular origin. Only candidate d/k/g entries and outputs are written; the checkpoint is read-only. The caller must guarantee unique positive slots in one launch. Slot 0 is padding.
+
+Each `(request, value head, V tile)` task loads one BF16 checkpoint tile. For every candidate it computes `S_before @ q` and `S_before @ k` from the checkpoint plus previous committed and draft correction records, then obtains the next correction and output. Earlier draft corrections remain in UB. This evaluates the GDN triangular dependency in token order, without constructing or writing an intermediate `V×K` state per candidate. It is a correctness/performance probe, **not** yet a tuned parallel triangular solve. Unlike the slow AR1 kernel it does not replay full-matrix outer products for every draft token. The following gate will implement flush, and the next gate will implement accepted-token cursor commit/reset before model dispatch.
+
+The exact numerical contract is compared with an independent FP64 CPU dense recurrence. Previous ring records are read at their stored FP16/FP32 precision; within the current verification window, the just-computed draft correction remains FP32 until all outputs have been computed. The Python test also compares a separate output-only formula against the dense recurrence.
+
+The kernel has no torch allocations or host readback. It accepts shared page-backed state views with compact inner dimensions and runtime slot strides, and runs on the current NPU stream. The PyTorch binding validates static shape/dtype/stride metadata. Device-side status codes are 0 success/padding, 1 invalid slot, 2 invalid position/length or flush-required window, 3 invalid ring base, 4 invalid padding metadata. Invalid rows write zero output and leave state untouched.
+
+## Tiling and first performance question
+
+Tasks are distributed by `blockIdx + n*blockNum` over `B×HV×(128/tile_v)` and use AIV-only cores, no inter-core communication. The vector tile is 16/32, K is fixed at 128; the 64-row tile exceeds this pilot's explicit UB budget. At `tile_v=32`, one task requests 60,832 bytes of UB buffers (checkpoint/product 32 KiB, history K/D 10 KiB, spec K/D 2.5 KiB, queues/reduction/vectors for the remainder), below the 910B4 UB capacity. This counts explicit allocations; the CANN compiler's resource report is authoritative. The host defaults to **40 vector cores**, capped at the task count. Measure 8/20/40 on the same batch and input, since the user's AR profile showed a meaningful 40-core improvement. At TP8, batch 1, tile 32 there are only 24 tasks, so `cores=40` launches 24 blocks and must be reported as such. `T=4` and history length 12 are the most important first probe; `T=1` is the draftless fallback.
+
+This implementation still performs scalar reductions for history-key dot products. On a vector-bound 910B4 it may be slower than native MTP verify even if it saves snapshot memory. If so, the next kernel iteration should precompute the small `KᵀQ`/`KᵀK` matrices and perform the triangular solve with more intra-window parallelism; do not optimize AR1 as a prerequisite.
+
+## Local and on-machine checks
+
+Local CPU reference tests:
+
+```bash
+.venv/bin/python -m unittest discover -s experimental/replayssm_sd_ascendc/tests -v
+```
+
+In the CANN 9.2.0 container, build only this isolated directory (substitute the server's active Python when needed):
+
+```bash
+cmake -S experimental/replayssm_sd_ascendc \
+  -B experimental/replayssm_sd_ascendc/build \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.0 \
+  -DSOC_VERSION=Ascend910B4 \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build experimental/replayssm_sd_ascendc/build --parallel 4
+```
+
+The binding is `build/libreplayssm_sd_torch.so`, and CANN places its kernel in `build/lib/`. RPATH includes `$ORIGIN/lib`, as required by the validated AR build layout.
+
+After build, first run one smoke and one graph case on an idle card:
+
+```bash
+python3 experimental/replayssm_sd_ascendc/run.py --stage smoke \
+  --tp 4 --batch 2 --cores 40 --device 0 \
+  --output /tmp/replayssm-sd-l31-smoke-tp4.json
+python3 experimental/replayssm_sd_ascendc/run.py --stage graph \
+  --tp 4 --batch 2 --cores 40 --device 0 \
+  --output /tmp/replayssm-sd-l31-graph-tp4.json
+```
+
+Once both pass, compare 8/20/40 cores at TP4 and TP8, and batches 1/32/64. Run each invocation separately or assign independent invocations to idle cards; a device trap should not be followed by more launches on that card until its status is checked. For example:
+
+```bash
+for tp in 4 8; do
+  for batch in 1 32 64; do
+    for cores in 8 20 40; do
+      python3 experimental/replayssm_sd_ascendc/run.py --stage perf \
+        --tp "$tp" --batch "$batch" --cores "$cores" --device 0 \
+        --output "/tmp/replayssm-sd-l31-tp${tp}-b${batch}-c${cores}.json"
+    done
+  done
+done
+```
+
+The `smoke` report covers isolated correctness, `graph` covers capture/replay correctness, and `perf` adds graph replay p50/p90. Time only graph replay; cache reset is outside the timed event interval. The first run includes JIT compilation and is not a latency measurement. This stage does **not** establish the eventual SD speedup because flush, cursor operations, model scheduling, and snapshot removal are not yet included.
+
+Return the first failing JSON/log if any, plus the build log, source commit, installed CANN/torch_npu versions, and device health. If smoke or graph fails, stop this level and fix it before running the large performance matrix. No `vllm serve` switch should point to this pilot yet.
