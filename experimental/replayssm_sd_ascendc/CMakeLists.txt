@@ -54,7 +54,18 @@ target_compile_options(replayssm_sd_torch PRIVATE ${torch_cxx_flags} -O2 -Wall)
 target_link_libraries(replayssm_sd_torch PRIVATE
     replayssm_sd_verify_kernel ${TORCH_LIBRARIES} "${TORCH_NPU_LIB}" "${ASCENDCL_LIB}")
 target_compile_definitions(replayssm_sd_torch PRIVATE VLLM_ASCEND_ENABLE_REPLAYSSM_SD)
-# ascendc_library writes the kernel under build/lib; the binding remains in build/.
+# Runtime search path for the AscendC kernel dependency. ascendc_library writes
+# the kernel under build/lib, while the binding remains in build/.
 set_target_properties(replayssm_sd_torch PROPERTIES
-    BUILD_RPATH "$ORIGIN;$ORIGIN/lib;${TORCH_INSTALL_PREFIX}/lib;${torch_npu_root}/lib;${ASCEND_CANN_PACKAGE_PATH}/lib64"
-    BUILD_RPATH_USE_ORIGIN TRUE)
+    BUILD_RPATH "$ORIGIN/lib"
+    INSTALL_RPATH "$ORIGIN/lib"
+    BUILD_RPATH_USE_ORIGIN TRUE
+    SKIP_BUILD_RPATH FALSE
+    BUILD_WITH_INSTALL_RPATH FALSE
+)
+
+# Explicitly request an ELF RUNPATH entry from the linker.
+target_link_options(replayssm_sd_torch PRIVATE
+    "LINKER:-rpath,\$ORIGIN/lib"
+    "LINKER:--enable-new-dtags"
+)
