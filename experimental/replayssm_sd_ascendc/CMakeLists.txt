@@ -26,7 +26,12 @@ if(NOT ASCENDC_CMAKE_DIR)
 endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
 
-ascendc_library(replayssm_sd_verify_kernel SHARED ../../csrc/kernels/replayssm_sd_verify.cpp)
+ascendc_library(replayssm_sd_verify_kernel SHARED
+    ../../csrc/kernels/replayssm_sd_verify.cpp
+    ../../csrc/kernels/replayssm_sd_verify_reduce.cpp
+    ../../csrc/kernels/replayssm_sd_verify_bulk.cpp
+    ../../csrc/kernels/replayssm_sd_verify_shared.cpp
+    ../../csrc/kernels/replayssm_sd_verify_prefetch.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(

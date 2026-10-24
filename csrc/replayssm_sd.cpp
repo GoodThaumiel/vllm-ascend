@@ -7,6 +7,10 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <acl/acl.h>
 #include "aclrtlaunch_replayssm_sd_verify.h"
+#include "aclrtlaunch_replayssm_sd_verify_reduce.h"
+#include "aclrtlaunch_replayssm_sd_verify_bulk.h"
+#include "aclrtlaunch_replayssm_sd_verify_shared.h"
+#include "aclrtlaunch_replayssm_sd_verify_prefetch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,7 +27,8 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
             const at::Tensor& beta, const at::Tensor& checkpoint, const at::Tensor& d_cache,
             const at::Tensor& k_cache, const at::Tensor& g_cache, const at::Tensor& slots,
             const at::Tensor& positions, const at::Tensor& bases, const at::Tensor& lengths,
-            const at::Tensor& out, const at::Tensor& status, double scale, int64_t tile_v, int64_t cores) {
+            const at::Tensor& out, const at::Tensor& status, double scale, int64_t tile_v, int64_t cores,
+            int64_t variant) {
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   const std::vector<at::Tensor> tensors = {q,      k,         v,      g,      beta,   checkpoint, d_cache,
                                             k_cache, g_cache,   slots,  positions, bases,  lengths,    out, status};
@@ -81,23 +86,47 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(g.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat &&
                   g_cache.scalar_type() == at::kFloat,
               "g/beta/g_cache must be FP32");
-  TORCH_CHECK(tile_v == 16 || tile_v == 32, "tile_v must be 16/32 for this UB budget");
+  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64, "tile_v must be 16/32/64");
   const int64_t tasks = batch * value_heads * (K_DIM / tile_v);
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
+  TORCH_CHECK(variant >= 0 && variant <= 4, "variant must be in [0,4]");
+  TORCH_CHECK(variant < 2 || value_heads <= 12,
+              "bulk/shared variants require at most 12 value heads per rank");
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "scale must be finite and positive");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const auto result = aclrtlaunch_replayssm_sd_verify(
-      static_cast<uint32_t>(std::min(cores, tasks)), stream, q.data_ptr(), k.data_ptr(), v.data_ptr(),
-      g.data_ptr(), beta.data_ptr(), checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(),
-      g_cache.data_ptr(), slots.data_ptr(), positions.data_ptr(), bases.data_ptr(), lengths.data_ptr(),
-      out.data_ptr(), status.data_ptr(), static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots),
-      static_cast<uint32_t>(heads), static_cast<uint32_t>(value_heads), static_cast<uint32_t>(ring_len),
-      static_cast<uint64_t>(checkpoint.stride(0)), static_cast<uint64_t>(d_cache.stride(0)),
-      static_cast<uint64_t>(k_cache.stride(0)), static_cast<uint64_t>(g_cache.stride(0)),
-      static_cast<uint32_t>(tile_v), static_cast<float>(scale));
+  const auto block_dim = static_cast<uint32_t>(std::min(cores, variant >= 3 ? batch * value_heads : tasks));
+#define REPLAY_SD_LAUNCH_ARGS                                                                       \
+  block_dim, stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(),        \
+      checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(),             \
+      slots.data_ptr(), positions.data_ptr(), bases.data_ptr(), lengths.data_ptr(),                  \
+      out.data_ptr(), status.data_ptr(), static_cast<uint32_t>(batch),                                \
+      static_cast<uint32_t>(num_slots), static_cast<uint32_t>(heads),                                 \
+      static_cast<uint32_t>(value_heads), static_cast<uint32_t>(ring_len),                            \
+      static_cast<uint64_t>(checkpoint.stride(0)), static_cast<uint64_t>(d_cache.stride(0)),          \
+      static_cast<uint64_t>(k_cache.stride(0)), static_cast<uint64_t>(g_cache.stride(0)),             \
+      static_cast<uint32_t>(tile_v), static_cast<float>(scale)
+  aclError result;
+  switch (variant) {
+    case 0:
+      result = aclrtlaunch_replayssm_sd_verify(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 1:
+      result = aclrtlaunch_replayssm_sd_verify_reduce(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 2:
+      result = aclrtlaunch_replayssm_sd_verify_bulk(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 3:
+      result = aclrtlaunch_replayssm_sd_verify_shared(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    default:
+      result = aclrtlaunch_replayssm_sd_verify_prefetch(REPLAY_SD_LAUNCH_ARGS);
+      break;
+  }
+#undef REPLAY_SD_LAUNCH_ARGS
   TORCH_CHECK(result == ACL_SUCCESS, "Replay SD verify launch failed: ", result);
 }
 

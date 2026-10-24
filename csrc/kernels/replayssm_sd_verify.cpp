@@ -12,12 +12,16 @@ constexpr uint32_t MAX_HISTORY = 16;
 constexpr uint32_t MAX_TOKENS = 4;
 constexpr uint32_t MAX_WINDOW = MAX_HISTORY + MAX_TOKENS;
 constexpr uint32_t FP32_BLOCK = 8;
+constexpr uint32_t MAX_RING = 64;
+constexpr uint32_t MAX_VALUE_HEADS = 12;
 
-// L3.1 non-flush pilot: one AIV task owns (request, value head, V tile).
+// L3.1 non-flush pilot: the baseline AIV task owns one V tile; shared variants
+// process all V tiles for a (request, value head) in one task.
 // No intermediate recurrent state is formed or written. The triangular GDN
 // correction solve is evaluated in token order with the earlier corrections
 // held in UB; this is algebraically the same unit-triangular solve as Eq. 10
 // of the paper, but is not yet the final performance tiling.
+template <int VARIANT>
 class ReplaySDVerify {
  public:
   __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
@@ -64,7 +68,26 @@ class ReplaySDVerify {
     pipe_.InitBuffer(specKBuffer_, MAX_TOKENS * K_DIM * sizeof(float));
     pipe_.InitBuffer(specDBuffer_, MAX_TOKENS * tileV * sizeof(float));
     pipe_.InitBuffer(vectorBuffer_, (3 * K_DIM + 7 * tileV + FP32_BLOCK) * sizeof(float));
-    pipe_.InitBuffer(reduceBuffer_, 4096);
+    if constexpr (VARIANT == 0) {
+      pipe_.InitBuffer(reduceBuffer_, 4096);
+    }
+    if constexpr (VARIANT >= 2) {
+      pipe_.InitBuffer(historyGateBuffer_, MAX_RING * sizeof(float));
+      pipe_.InitBuffer(candidateGateBuffer_, MAX_TOKENS * MAX_VALUE_HEADS * sizeof(float));
+      pipe_.InitBuffer(candidateLogGateBuffer_, MAX_TOKENS * MAX_VALUE_HEADS * sizeof(float));
+      pipe_.InitBuffer(candidateBetaBuffer_, MAX_TOKENS * MAX_VALUE_HEADS * sizeof(float));
+      historyGate_ = historyGateBuffer_.Get<float>();
+      candidateGate_ = candidateGateBuffer_.Get<float>();
+      candidateLogGate_ = candidateLogGateBuffer_.Get<float>();
+      candidateBeta_ = candidateBetaBuffer_.Get<float>();
+    }
+    if constexpr (VARIANT >= 3) {
+      pipe_.InitBuffer(allQBuffer_, MAX_TOKENS * K_DIM * sizeof(float));
+      allQ_ = allQBuffer_.Get<float>();
+    }
+    if constexpr (VARIANT == 4) {
+      pipe_.InitBuffer(statePrefetchQueue_, 2, tileV_ * K_DIM * sizeof(bfloat16_t));
+    }
 
     state_ = checkpointBuffer_.Get<float>();
     product_ = productBuffer_.Get<float>();
@@ -85,6 +108,10 @@ class ReplaySDVerify {
   }
 
   __aicore__ inline void Process() {
+    if constexpr (VARIANT >= 3) {
+      ProcessSharedHeads();
+      return;
+    }
     for (uint32_t task = GetBlockIdx(); task < batch_ * valueHeads_ * tiles_; task += GetBlockNum()) {
       const uint32_t row = task / (valueHeads_ * tiles_);
       const uint32_t head = (task / tiles_) % valueHeads_;
@@ -130,14 +157,33 @@ class ReplaySDVerify {
       float historyAlpha[MAX_HISTORY];
       float specAlpha[MAX_TOKENS];
       float historyProduct = 1.0f;
+      if constexpr (VARIANT >= 2) {
+        Load(gCache_, gOffset, historyGate_, ringLen_);
+        Exp(historyGate_, historyGate_, ringLen_);
+        PipeBarrier<PIPE_V>();
+        SyncVectorToScalar();
+        Load(g_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateLogGate_,
+             MAX_TOKENS * valueHeads_);
+        DataCopy(candidateGate_, candidateLogGate_, MAX_TOKENS * valueHeads_);
+        PipeBarrier<PIPE_V>();
+        Exp(candidateGate_, candidateGate_, MAX_TOKENS * valueHeads_);
+        PipeBarrier<PIPE_V>();
+        Load(beta_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateBeta_,
+             MAX_TOKENS * valueHeads_);
+        SyncVectorToScalar();
+      }
       for (int32_t i = 0; i < pos; ++i) {
         const uint32_t phys = Physical(base, i);
         Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
         Load(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart, historyD_[i * tileV_], tileV_);
-        Load(gCache_, gOffset + phys, scalar_, 1);
-        Exp(scalar_, scalar_, 1);
-        PipeBarrier<PIPE_V>();
-        historyAlpha[i] = ReadLocal(scalar_, 0);
+        if constexpr (VARIANT >= 2) {
+          historyAlpha[i] = historyGate_.GetValue(phys);
+        } else {
+          Load(gCache_, gOffset + phys, scalar_, 1);
+          Exp(scalar_, scalar_, 1);
+          PipeBarrier<PIPE_V>();
+          historyAlpha[i] = ReadLocal(scalar_, 0);
+        }
         historyProduct *= historyAlpha[i];
       }
 
@@ -176,13 +222,23 @@ class ReplaySDVerify {
           suffix *= specAlpha[j];
         }
 
-        Load(g_, (static_cast<uint64_t>(row) * MAX_TOKENS + s) * valueHeads_ + head, scalar_, 1);
-        const float logGate = ReadLocal(scalar_, 0);
-        Exp(scalar_, scalar_, 1);
-        PipeBarrier<PIPE_V>();
-        const float alpha = ReadLocal(scalar_, 0);
-        Load(beta_, (static_cast<uint64_t>(row) * MAX_TOKENS + s) * valueHeads_ + head, scalar_, 1);
-        const float beta = ReadLocal(scalar_, 0);
+        float logGate;
+        float alpha;
+        float beta;
+        if constexpr (VARIANT >= 2) {
+          const uint32_t gateIndex = s * valueHeads_ + head;
+          alpha = candidateGate_.GetValue(gateIndex);
+          beta = candidateBeta_.GetValue(gateIndex);
+          logGate = candidateLogGate_.GetValue(gateIndex);
+        } else {
+          Load(g_, (static_cast<uint64_t>(row) * MAX_TOKENS + s) * valueHeads_ + head, scalar_, 1);
+          logGate = ReadLocal(scalar_, 0);
+          Exp(scalar_, scalar_, 1);
+          PipeBarrier<PIPE_V>();
+          alpha = ReadLocal(scalar_, 0);
+          Load(beta_, (static_cast<uint64_t>(row) * MAX_TOKENS + s) * valueHeads_ + head, scalar_, 1);
+          beta = ReadLocal(scalar_, 0);
+        }
         Muls(prevK_, prevK_, alpha, tileV_);
         PipeBarrier<PIPE_V>();
         Sub(delta_, value_, prevK_, tileV_);
@@ -220,6 +276,205 @@ class ReplaySDVerify {
   }
 
  private:
+  __aicore__ inline void ProcessSharedHeads() {
+    // One task owns all V tiles of a (request, value head). The K-side
+    // dot table is invariant across V tiles, so build it once per task.
+    for (uint32_t task = GetBlockIdx(); task < batch_ * valueHeads_; task += GetBlockNum()) {
+      const uint32_t row = task / valueHeads_;
+      const uint32_t head = task % valueHeads_;
+      const uint32_t keyHead = head / (valueHeads_ / heads_);
+      const int32_t slot = ReadInt(slots_, row);
+      const int32_t pos = ReadInt(positions_, row);
+      const int32_t base = ReadInt(bases_, row);
+      const int32_t length = ReadInt(lengths_, row);
+      int32_t error = 0;
+      if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
+        error = 1;
+      } else if (slot == 0) {
+        if (pos != 0 || base != 0 || length != 0) {
+          error = 4;
+        }
+      } else if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY) || length < 1 ||
+                 length > static_cast<int32_t>(MAX_TOKENS) || pos + length > static_cast<int32_t>(MAX_WINDOW) ||
+                 pos + length > static_cast<int32_t>(ringLen_)) {
+        error = 2;
+      } else if (base < 0 || base >= static_cast<int32_t>(ringLen_)) {
+        error = 3;
+      }
+      if (error != 0 || slot == 0) {
+        Duplicate(result_, 0.0f, tileV_);
+        PipeBarrier<PIPE_V>();
+        for (uint32_t tile = 0; tile < tiles_; ++tile) {
+          for (uint32_t s = 0; s < MAX_TOKENS; ++s) {
+            Store(out_, OutputOffset(row, s, head, tile * tileV_), result_, tileV_);
+          }
+          WriteStatus(task * tiles_ + tile, error);
+        }
+        continue;
+      }
+
+      const uint64_t dOffset = static_cast<uint64_t>(slot) * dStride_ +
+                               static_cast<uint64_t>(head) * ringLen_ * V_DIM;
+      const uint64_t kOffset = static_cast<uint64_t>(slot) * kStride_ +
+                               static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
+      const uint64_t gOffset = static_cast<uint64_t>(slot) * gStride_ +
+                               static_cast<uint64_t>(head) * ringLen_;
+      const uint64_t stateOffset = static_cast<uint64_t>(slot) * checkpointStride_ +
+                                   static_cast<uint64_t>(head) * V_DIM * K_DIM;
+
+      Load(gCache_, gOffset, historyGate_, ringLen_);
+      Exp(historyGate_, historyGate_, ringLen_);
+      PipeBarrier<PIPE_V>();
+      Load(g_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateLogGate_,
+           MAX_TOKENS * valueHeads_);
+      DataCopy(candidateGate_, candidateLogGate_, MAX_TOKENS * valueHeads_);
+      PipeBarrier<PIPE_V>();
+      Exp(candidateGate_, candidateGate_, MAX_TOKENS * valueHeads_);
+      PipeBarrier<PIPE_V>();
+      Load(beta_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateBeta_,
+           MAX_TOKENS * valueHeads_);
+      SyncVectorToScalar();
+      float historyAlpha[MAX_HISTORY];
+      float alpha[MAX_TOKENS];
+      float beta[MAX_TOKENS];
+      float logGate[MAX_TOKENS];
+      float historyProduct = 1.0f;
+      for (int32_t i = 0; i < pos; ++i) {
+        const uint32_t phys = Physical(base, i);
+        historyAlpha[i] = historyGate_.GetValue(phys);
+        historyProduct *= historyAlpha[i];
+        Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
+      }
+      for (int32_t s = 0; s < length; ++s) {
+        const uint32_t gateIndex = s * valueHeads_ + head;
+        alpha[s] = candidateGate_.GetValue(gateIndex);
+        beta[s] = candidateBeta_.GetValue(gateIndex);
+        logGate[s] = candidateLogGate_.GetValue(gateIndex);
+        const uint64_t qkOffset = (static_cast<uint64_t>(row) * MAX_TOKENS + s) * heads_ * K_DIM +
+                                  static_cast<uint64_t>(keyHead) * K_DIM;
+        Load(q_, qkOffset, allQ_[s * K_DIM], K_DIM);
+        Muls(allQ_[s * K_DIM], allQ_[s * K_DIM], scale_, K_DIM);
+        PipeBarrier<PIPE_V>();
+        Load(k_, qkOffset, specK_[s * K_DIM], K_DIM);
+      }
+
+      float historyQDot[MAX_TOKENS][MAX_HISTORY];
+      float historyKDot[MAX_TOKENS][MAX_HISTORY];
+      float specQDot[MAX_TOKENS][MAX_TOKENS];
+      float specKDot[MAX_TOKENS][MAX_TOKENS];
+      float currentKQ[MAX_TOKENS];
+      for (int32_t s = 0; s < length; ++s) {
+        auto qVec = allQ_[s * K_DIM];
+        auto kVec = specK_[s * K_DIM];
+        for (int32_t i = 0; i < pos; ++i) {
+          auto oldK = historyK_[i * K_DIM];
+          historyQDot[s][i] = Dot(oldK, qVec);
+          historyKDot[s][i] = Dot(oldK, kVec);
+        }
+        for (int32_t j = 0; j < s; ++j) {
+          auto oldK = specK_[j * K_DIM];
+          specQDot[s][j] = Dot(oldK, qVec);
+          specKDot[s][j] = Dot(oldK, kVec);
+        }
+        currentKQ[s] = Dot(kVec, qVec);
+      }
+
+      if constexpr (VARIANT == 4) {
+        PrefetchCheckpoint(stateOffset);
+        if (tiles_ > 1) {
+          PrefetchCheckpoint(stateOffset + tileV_ * K_DIM);
+        }
+      }
+      for (uint32_t tile = 0; tile < tiles_; ++tile) {
+        const uint32_t vStart = tile * tileV_;
+        if constexpr (VARIANT == 4) {
+          ConsumeCheckpoint();
+          if (tile + 2 < tiles_) {
+            PrefetchCheckpoint(stateOffset + (tile + 2) * tileV_ * K_DIM);
+          }
+        } else {
+          Load(checkpoint_, stateOffset + vStart * K_DIM, state_, tileV_ * K_DIM);
+        }
+        for (int32_t i = 0; i < pos; ++i) {
+          const uint32_t phys = Physical(base, i);
+          Load(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart,
+               historyD_[i * tileV_], tileV_);
+        }
+        float specProduct = 1.0f;
+        for (int32_t s = 0; s < length; ++s) {
+          const uint64_t vOffset = OutputOffset(row, s, head, vStart);
+          Load(v_, vOffset, value_, tileV_);
+          MatVec(allQ_[s * K_DIM], prevQ_);
+          MatVec(specK_[s * K_DIM], prevK_);
+          Muls(prevQ_, prevQ_, historyProduct * specProduct, tileV_);
+          Muls(prevK_, prevK_, historyProduct * specProduct, tileV_);
+          PipeBarrier<PIPE_V>();
+          float suffix = specProduct;
+          for (int32_t remaining = pos; remaining > 0; --remaining) {
+            const int32_t i = remaining - 1;
+            auto oldD = historyD_[i * tileV_];
+            Accumulate(prevQ_, oldD, suffix * historyQDot[s][i]);
+            Accumulate(prevK_, oldD, suffix * historyKDot[s][i]);
+            suffix *= historyAlpha[i];
+          }
+          suffix = 1.0f;
+          for (int32_t remaining = s; remaining > 0; --remaining) {
+            const int32_t j = remaining - 1;
+            auto oldD = specD_[j * tileV_];
+            Accumulate(prevQ_, oldD, suffix * specQDot[s][j]);
+            Accumulate(prevK_, oldD, suffix * specKDot[s][j]);
+            suffix *= alpha[j];
+          }
+          Muls(prevK_, prevK_, alpha[s], tileV_);
+          PipeBarrier<PIPE_V>();
+          Sub(delta_, value_, prevK_, tileV_);
+          PipeBarrier<PIPE_V>();
+          Muls(delta_, delta_, beta[s], tileV_);
+          PipeBarrier<PIPE_V>();
+          Muls(prevQ_, prevQ_, alpha[s], tileV_);
+          Muls(term_, delta_, currentKQ[s], tileV_);
+          PipeBarrier<PIPE_V>();
+          Add(result_, prevQ_, term_, tileV_);
+          PipeBarrier<PIPE_V>();
+          Store(out_, vOffset, result_, tileV_);
+          DataCopy(specD_[s * tileV_], delta_, tileV_);
+          PipeBarrier<PIPE_V>();
+          const uint32_t phys = Physical(base, pos + s);
+          Store(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart, delta_, tileV_);
+          if (vStart == 0) {
+            WriteGate(gOffset + phys, logGate[s]);
+            if (head % (valueHeads_ / heads_) == 0) {
+              Store(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM,
+                    specK_[s * K_DIM], K_DIM);
+            }
+          }
+          specProduct *= alpha[s];
+        }
+        Duplicate(result_, 0.0f, tileV_);
+        PipeBarrier<PIPE_V>();
+        for (int32_t s = length; s < static_cast<int32_t>(MAX_TOKENS); ++s) {
+          Store(out_, OutputOffset(row, s, head, vStart), result_, tileV_);
+        }
+        WriteStatus(task * tiles_ + tile, 0);
+      }
+    }
+  }
+
+  __aicore__ inline void PrefetchCheckpoint(uint64_t offset) {
+    auto input = statePrefetchQueue_.AllocTensor<bfloat16_t>();
+    DataCopyExtParams cp{1, static_cast<uint32_t>(tileV_ * K_DIM * sizeof(bfloat16_t)), 0, 0, 0};
+    DataCopyPadExtParams<bfloat16_t> pad{false, 0, 0, 0};
+    DataCopyPad(input, checkpoint_[offset], cp, pad);
+    statePrefetchQueue_.EnQue(input);
+  }
+
+  __aicore__ inline void ConsumeCheckpoint() {
+    auto input = statePrefetchQueue_.DeQue<bfloat16_t>();
+    Cast(state_, input, RoundMode::CAST_NONE, tileV_ * K_DIM);
+    PipeBarrier<PIPE_V>();
+    statePrefetchQueue_.FreeTensor(input);
+  }
+
   __aicore__ inline uint32_t Physical(int32_t base, int32_t logical) const {
     return (base + logical) & (ringLen_ - 1);
   }
@@ -270,8 +525,7 @@ class ReplaySDVerify {
   __aicore__ inline float Dot(LocalTensor<float> a, LocalTensor<float> b) {
     Mul(product_, a, b, K_DIM);
     PipeBarrier<PIPE_V>();
-    uint32_t shape[2] = {1, K_DIM};
-    ReduceSum<float, Pattern::Reduce::AR, true>(scalar_, product_, reduceBuffer_.Get<uint8_t>(), shape, true);
+    ReduceK128(scalar_, 1);
     PipeBarrier<PIPE_V>();
     return ReadLocal(scalar_, 0);
   }
@@ -280,9 +534,26 @@ class ReplaySDVerify {
     Mul(product_, state_, vector, 64, tileV_, {1, 1, 1, 16, 16, 0});
     Mul(product_[64], state_[64], vector[64], 64, tileV_, {1, 1, 1, 16, 16, 0});
     PipeBarrier<PIPE_V>();
-    uint32_t shape[2] = {tileV_, K_DIM};
-    ReduceSum<float, Pattern::Reduce::AR, true>(dest, product_, reduceBuffer_.Get<uint8_t>(), shape, true);
+    ReduceK128(dest, tileV_);
     PipeBarrier<PIPE_V>();
+  }
+
+  __aicore__ inline void ReduceK128(LocalTensor<float> dest, uint32_t rows) {
+    if constexpr (VARIANT == 0) {
+      uint32_t shape[2] = {rows, K_DIM};
+      ReduceSum<float, Pattern::Reduce::AR, true>(dest, product_, reduceBuffer_.Get<uint8_t>(), shape, true);
+    } else {
+      // Match the 910B native RGDR K=128 path: fold 128 to 64 in place,
+      // then reduce all rows with one WholeReduceSum call.
+      Add(product_[64], product_, product_[64], 64, rows, {1, 1, 1, 16, 16, 16});
+      PipeBarrier<PIPE_V>();
+      WholeReduceSum(dest, product_[64], 64, rows, 1, 1, 16);
+    }
+  }
+
+  __aicore__ inline void SyncVectorToScalar() {
+    SetFlag<HardEvent::V_S>(EVENT_ID0);
+    WaitFlag<HardEvent::V_S>(EVENT_ID0);
   }
 
   __aicore__ inline void Accumulate(LocalTensor<float> dest, LocalTensor<float> d, float coefficient) {
@@ -333,10 +604,14 @@ class ReplaySDVerify {
 
   TPipe pipe_;
   TQue<QuePosition::VECIN, 1> in_;
+  TQue<QuePosition::VECIN, 2> statePrefetchQueue_;
   TQue<QuePosition::VECOUT, 1> outQueue_;
   TBuf<QuePosition::VECCALC> checkpointBuffer_, productBuffer_, historyKBuffer_, historyDBuffer_;
   TBuf<QuePosition::VECCALC> specKBuffer_, specDBuffer_, vectorBuffer_, reduceBuffer_;
+  TBuf<QuePosition::VECCALC> historyGateBuffer_, candidateGateBuffer_, candidateLogGateBuffer_;
+  TBuf<QuePosition::VECCALC> candidateBetaBuffer_, allQBuffer_;
   LocalTensor<float> state_, product_, historyK_, historyD_, specK_, specD_;
+  LocalTensor<float> historyGate_, candidateGate_, candidateLogGate_, candidateBeta_, allQ_;
   LocalTensor<float> qLocal_, kLocal_, value_, prevQ_, prevK_, delta_, result_, term_, scalar_;
   GlobalTensor<bfloat16_t> q_, k_, v_, checkpoint_, out_;
   GlobalTensor<half> dCache_, kCache_;
@@ -348,6 +623,7 @@ class ReplaySDVerify {
 };
 }  // namespace
 
+#ifndef REPLAY_SD_NO_ENTRY
 extern "C" __global__ __aicore__ void replayssm_sd_verify(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint, GM_ADDR dCache,
     GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR positions, GM_ADDR bases, GM_ADDR lengths,
@@ -355,9 +631,10 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify(
     uint32_t ringLen, uint64_t checkpointSlotStride, uint64_t dSlotStride, uint64_t kSlotStride,
     uint64_t gSlotStride, uint32_t tileV, float scale) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-  ReplaySDVerify op;
+  ReplaySDVerify<0> op;
   op.Init(q, k, v, g, beta, checkpoint, dCache, kCache, gCache, slots, positions, bases, lengths, out,
           status, batch, numSlots, heads, valueHeads, ringLen, checkpointSlotStride, dSlotStride,
           kSlotStride, gSlotStride, tileV, scale);
   op.Process();
 }
+#endif

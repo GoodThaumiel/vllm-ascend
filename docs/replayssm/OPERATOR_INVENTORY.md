@@ -72,7 +72,7 @@ Qwen3.6 的 MTP draft layer 是 full attention；Replay 算子运行在 target �
 
 | 编号 | 算子 | 最接近的已有实现 | 实现决策 | 状态 | 修改性质 |
 |---|---|---|---|---|---|
-| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | AscendC `T≤4` 输出与 d/k/g 写入；扩展到 history≤16、history+T≤20；主扩展已注册 | L3.1 用户回传旧非 flush 窗口 18 组 graph/perf 全过；新窗口待上机 | 新增插件算子，高工作量 |
+| SD1 | 多 token Replay verify recurrent | FLA AscendC `recurrent_gated_delta_rule`；原论文仓 Triton `gdn_replayssm_spec_circular_kernel` | AscendC `T≤4` 输出与 d/k/g 写入；扩展到 history≤16、history+T≤20；主扩展已注册 | L3.1 旧窗口 18 组 graph/perf 已过；新增 v0–v4 归约、批量搬运、共享点积、预取消融及 tile64，待 CANN/NPU 上机，详见 `LEVEL3_SD_ABLATION.md` | 新增插件算子，高工作量 |
 | SD2 | flush/compact | 原论文仓 SD1 同源的 flush specialization | 首版先执行 SD1，再用独立 AscendC compact 折叠旧已接受历史；graph 中固定两次 launch，按 per-row flush 路由 | 独立算子、CPU golden 与主扩展注册已完成，待 CANN/NPU | 新增插件算子，中高工作量 |
 | SD3 | accepted-token cursor commit | 原论文仓 `_advance_gdn_spec_cursors_kernel` | AscendC 更新 block-keyed `write_pos/cache_base/is_flush`；与 reset 共用一个入口 | 独立算子、CPU golden 与主扩展注册已完成，待 CANN/NPU | 新增插件算子，低工作量 |
 | SD4 | 新请求/恢复时 cursor reset | 原论文仓 `_reset_gdn_replayssm_spec_cursors_kernel` | SD3 算子的 `do_reset` 分支；reset 覆盖旧 accepted | CPU golden 已完成，待 CANN/NPU | 同 SD3，无额外 kernel |

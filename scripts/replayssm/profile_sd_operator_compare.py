@@ -178,6 +178,7 @@ def run_case(args: argparse.Namespace, batch: int, context: int, length: int, po
             scale,
             args.tile_v,
             args.cores,
+            args.variant,
         )
 
     reset_native()
@@ -204,7 +205,7 @@ def run_case(args: argparse.Namespace, batch: int, context: int, length: int, po
     reset_replay()
     torch.npu.synchronize()
 
-    label = f"tp{args.tp}_b{batch}_ctx{context}_t{length}_a{args.accepted}_pos{position}_c{args.cores}"
+    label = f"tp{args.tp}_b{batch}_ctx{context}_t{length}_a{args.accepted}_pos{position}_c{args.cores}_v{args.variant}"
     durations = {}
     for name, call in (("native", native_call), ("replay", replay_call)):
         print(f"PROFILE_BEGIN {label} {name} repetitions={args.repetitions}", flush=True)
@@ -234,7 +235,10 @@ def run_case(args: argparse.Namespace, batch: int, context: int, length: int, po
         "warmup_per_path": args.warmup,
         "tile_v": args.tile_v,
         "requested_cores": args.cores,
-        "effective_replay_cores": min(args.cores, batch * value_heads * (HEAD_DIM // args.tile_v)),
+        "variant": args.variant,
+        "effective_replay_cores": min(
+            args.cores, batch * value_heads * (1 if args.variant >= 3 else HEAD_DIM // args.tile_v)
+        ),
         "output_max_abs_error": max_abs,
         "output_relative_l2_error": relative_l2,
         "host_range_seconds_including_dispatch": durations,
@@ -260,8 +264,9 @@ def main() -> None:
     parser.add_argument("--positions", type=nonnegative_ints, default=(0, 7, 12))
     parser.add_argument("--base", type=int, default=29)
     parser.add_argument("--ring", type=int, choices=(16, 32, 64), default=32)
-    parser.add_argument("--tile-v", type=int, choices=(16, 32), default=32)
+    parser.add_argument("--tile-v", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
+    parser.add_argument("--variant", type=int, choices=(0, 1, 2, 3, 4), default=0)
     parser.add_argument("--repetitions", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--max-abs-error", type=float, default=0.05)
@@ -288,6 +293,7 @@ def main() -> None:
         "packages": package_versions(),
         "native_source": "vllm_ascend.ops.gdn.recurrent_gated_delta_rule",
         "replay_source": "vllm_ascend.ops.replayssm.ascendc.replayssm_sd_verify",
+        "replay_variant": args.variant,
         "note": (
             "Context length is a label only: recurrent tensor shapes and seed are identical across labels. "
             "Non-flush recurrent core only; no causal conv, gating, L2 norm, cursor commit, or HTTP serving."

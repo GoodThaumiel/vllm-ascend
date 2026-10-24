@@ -35,8 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("lab", "framework"), default="lab")
     parser.add_argument("--tp", type=int, choices=(4, 8), default=4)
     parser.add_argument("--batch", type=int, default=2)
-    parser.add_argument("--tile-v", type=int, choices=(16, 32), default=32)
+    parser.add_argument("--tile-v", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
+    parser.add_argument("--variant", type=int, choices=(0, 1, 2, 3, 4), default=0)
     parser.add_argument("--layout", choices=("compact", "page_strided"), default="page_strided")
     parser.add_argument("--stage", choices=("smoke", "graph", "perf", "all"), default="smoke")
     parser.add_argument("--iterations", type=int, default=50)
@@ -70,7 +71,7 @@ def _run_once(args, device, pos, length, base, seed, padding=False):
     cpu = _cpu_case(args, pos, length, base, seed, padding=padding)
     expected = recurrent_golden(cpu)
     gpu = _device_case(cpu, device, args.layout)
-    invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
+    invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
     torch.npu.synchronize()
     actual = clone_case(gpu)
     return check_result(actual, expected)
@@ -81,11 +82,11 @@ def _graph_case(args, device, perf=False):
 
     cpu = _cpu_case(args, 7, 4, 29, 157)
     gpu = _device_case(cpu, device, args.layout)
-    invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
+    invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
+        invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
     records = []
     for pos, length, base, padding in (
         (0, 1, 0, False),
@@ -156,7 +157,11 @@ def main() -> None:
         "batch": args.batch,
         "tile_v": args.tile_v,
         "cores": args.cores,
-        "effective_cores": min(args.cores, args.batch * (48 // args.tp) * (128 // args.tile_v)),
+        "variant": args.variant,
+        "effective_cores": min(
+            args.cores,
+            args.batch * (48 // args.tp) * (1 if args.variant >= 3 else (128 // args.tile_v)),
+        ),
         "layout": args.layout,
         "backend": args.backend,
         "status": "FAILED",

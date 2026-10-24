@@ -129,6 +129,8 @@ class FrameworkMetaTests(unittest.TestCase):
         )
         self.assertEqual(len(schema.returns), 0)
         self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta")))
+        for variant in range(5):
+            self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta"), variant))
 
     def test_sd_fake_tensor_tracing_retains_operator(self):
         from torch.fx.experimental.proxy_tensor import make_fx

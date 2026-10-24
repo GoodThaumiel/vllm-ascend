@@ -33,7 +33,7 @@ def make_case(
         raise ValueError("Invalid history position or verify length")
     if position + length > min(MAX_WINDOW, ring_len) or not 0 <= base < ring_len:
         raise ValueError("This pilot requires the verify window to fit the physical ring")
-    if tile_v not in (16, 32):
+    if tile_v not in (16, 32, 64):
         raise ValueError("Invalid tile_v")
     generator = torch.Generator().manual_seed(seed)
     heads, value_heads = 16 // tp, 48 // tp
@@ -212,7 +212,14 @@ def check_result(actual: dict[str, torch.Tensor], expected: dict[str, torch.Tens
     return errors
 
 
-def invoke(case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, backend: str = "lab") -> None:
+def invoke(
+    case: dict[str, torch.Tensor],
+    *,
+    tile_v: int = 32,
+    cores: int = 40,
+    variant: int = 0,
+    backend: str = "lab",
+) -> None:
     if backend == "lab":
         op = torch.ops.replayssm_sd_lab.verify_
     elif backend == "framework":
@@ -245,4 +252,5 @@ def invoke(case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, 
         HEAD_DIM**-0.5,
         tile_v,
         cores,
+        variant,
     )

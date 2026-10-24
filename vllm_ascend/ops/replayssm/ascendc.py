@@ -70,6 +70,7 @@ def replayssm_sd_verify(
     scale: float,
     tile_v: int = 32,
     cores: int = 40,
+    variant: int = 0,
 ) -> None:
     """Verify a non-flush MTP window through the framework-owned SD op.
 
@@ -96,6 +97,7 @@ def replayssm_sd_verify(
         scale,
         tile_v,
         cores,
+        variant,
     )
 
 

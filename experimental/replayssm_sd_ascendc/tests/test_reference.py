@@ -58,6 +58,13 @@ class SDReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid TP"):
             make_case(tp=3)
 
+    def test_tile64_uses_two_value_tiles_per_head(self):
+        for tp in (4, 8):
+            with self.subTest(tp=tp):
+                case = make_case(tp=tp, batch=2, position=12, length=4, tile_v=64)
+                self.assertEqual(case["status"].numel(), 2 * (48 // tp) * 2)
+                torch.testing.assert_close(output_only_reference(case), recurrent_golden(case)["out"], rtol=0, atol=0)
+
     def test_padding_and_mixed_window_lengths(self):
         case = make_case(batch=3, position=7, length=4, base=30, padding=True)
         case["lengths"][0] = 1
