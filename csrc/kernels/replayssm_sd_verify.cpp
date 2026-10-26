@@ -85,7 +85,11 @@ class ReplaySDVerify {
       pipe_.InitBuffer(allQBuffer_, MAX_TOKENS * K_DIM * sizeof(float));
       allQ_ = allQBuffer_.Get<float>();
     }
-    if constexpr (VARIANT == 4) {
+    if constexpr (VARIANT == 5 || VARIANT == 6) {
+      pipe_.InitBuffer(dotRowBuffer_, MAX_HISTORY * sizeof(float));
+      dotRows_ = dotRowBuffer_.Get<float>();
+    }
+    if constexpr (VARIANT == 4 || VARIANT == 6) {
       pipe_.InitBuffer(statePrefetchQueue_, 2, tileV_ * K_DIM * sizeof(bfloat16_t));
     }
 
@@ -358,6 +362,14 @@ class ReplaySDVerify {
         Load(k_, qkOffset, specK_[s * K_DIM], K_DIM);
       }
 
+      if constexpr (VARIANT == 6) {
+        // Keep the first checkpoint DMA in flight while computing the K-side
+        // dot table, instead of enqueuing it after all dot work is finished.
+        PrefetchCheckpoint(stateOffset);
+        if (tiles_ > 1) {
+          PrefetchCheckpoint(stateOffset + tileV_ * K_DIM);
+        }
+      }
       float historyQDot[MAX_TOKENS][MAX_HISTORY];
       float historyKDot[MAX_TOKENS][MAX_HISTORY];
       float specQDot[MAX_TOKENS][MAX_TOKENS];
@@ -366,17 +378,31 @@ class ReplaySDVerify {
       for (int32_t s = 0; s < length; ++s) {
         auto qVec = allQ_[s * K_DIM];
         auto kVec = specK_[s * K_DIM];
-        for (int32_t i = 0; i < pos; ++i) {
-          auto oldK = historyK_[i * K_DIM];
-          historyQDot[s][i] = Dot(oldK, qVec);
-          historyKDot[s][i] = Dot(oldK, kVec);
+        if constexpr (VARIANT == 5 || VARIANT == 6) {
+          // Reduce all history rows together. One V->S sync replaces one sync
+          // per key, while each row keeps its original K=128 dot product.
+          if (pos > 0) {
+            DotRows(historyK_, qVec, historyQDot[s], pos);
+            DotRows(historyK_, kVec, historyKDot[s], pos);
+          }
+          DotRows(specK_, qVec, specQDot[s], s + 1);
+          currentKQ[s] = specQDot[s][s];
+          if (s > 0) {
+            DotRows(specK_, kVec, specKDot[s], s);
+          }
+        } else {
+          for (int32_t i = 0; i < pos; ++i) {
+            auto oldK = historyK_[i * K_DIM];
+            historyQDot[s][i] = Dot(oldK, qVec);
+            historyKDot[s][i] = Dot(oldK, kVec);
+          }
+          for (int32_t j = 0; j < s; ++j) {
+            auto oldK = specK_[j * K_DIM];
+            specQDot[s][j] = Dot(oldK, qVec);
+            specKDot[s][j] = Dot(oldK, kVec);
+          }
+          currentKQ[s] = Dot(kVec, qVec);
         }
-        for (int32_t j = 0; j < s; ++j) {
-          auto oldK = specK_[j * K_DIM];
-          specQDot[s][j] = Dot(oldK, qVec);
-          specKDot[s][j] = Dot(oldK, kVec);
-        }
-        currentKQ[s] = Dot(kVec, qVec);
       }
 
       if constexpr (VARIANT == 4) {
@@ -387,7 +413,7 @@ class ReplaySDVerify {
       }
       for (uint32_t tile = 0; tile < tiles_; ++tile) {
         const uint32_t vStart = tile * tileV_;
-        if constexpr (VARIANT == 4) {
+        if constexpr (VARIANT == 4 || VARIANT == 6) {
           ConsumeCheckpoint();
           if (tile + 2 < tiles_) {
             PrefetchCheckpoint(stateOffset + (tile + 2) * tileV_ * K_DIM);
@@ -530,6 +556,19 @@ class ReplaySDVerify {
     return ReadLocal(scalar_, 0);
   }
 
+  __aicore__ inline void DotRows(LocalTensor<float> keys, LocalTensor<float> vector,
+                                 float* output, uint32_t rows) {
+    Mul(product_, keys, vector, 64, rows, {1, 1, 1, 16, 16, 0});
+    Mul(product_[64], keys[64], vector[64], 64, rows, {1, 1, 1, 16, 16, 0});
+    PipeBarrier<PIPE_V>();
+    ReduceK128(dotRows_, rows);
+    PipeBarrier<PIPE_V>();
+    SyncVectorToScalar();
+    for (uint32_t i = 0; i < rows; ++i) {
+      output[i] = dotRows_.GetValue(i);
+    }
+  }
+
   __aicore__ inline void MatVec(LocalTensor<float> vector, LocalTensor<float> dest) {
     Mul(product_, state_, vector, 64, tileV_, {1, 1, 1, 16, 16, 0});
     Mul(product_[64], state_[64], vector[64], 64, tileV_, {1, 1, 1, 16, 16, 0});
@@ -609,9 +648,10 @@ class ReplaySDVerify {
   TBuf<QuePosition::VECCALC> checkpointBuffer_, productBuffer_, historyKBuffer_, historyDBuffer_;
   TBuf<QuePosition::VECCALC> specKBuffer_, specDBuffer_, vectorBuffer_, reduceBuffer_;
   TBuf<QuePosition::VECCALC> historyGateBuffer_, candidateGateBuffer_, candidateLogGateBuffer_;
-  TBuf<QuePosition::VECCALC> candidateBetaBuffer_, allQBuffer_;
+  TBuf<QuePosition::VECCALC> candidateBetaBuffer_, allQBuffer_, dotRowBuffer_;
   LocalTensor<float> state_, product_, historyK_, historyD_, specK_, specD_;
   LocalTensor<float> historyGate_, candidateGate_, candidateLogGate_, candidateBeta_, allQ_;
+  LocalTensor<float> dotRows_;
   LocalTensor<float> qLocal_, kLocal_, value_, prevQ_, prevK_, delta_, result_, term_, scalar_;
   GlobalTensor<bfloat16_t> q_, k_, v_, checkpoint_, out_;
   GlobalTensor<half> dCache_, kCache_;

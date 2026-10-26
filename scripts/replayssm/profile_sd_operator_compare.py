@@ -266,7 +266,7 @@ def main() -> None:
     parser.add_argument("--ring", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument("--tile-v", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
-    parser.add_argument("--variant", type=int, choices=(0, 1, 2, 3, 4), default=0)
+    parser.add_argument("--variant", type=int, choices=(0, 1, 2, 3, 4, 5, 6), default=0)
     parser.add_argument("--repetitions", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--max-abs-error", type=float, default=0.05)
