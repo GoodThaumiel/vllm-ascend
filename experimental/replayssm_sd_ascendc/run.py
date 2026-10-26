@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
-    parser.add_argument("--variant", type=int, choices=range(8), default=0)
+    parser.add_argument("--variant", type=int, choices=range(11), default=0)
     parser.add_argument("--layout", choices=("compact", "page_strided"), default="page_strided")
     parser.add_argument("--stage", choices=("smoke", "graph", "perf", "all"), default="smoke")
     parser.add_argument("--iterations", type=int, default=50)
@@ -93,8 +93,10 @@ def _graph_case(args, device, perf=False):
         (7, 2, 29, False),
         (7, 3, 30, False),
         (7, 4, 29, False),
+        (7, 4, 0, False),
         (12, 4, 31, False),
         (16, 4, 31, False),
+        (16, 4, 0, False),
         (7, 4, 30, True),
     ):
         cpu = _cpu_case(args, pos, length, base, seed=160 + pos, padding=padding)
@@ -204,8 +206,10 @@ def main() -> None:
                 (7, 2, 29, False),
                 (7, 3, 30, False),
                 (7, 4, 29, False),
+                (7, 4, 0, False),
                 (12, 4, 31, False),
                 (16, 4, 31, False),
+                (16, 4, 0, False),
                 (7, 4, 30, True),
             ):
                 errors = _run_once(args, device, pos, length, base, 101 + pos, padding=padding)
