@@ -33,7 +33,8 @@ ascendc_library(replayssm_sd_verify_kernel SHARED
     ../../csrc/kernels/replayssm_sd_verify_shared.cpp
     ../../csrc/kernels/replayssm_sd_verify_prefetch.cpp
     ../../csrc/kernels/replayssm_sd_verify_dotrows.cpp
-    ../../csrc/kernels/replayssm_sd_verify_dotrows_early.cpp)
+    ../../csrc/kernels/replayssm_sd_verify_dotrows_early.cpp
+    ../../csrc/kernels/replayssm_sd_verify_batch_history.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(

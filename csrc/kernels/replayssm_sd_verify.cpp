@@ -85,9 +85,25 @@ class ReplaySDVerify {
       pipe_.InitBuffer(allQBuffer_, MAX_TOKENS * K_DIM * sizeof(float));
       allQ_ = allQBuffer_.Get<float>();
     }
-    if constexpr (VARIANT == 5 || VARIANT == 6) {
+    if constexpr (VARIANT >= 5) {
       pipe_.InitBuffer(dotRowBuffer_, MAX_HISTORY * sizeof(float));
       dotRows_ = dotRowBuffer_.Get<float>();
+    }
+    if constexpr (VARIANT == 7) {
+      pipe_.InitBuffer(historyQDotBuffer_, MAX_TOKENS * MAX_HISTORY * sizeof(float));
+      pipe_.InitBuffer(historyKDotBuffer_, MAX_TOKENS * MAX_HISTORY * sizeof(float));
+      pipe_.InitBuffer(historySuffixBuffer_, MAX_HISTORY * sizeof(float));
+      pipe_.InitBuffer(scaledSuffixBuffer_, MAX_HISTORY * sizeof(float));
+      pipe_.InitBuffer(historyCoeffBuffer_, MAX_HISTORY * sizeof(float));
+      pipe_.InitBuffer(expandedCoeffBuffer_, MAX_HISTORY * tileV_ * sizeof(float));
+      pipe_.InitBuffer(weightedHistoryBuffer_, MAX_HISTORY * tileV_ * sizeof(float));
+      historyQDot_ = historyQDotBuffer_.Get<float>();
+      historyKDot_ = historyKDotBuffer_.Get<float>();
+      historySuffix_ = historySuffixBuffer_.Get<float>();
+      scaledSuffix_ = scaledSuffixBuffer_.Get<float>();
+      historyCoeff_ = historyCoeffBuffer_.Get<float>();
+      expandedCoeff_ = expandedCoeffBuffer_.Get<float>();
+      weightedHistory_ = weightedHistoryBuffer_.Get<float>();
     }
     if constexpr (VARIANT == 4 || VARIANT == 6) {
       pipe_.InitBuffer(statePrefetchQueue_, 2, tileV_ * K_DIM * sizeof(bfloat16_t));
@@ -349,6 +365,17 @@ class ReplaySDVerify {
         historyProduct *= historyAlpha[i];
         Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
       }
+      if constexpr (VARIANT == 7) {
+        // Suffix(i) = product of gates after history row i. It is shared by
+        // every candidate token and V tile; only specProduct changes per token.
+        float suffix = 1.0f;
+        for (int32_t i = pos - 1; i >= 0; --i) {
+          historySuffix_.SetValue(i, suffix);
+          suffix *= historyAlpha[i];
+        }
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+      }
       for (int32_t s = 0; s < length; ++s) {
         const uint32_t gateIndex = s * valueHeads_ + head;
         alpha[s] = candidateGate_.GetValue(gateIndex);
@@ -378,12 +405,17 @@ class ReplaySDVerify {
       for (int32_t s = 0; s < length; ++s) {
         auto qVec = allQ_[s * K_DIM];
         auto kVec = specK_[s * K_DIM];
-        if constexpr (VARIANT == 5 || VARIANT == 6) {
-          // Reduce all history rows together. One V->S sync replaces one sync
-          // per key, while each row keeps its original K=128 dot product.
+        if constexpr (VARIANT >= 5) {
+          // Reduce all history rows together. V7 keeps history results in UB;
+          // earlier variants convert each batched result to Scalar once.
           if (pos > 0) {
-            DotRows(historyK_, qVec, historyQDot[s], pos);
-            DotRows(historyK_, kVec, historyKDot[s], pos);
+            if constexpr (VARIANT == 7) {
+              DotRowsToUB(historyK_, qVec, historyQDot_[s * MAX_HISTORY], pos);
+              DotRowsToUB(historyK_, kVec, historyKDot_[s * MAX_HISTORY], pos);
+            } else {
+              DotRows(historyK_, qVec, historyQDot[s], pos);
+              DotRows(historyK_, kVec, historyKDot[s], pos);
+            }
           }
           DotRows(specK_, qVec, specQDot[s], s + 1);
           currentKQ[s] = specQDot[s][s];
@@ -426,6 +458,15 @@ class ReplaySDVerify {
           Load(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart,
                historyD_[i * tileV_], tileV_);
         }
+        if constexpr (VARIANT == 7) {
+          // Broadcast requires an aligned leading dimension. Keep the
+          // reduction at 16 rows, with absent history explicitly zeroed.
+          if (pos < static_cast<int32_t>(MAX_HISTORY)) {
+            Duplicate(historyD_[pos * tileV_], 0.0f,
+                      (MAX_HISTORY - pos) * tileV_);
+            PipeBarrier<PIPE_V>();
+          }
+        }
         float specProduct = 1.0f;
         for (int32_t s = 0; s < length; ++s) {
           const uint64_t vOffset = OutputOffset(row, s, head, vStart);
@@ -435,15 +476,24 @@ class ReplaySDVerify {
           Muls(prevQ_, prevQ_, historyProduct * specProduct, tileV_);
           Muls(prevK_, prevK_, historyProduct * specProduct, tileV_);
           PipeBarrier<PIPE_V>();
-          float suffix = specProduct;
-          for (int32_t remaining = pos; remaining > 0; --remaining) {
-            const int32_t i = remaining - 1;
-            auto oldD = historyD_[i * tileV_];
-            Accumulate(prevQ_, oldD, suffix * historyQDot[s][i]);
-            Accumulate(prevK_, oldD, suffix * historyKDot[s][i]);
-            suffix *= historyAlpha[i];
+          if constexpr (VARIANT == 7) {
+            if (pos > 0) {
+              Muls(scaledSuffix_, historySuffix_, specProduct, pos);
+              PipeBarrier<PIPE_V>();
+              AccumulateHistory(prevQ_, historyQDot_[s * MAX_HISTORY], pos);
+              AccumulateHistory(prevK_, historyKDot_[s * MAX_HISTORY], pos);
+            }
+          } else {
+            float suffix = specProduct;
+            for (int32_t remaining = pos; remaining > 0; --remaining) {
+              const int32_t i = remaining - 1;
+              auto oldD = historyD_[i * tileV_];
+              Accumulate(prevQ_, oldD, suffix * historyQDot[s][i]);
+              Accumulate(prevK_, oldD, suffix * historyKDot[s][i]);
+              suffix *= historyAlpha[i];
+            }
           }
-          suffix = 1.0f;
+          float suffix = 1.0f;
           for (int32_t remaining = s; remaining > 0; --remaining) {
             const int32_t j = remaining - 1;
             auto oldD = specD_[j * tileV_];
@@ -558,15 +608,45 @@ class ReplaySDVerify {
 
   __aicore__ inline void DotRows(LocalTensor<float> keys, LocalTensor<float> vector,
                                  float* output, uint32_t rows) {
-    Mul(product_, keys, vector, 64, rows, {1, 1, 1, 16, 16, 0});
-    Mul(product_[64], keys[64], vector[64], 64, rows, {1, 1, 1, 16, 16, 0});
-    PipeBarrier<PIPE_V>();
-    ReduceK128(dotRows_, rows);
-    PipeBarrier<PIPE_V>();
+    DotRowsToUB(keys, vector, dotRows_, rows);
     SyncVectorToScalar();
     for (uint32_t i = 0; i < rows; ++i) {
       output[i] = dotRows_.GetValue(i);
     }
+  }
+
+  __aicore__ inline void DotRowsToUB(LocalTensor<float> keys, LocalTensor<float> vector,
+                                     LocalTensor<float> dest, uint32_t rows) {
+    Mul(product_, keys, vector, 64, rows, {1, 1, 1, 16, 16, 0});
+    Mul(product_[64], keys[64], vector[64], 64, rows, {1, 1, 1, 16, 16, 0});
+    PipeBarrier<PIPE_V>();
+    ReduceK128(dest, rows);
+    PipeBarrier<PIPE_V>();
+  }
+
+  __aicore__ inline void AccumulateHistory(LocalTensor<float> dest, LocalTensor<float> dots,
+                                            uint32_t rows) {
+    Duplicate(historyCoeff_, 0.0f, MAX_HISTORY);
+    PipeBarrier<PIPE_V>();
+    Mul(historyCoeff_, dots, scaledSuffix_, rows);
+    PipeBarrier<PIPE_V>();
+    uint32_t dstShape[2] = {MAX_HISTORY, tileV_};
+    uint32_t srcShape[2] = {MAX_HISTORY, 1};
+    Broadcast<float, 2, 1>(expandedCoeff_, historyCoeff_, dstShape, srcShape);
+    PipeBarrier<PIPE_V>();
+    Mul(weightedHistory_, historyD_, expandedCoeff_, MAX_HISTORY * tileV_);
+    PipeBarrier<PIPE_V>();
+    // Pairwise reduction across 16 history rows. Unused rows were zeroed;
+    // each step updates disjoint destinations and halves the active rows.
+    for (uint32_t step = 1; step < MAX_HISTORY; step *= 2) {
+      const uint8_t repeats = MAX_HISTORY / (2 * step);
+      const uint8_t rowStride = 2 * step * tileV_ / FP32_BLOCK;
+      Add(weightedHistory_, weightedHistory_, weightedHistory_[step * tileV_],
+          tileV_, repeats, {1, 1, 1, rowStride, rowStride, rowStride});
+      PipeBarrier<PIPE_V>();
+    }
+    Add(dest, dest, weightedHistory_, tileV_);
+    PipeBarrier<PIPE_V>();
   }
 
   __aicore__ inline void MatVec(LocalTensor<float> vector, LocalTensor<float> dest) {
@@ -649,9 +729,13 @@ class ReplaySDVerify {
   TBuf<QuePosition::VECCALC> specKBuffer_, specDBuffer_, vectorBuffer_, reduceBuffer_;
   TBuf<QuePosition::VECCALC> historyGateBuffer_, candidateGateBuffer_, candidateLogGateBuffer_;
   TBuf<QuePosition::VECCALC> candidateBetaBuffer_, allQBuffer_, dotRowBuffer_;
+  TBuf<QuePosition::VECCALC> historyQDotBuffer_, historyKDotBuffer_, historySuffixBuffer_;
+  TBuf<QuePosition::VECCALC> scaledSuffixBuffer_, historyCoeffBuffer_, expandedCoeffBuffer_, weightedHistoryBuffer_;
   LocalTensor<float> state_, product_, historyK_, historyD_, specK_, specD_;
   LocalTensor<float> historyGate_, candidateGate_, candidateLogGate_, candidateBeta_, allQ_;
   LocalTensor<float> dotRows_;
+  LocalTensor<float> historyQDot_, historyKDot_, historySuffix_, scaledSuffix_, historyCoeff_;
+  LocalTensor<float> expandedCoeff_, weightedHistory_;
   LocalTensor<float> qLocal_, kLocal_, value_, prevQ_, prevK_, delta_, result_, term_, scalar_;
   GlobalTensor<bfloat16_t> q_, k_, v_, checkpoint_, out_;
   GlobalTensor<half> dCache_, kCache_;

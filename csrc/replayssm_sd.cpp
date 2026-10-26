@@ -13,6 +13,7 @@
 #include "aclrtlaunch_replayssm_sd_verify_prefetch.h"
 #include "aclrtlaunch_replayssm_sd_verify_dotrows.h"
 #include "aclrtlaunch_replayssm_sd_verify_dotrows_early.h"
+#include "aclrtlaunch_replayssm_sd_verify_batch_history.h"
 
 #include <algorithm>
 #include <cmath>
@@ -93,7 +94,7 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 6, "variant must be in [0,6]");
+  TORCH_CHECK(variant >= 0 && variant <= 7, "variant must be in [0,7]");
   TORCH_CHECK(variant < 2 || value_heads <= 12,
               "bulk/shared variants require at most 12 value heads per rank");
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "scale must be finite and positive");
@@ -130,8 +131,11 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
     case 5:
       result = aclrtlaunch_replayssm_sd_verify_dotrows(REPLAY_SD_LAUNCH_ARGS);
       break;
-    default:
+    case 6:
       result = aclrtlaunch_replayssm_sd_verify_dotrows_early(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    default:
+      result = aclrtlaunch_replayssm_sd_verify_batch_history(REPLAY_SD_LAUNCH_ARGS);
       break;
   }
 #undef REPLAY_SD_LAUNCH_ARGS
