@@ -39,7 +39,8 @@ ascendc_library(replayssm_sd_verify_kernel SHARED
     ../../csrc/kernels/replayssm_sd_verify_bulk_history.cpp
     ../../csrc/kernels/replayssm_sd_verify_muladd.cpp
     ../../csrc/kernels/replayssm_sd_verify_bulk_qkv.cpp
-    ../../csrc/kernels/replayssm_sd_verify_tile128.cpp)
+    ../../csrc/kernels/replayssm_sd_verify_tile128.cpp
+    ../../csrc/kernels/replayssm_sd_verify_tile128_bulk_qkv.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(

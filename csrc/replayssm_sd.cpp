@@ -19,6 +19,7 @@
 #include "aclrtlaunch_replayssm_sd_verify_muladd.h"
 #include "aclrtlaunch_replayssm_sd_verify_bulk_qkv.h"
 #include "aclrtlaunch_replayssm_sd_verify_tile128.h"
+#include "aclrtlaunch_replayssm_sd_verify_tile128_bulk_qkv.h"
 
 #include <algorithm>
 #include <cmath>
@@ -94,14 +95,14 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(g.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat &&
                   g_cache.scalar_type() == at::kFloat,
               "g/beta/g_cache must be FP32");
-  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && variant == 12),
-              "tile_v must be 16/32/64, or 128 with variant 12");
+  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && (variant == 12 || variant == 13)),
+              "tile_v must be 16/32/64, or 128 with variant 12/13");
   const int64_t tasks = batch * value_heads * (K_DIM / tile_v);
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 12, "variant must be in [0,12]");
-  TORCH_CHECK(variant != 12 || tile_v == 128, "variant 12 requires tile_v=128");
+  TORCH_CHECK(variant >= 0 && variant <= 13, "variant must be in [0,13]");
+  TORCH_CHECK((variant != 12 && variant != 13) || tile_v == 128, "variant 12/13 requires tile_v=128");
   TORCH_CHECK(variant < 2 || value_heads <= 12,
               "bulk/shared variants require at most 12 value heads per rank");
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "scale must be finite and positive");
@@ -156,8 +157,11 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
     case 11:
       result = aclrtlaunch_replayssm_sd_verify_bulk_qkv(REPLAY_SD_LAUNCH_ARGS);
       break;
-    default:
+    case 12:
       result = aclrtlaunch_replayssm_sd_verify_tile128(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    default:
+      result = aclrtlaunch_replayssm_sd_verify_tile128_bulk_qkv(REPLAY_SD_LAUNCH_ARGS);
       break;
   }
 #undef REPLAY_SD_LAUNCH_ARGS
