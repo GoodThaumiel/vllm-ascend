@@ -653,8 +653,9 @@ class ReplaySDVerify {
     auto input = in_.AllocTensor<half>();
     // GM rows have V_DIM elements, while the UB tensor is packed by tileV_.
     // Both tileV_ and the physical row pitch are 32-byte aligned.
-    DataCopyExtParams cp{static_cast<uint16_t>(rows), tileV_ * sizeof(half),
-                         (V_DIM - tileV_) * sizeof(half), 0, 0};
+    DataCopyExtParams cp{static_cast<uint16_t>(rows),
+                         static_cast<uint32_t>(tileV_ * sizeof(half)),
+                         static_cast<uint32_t>((V_DIM - tileV_) * sizeof(half)), 0, 0};
     DataCopyPadExtParams<half> pad{false, 0, 0, 0};
     DataCopyPad(input, dCache_[offset], cp, pad);
     in_.EnQue(input);

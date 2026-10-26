@@ -13,6 +13,8 @@ v8b 显式申请 UB 在 tile64 为 114,400 B，v8c/v8d 与 v7 相同，为 112,9
 
 1. 同一容器重编主扩展。若某一候选编译失败，回传首条 `bisheng`/CCE 错误、对应 kernel 名、完整构建日志及设备健康状态；不要用旧扩展继续测试。
 
+首次构建在 v8c 的 `DataCopyExtParams` 字节数列表初始化处因 `size_t` 到 `uint32_t` 窄化而失败；后续修复已为 `blockLen` 和 `srcStride` 加显式转换。请拉取修复提交后重新编译，再从本清单第 2 步开始。`sgmv_shrink.cpp` 的 C++20 扩展警告与此错误无关。
+
 ```bash
 python3 -m pip install --no-build-isolation --no-deps -v -e .
 ```
