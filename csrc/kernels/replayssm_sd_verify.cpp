@@ -86,6 +86,10 @@ class ReplaySDVerify {
       pipe_.InitBuffer(allQBuffer_, MAX_TOKENS * K_DIM * sizeof(float));
       allQ_ = allQBuffer_.Get<float>();
     }
+    if constexpr (VARIANT == 11) {
+      pipe_.InitBuffer(allVBuffer_, MAX_TOKENS * tileV_ * sizeof(float));
+      allV_ = allVBuffer_.Get<float>();
+    }
     if constexpr (VARIANT >= 5) {
       pipe_.InitBuffer(dotRowBuffer_, MAX_HISTORY * sizeof(float));
       dotRows_ = dotRowBuffer_.Get<float>();
@@ -372,11 +376,11 @@ class ReplaySDVerify {
         const uint32_t phys = Physical(base, i);
         historyAlpha[i] = historyGate_.GetValue(phys);
         historyProduct *= historyAlpha[i];
-        if constexpr (VARIANT != 9) {
+        if constexpr (VARIANT != 9 && VARIANT != 11) {
           Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
         }
       }
-      if constexpr (VARIANT == 9) {
+      if constexpr (VARIANT == 9 || VARIANT == 11) {
         // Logical history crosses the physical ring at most once. Two large
         // copies replace up to 16 per-record K copies and casts.
         const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
@@ -406,12 +410,27 @@ class ReplaySDVerify {
         alpha[s] = candidateGate_.GetValue(gateIndex);
         beta[s] = candidateBeta_.GetValue(gateIndex);
         logGate[s] = candidateLogGate_.GetValue(gateIndex);
-        const uint64_t qkOffset = (static_cast<uint64_t>(row) * MAX_TOKENS + s) * heads_ * K_DIM +
+        if constexpr (VARIANT != 11) {
+          const uint64_t qkOffset = (static_cast<uint64_t>(row) * MAX_TOKENS + s) * heads_ * K_DIM +
+                                    static_cast<uint64_t>(keyHead) * K_DIM;
+          Load(q_, qkOffset, allQ_[s * K_DIM], K_DIM);
+          Muls(allQ_[s * K_DIM], allQ_[s * K_DIM], scale_, K_DIM);
+          PipeBarrier<PIPE_V>();
+          Load(k_, qkOffset, specK_[s * K_DIM], K_DIM);
+        }
+      }
+      if constexpr (VARIANT == 11) {
+        // Q/K are [B, 4, H, 128]. Copy the active tokens as packed UB rows.
+        const uint64_t qkOffset = static_cast<uint64_t>(row) * MAX_TOKENS * heads_ * K_DIM +
                                   static_cast<uint64_t>(keyHead) * K_DIM;
-        Load(q_, qkOffset, allQ_[s * K_DIM], K_DIM);
-        Muls(allQ_[s * K_DIM], allQ_[s * K_DIM], scale_, K_DIM);
-        PipeBarrier<PIPE_V>();
-        Load(k_, qkOffset, specK_[s * K_DIM], K_DIM);
+        LoadCandidateRows(q_, qkOffset, allQ_, static_cast<uint32_t>(length), K_DIM,
+                          heads_ * K_DIM);
+        LoadCandidateRows(k_, qkOffset, specK_, static_cast<uint32_t>(length), K_DIM,
+                          heads_ * K_DIM);
+        for (int32_t s = 0; s < length; ++s) {
+          Muls(allQ_[s * K_DIM], allQ_[s * K_DIM], scale_, K_DIM);
+          PipeBarrier<PIPE_V>();
+        }
       }
       if constexpr (VARIANT == 8) {
         // Candidate gate suffixes are invariant across V tiles. Keep the
@@ -500,7 +519,7 @@ class ReplaySDVerify {
         } else {
           Load(checkpoint_, stateOffset + vStart * K_DIM, state_, tileV_ * K_DIM);
         }
-        if constexpr (VARIANT == 9) {
+        if constexpr (VARIANT == 9 || VARIANT == 11) {
           const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
           const uint32_t first = static_cast<uint32_t>(pos) < available ? static_cast<uint32_t>(pos) : available;
           if (first > 0) {
@@ -533,10 +552,17 @@ class ReplaySDVerify {
           Duplicate(specD_, 0.0f, SPEC_ROWS * tileV_);
           PipeBarrier<PIPE_V>();
         }
+        if constexpr (VARIANT == 11) {
+          // V is [B, 4, HV, 128]; each V tile has its own row offset.
+          LoadCandidateRows(v_, OutputOffset(row, 0, head, vStart), allV_,
+                            static_cast<uint32_t>(length), tileV_, valueHeads_ * V_DIM);
+        }
         float specProduct = 1.0f;
         for (int32_t s = 0; s < length; ++s) {
           const uint64_t vOffset = OutputOffset(row, s, head, vStart);
-          Load(v_, vOffset, value_, tileV_);
+          if constexpr (VARIANT != 11) {
+            Load(v_, vOffset, value_, tileV_);
+          }
           MatVec(allQ_[s * K_DIM], prevQ_);
           MatVec(specK_[s * K_DIM], prevK_);
           Muls(prevQ_, prevQ_, historyProduct * specProduct, tileV_);
@@ -576,7 +602,11 @@ class ReplaySDVerify {
           }
           Muls(prevK_, prevK_, alpha[s], tileV_);
           PipeBarrier<PIPE_V>();
-          Sub(delta_, value_, prevK_, tileV_);
+          if constexpr (VARIANT == 11) {
+            Sub(delta_, allV_[s * tileV_], prevK_, tileV_);
+          } else {
+            Sub(delta_, value_, prevK_, tileV_);
+          }
           PipeBarrier<PIPE_V>();
           Muls(delta_, delta_, beta[s], tileV_);
           PipeBarrier<PIPE_V>();
@@ -661,6 +691,23 @@ class ReplaySDVerify {
     in_.EnQue(input);
     input = in_.DeQue<half>();
     Cast(dest, input, RoundMode::CAST_NONE, rows * tileV_);
+    PipeBarrier<PIPE_V>();
+    in_.FreeTensor(input);
+  }
+
+  __aicore__ inline void LoadCandidateRows(GlobalTensor<bfloat16_t>& source, uint64_t offset,
+                                            LocalTensor<float> dest, uint32_t rows,
+                                            uint32_t rowWidth, uint32_t rowPitch) {
+    auto input = in_.AllocTensor<bfloat16_t>();
+    // DataCopyExtParams blockLen/srcStride are bytes; the UB rows are packed.
+    DataCopyExtParams cp{static_cast<uint16_t>(rows),
+                         static_cast<uint32_t>(rowWidth * sizeof(bfloat16_t)),
+                         static_cast<uint32_t>((rowPitch - rowWidth) * sizeof(bfloat16_t)), 0, 0};
+    DataCopyPadExtParams<bfloat16_t> pad{false, 0, 0, 0};
+    DataCopyPad(input, source[offset], cp, pad);
+    in_.EnQue(input);
+    input = in_.DeQue<bfloat16_t>();
+    Cast(dest, input, RoundMode::CAST_NONE, rows * rowWidth);
     PipeBarrier<PIPE_V>();
     in_.FreeTensor(input);
   }
@@ -849,12 +896,12 @@ class ReplaySDVerify {
   TBuf<QuePosition::VECCALC> checkpointBuffer_, productBuffer_, historyKBuffer_, historyDBuffer_;
   TBuf<QuePosition::VECCALC> specKBuffer_, specDBuffer_, vectorBuffer_, reduceBuffer_;
   TBuf<QuePosition::VECCALC> historyGateBuffer_, candidateGateBuffer_, candidateLogGateBuffer_;
-  TBuf<QuePosition::VECCALC> candidateBetaBuffer_, allQBuffer_, dotRowBuffer_;
+  TBuf<QuePosition::VECCALC> candidateBetaBuffer_, allQBuffer_, allVBuffer_, dotRowBuffer_;
   TBuf<QuePosition::VECCALC> historyQDotBuffer_, historyKDotBuffer_, historySuffixBuffer_;
   TBuf<QuePosition::VECCALC> scaledSuffixBuffer_, historyCoeffBuffer_, expandedCoeffBuffer_, weightedHistoryBuffer_;
   TBuf<QuePosition::VECCALC> specQDotBuffer_, specKDotBuffer_, specSuffixBuffer_;
   LocalTensor<float> state_, product_, historyK_, historyD_, specK_, specD_;
-  LocalTensor<float> historyGate_, candidateGate_, candidateLogGate_, candidateBeta_, allQ_;
+  LocalTensor<float> historyGate_, candidateGate_, candidateLogGate_, candidateBeta_, allQ_, allV_;
   LocalTensor<float> dotRows_;
   LocalTensor<float> historyQDot_, historyKDot_, historySuffix_, scaledSuffix_, historyCoeff_;
   LocalTensor<float> expandedCoeff_, weightedHistory_;

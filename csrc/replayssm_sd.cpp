@@ -17,6 +17,7 @@
 #include "aclrtlaunch_replayssm_sd_verify_spec_ub.h"
 #include "aclrtlaunch_replayssm_sd_verify_bulk_history.h"
 #include "aclrtlaunch_replayssm_sd_verify_muladd.h"
+#include "aclrtlaunch_replayssm_sd_verify_bulk_qkv.h"
 
 #include <algorithm>
 #include <cmath>
@@ -97,7 +98,7 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 10, "variant must be in [0,10]");
+  TORCH_CHECK(variant >= 0 && variant <= 11, "variant must be in [0,11]");
   TORCH_CHECK(variant < 2 || value_heads <= 12,
               "bulk/shared variants require at most 12 value heads per rank");
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "scale must be finite and positive");
@@ -146,8 +147,11 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
     case 9:
       result = aclrtlaunch_replayssm_sd_verify_bulk_history(REPLAY_SD_LAUNCH_ARGS);
       break;
-    default:
+    case 10:
       result = aclrtlaunch_replayssm_sd_verify_muladd(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    default:
+      result = aclrtlaunch_replayssm_sd_verify_bulk_qkv(REPLAY_SD_LAUNCH_ARGS);
       break;
   }
 #undef REPLAY_SD_LAUNCH_ARGS
