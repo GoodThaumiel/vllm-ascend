@@ -59,7 +59,8 @@ class ReplaySDVerify {
     tiles_ = V_DIM / tileV;
     scale_ = scale;
 
-    pipe_.InitBuffer(in_, 1, tileV * K_DIM * sizeof(bfloat16_t));
+    // V12 stages the 128-row checkpoint in four 8 KiB chunks.
+    pipe_.InitBuffer(in_, 1, VARIANT == 12 ? 8192 : tileV * K_DIM * sizeof(bfloat16_t));
     // A key-cache store casts all 128 elements to FP16 in this queue.
     pipe_.InitBuffer(outQueue_, 1, K_DIM * sizeof(float));
     pipe_.InitBuffer(checkpointBuffer_, tileV * K_DIM * sizeof(float));
@@ -100,15 +101,19 @@ class ReplaySDVerify {
       pipe_.InitBuffer(historySuffixBuffer_, MAX_HISTORY * sizeof(float));
       pipe_.InitBuffer(scaledSuffixBuffer_, MAX_HISTORY * sizeof(float));
       pipe_.InitBuffer(historyCoeffBuffer_, MAX_HISTORY * sizeof(float));
-      pipe_.InitBuffer(expandedCoeffBuffer_, MAX_HISTORY * tileV_ * sizeof(float));
-      pipe_.InitBuffer(weightedHistoryBuffer_, MAX_HISTORY * tileV_ * sizeof(float));
+      if constexpr (VARIANT != 12) {
+        pipe_.InitBuffer(expandedCoeffBuffer_, MAX_HISTORY * tileV_ * sizeof(float));
+        pipe_.InitBuffer(weightedHistoryBuffer_, MAX_HISTORY * tileV_ * sizeof(float));
+      }
       historyQDot_ = historyQDotBuffer_.Get<float>();
       historyKDot_ = historyKDotBuffer_.Get<float>();
       historySuffix_ = historySuffixBuffer_.Get<float>();
       scaledSuffix_ = scaledSuffixBuffer_.Get<float>();
       historyCoeff_ = historyCoeffBuffer_.Get<float>();
-      expandedCoeff_ = expandedCoeffBuffer_.Get<float>();
-      weightedHistory_ = weightedHistoryBuffer_.Get<float>();
+      if constexpr (VARIANT != 12) {
+        expandedCoeff_ = expandedCoeffBuffer_.Get<float>();
+        weightedHistory_ = weightedHistoryBuffer_.Get<float>();
+      }
     }
     if constexpr (VARIANT == 8) {
       pipe_.InitBuffer(specQDotBuffer_, MAX_TOKENS * SPEC_ROWS * sizeof(float));
@@ -124,6 +129,12 @@ class ReplaySDVerify {
 
     state_ = checkpointBuffer_.Get<float>();
     product_ = productBuffer_.Get<float>();
+    if constexpr (VARIANT == 12) {
+      // Dot/MatVec complete before history correction. Reuse two disjoint
+      // regions of their product workspace, then overwrite them next token.
+      expandedCoeff_ = product_;
+      weightedHistory_ = product_[MAX_HISTORY * tileV_];
+    }
     historyK_ = historyKBuffer_.Get<float>();
     historyD_ = historyDBuffer_.Get<float>();
     specK_ = specKBuffer_.Get<float>();
@@ -376,11 +387,11 @@ class ReplaySDVerify {
         const uint32_t phys = Physical(base, i);
         historyAlpha[i] = historyGate_.GetValue(phys);
         historyProduct *= historyAlpha[i];
-        if constexpr (VARIANT != 9 && VARIANT != 11) {
+        if constexpr (VARIANT != 9 && VARIANT != 11 && VARIANT != 12) {
           Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
         }
       }
-      if constexpr (VARIANT == 9 || VARIANT == 11) {
+      if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12) {
         // Logical history crosses the physical ring at most once. Two large
         // copies replace up to 16 per-record K copies and casts.
         const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
@@ -516,10 +527,16 @@ class ReplaySDVerify {
           if (tile + 2 < tiles_) {
             PrefetchCheckpoint(stateOffset + (tile + 2) * tileV_ * K_DIM);
           }
+        } else if constexpr (VARIANT == 12) {
+          // in_ holds 4096 BF16 elements; the full checkpoint needs four
+          // copies at tileV=128.
+          for (uint32_t k = 0; k < tileV_ * K_DIM; k += 4096) {
+            Load(checkpoint_, stateOffset + vStart * K_DIM + k, state_[k], 4096);
+          }
         } else {
           Load(checkpoint_, stateOffset + vStart * K_DIM, state_, tileV_ * K_DIM);
         }
-        if constexpr (VARIANT == 9 || VARIANT == 11) {
+        if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12) {
           const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
           const uint32_t first = static_cast<uint32_t>(pos) < available ? static_cast<uint32_t>(pos) : available;
           if (first > 0) {
@@ -776,9 +793,20 @@ class ReplaySDVerify {
     // each step updates disjoint destinations and halves the active rows.
     for (uint32_t step = 1; step < MAX_HISTORY; step *= 2) {
       const uint8_t repeats = MAX_HISTORY / (2 * step);
-      const uint8_t rowStride = 2 * step * tileV_ / FP32_BLOCK;
-      Add(weightedHistory_, weightedHistory_, weightedHistory_[step * tileV_],
-          tileV_, repeats, {1, 1, 1, rowStride, rowStride, rowStride});
+      if constexpr (VARIANT == 12) {
+        if (step == 8) {
+          // A single repeat needs no row stride; 2*8*128/8 overflows uint8_t.
+          Add(weightedHistory_, weightedHistory_, weightedHistory_[step * tileV_], tileV_);
+        } else {
+          const uint8_t rowStride = 2 * step * tileV_ / FP32_BLOCK;
+          Add(weightedHistory_, weightedHistory_, weightedHistory_[step * tileV_],
+              tileV_, repeats, {1, 1, 1, rowStride, rowStride, rowStride});
+        }
+      } else {
+        const uint8_t rowStride = 2 * step * tileV_ / FP32_BLOCK;
+        Add(weightedHistory_, weightedHistory_, weightedHistory_[step * tileV_],
+            tileV_, repeats, {1, 1, 1, rowStride, rowStride, rowStride});
+      }
       PipeBarrier<PIPE_V>();
     }
     Add(dest, dest, weightedHistory_, tileV_);

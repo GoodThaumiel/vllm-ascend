@@ -65,6 +65,13 @@ class SDReferenceTests(unittest.TestCase):
                 self.assertEqual(case["status"].numel(), 2 * (48 // tp) * 2)
                 torch.testing.assert_close(output_only_reference(case), recurrent_golden(case)["out"], rtol=0, atol=0)
 
+    def test_tile128_uses_one_value_tile_per_head(self):
+        for tp in (4, 8):
+            with self.subTest(tp=tp):
+                case = make_case(tp=tp, batch=2, position=12, length=4, tile_v=128)
+                self.assertEqual(case["status"].numel(), 2 * (48 // tp))
+                torch.testing.assert_close(output_only_reference(case), recurrent_golden(case)["out"], rtol=0, atol=0)
+
     def test_padding_and_mixed_window_lengths(self):
         case = make_case(batch=3, position=7, length=4, base=30, padding=True)
         case["lengths"][0] = 1

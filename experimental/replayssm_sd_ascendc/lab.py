@@ -33,7 +33,7 @@ def make_case(
         raise ValueError("Invalid history position or verify length")
     if position + length > min(MAX_WINDOW, ring_len) or not 0 <= base < ring_len:
         raise ValueError("This pilot requires the verify window to fit the physical ring")
-    if tile_v not in (16, 32, 64):
+    if tile_v not in (16, 32, 64, 128):
         raise ValueError("Invalid tile_v")
     generator = torch.Generator().manual_seed(seed)
     heads, value_heads = 16 // tp, 48 // tp
