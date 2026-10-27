@@ -8,6 +8,12 @@ Each AIV task owns (row, value head, V tile) and reads a BF16 tile_v×128 checkp
 
 The implementation follows the existing AR AscendC scalar staging, vector outer-add and page-stride conventions. It is a correctness/performance pilot; separate compaction adds a launch and needs profiling before serving integration.
 
+The L3.4 ablation adds optional `--variant 1` (one task per row/value head) and
+`--variant 2` (original flush tiling with coalesced non-flush status writes).
+The default `--variant 0` retains the original mapping. Follow the
+[L3.4 validation checklist](../../docs/replayssm/checklists/LEVEL3_SD_COMPACT_ABLATION.md)
+before selecting an optimized version for the framework path.
+
 ## On-machine checklist
 
 Build in the CANN 9.2.0 container using the same Python and torch_npu:

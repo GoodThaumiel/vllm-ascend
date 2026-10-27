@@ -15,7 +15,8 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
                           const at::Tensor& k_cache, const at::Tensor& g_cache,
                           const at::Tensor& slots, const at::Tensor& positions,
                           const at::Tensor& bases, const at::Tensor& flush,
-                          const at::Tensor& status, int64_t tile_v, int64_t cores) {
+                          const at::Tensor& status, int64_t tile_v, int64_t cores,
+                          int64_t variant) {
   TORCH_CHECK(checkpoint.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& t : {d_cache, k_cache, g_cache, slots, positions, bases, flush, status}) {
     TORCH_CHECK(t.device() == checkpoint.device(), "All tensors must be on one NPU");
@@ -70,18 +71,26 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
                   status.is_contiguous(),
               "status must be contiguous int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
+  TORCH_CHECK(variant >= 0 && variant <= 2, "variant must be 0 (original), 1 (grouped), or 2 (hybrid)");
+  TORCH_CHECK(variant == 0 || (value_heads * (128 / tile_v)) % 8 == 0,
+              "optimized compact requires a 32-byte aligned status row");
+  TORCH_CHECK(variant == 0 || value_heads * (128 / tile_v) * sizeof(int32_t) <=
+                                   tile_v * 128 * sizeof(at::BFloat16),
+              "optimized compact status row exceeds the output UB buffer");
 
   const c10_npu::OptionalNPUGuard guard(checkpoint.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
+  const int64_t active_tasks = variant == 1 ? batch * value_heads : tasks;
   const auto result = aclrtlaunch_replayssm_sd_compact(
-      static_cast<uint32_t>(std::min(cores, tasks)), stream, checkpoint.data_ptr(),
+      static_cast<uint32_t>(std::min(cores, active_tasks)), stream, checkpoint.data_ptr(),
       d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(), slots.data_ptr(),
       positions.data_ptr(), bases.data_ptr(), flush.data_ptr(), status.data_ptr(),
       static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots),
       static_cast<uint32_t>(heads), static_cast<uint32_t>(value_heads),
       static_cast<uint32_t>(ring_len), static_cast<uint64_t>(checkpoint.stride(0)),
       static_cast<uint64_t>(d_cache.stride(0)), static_cast<uint64_t>(k_cache.stride(0)),
-      static_cast<uint64_t>(g_cache.stride(0)), static_cast<uint32_t>(tile_v));
+      static_cast<uint64_t>(g_cache.stride(0)), static_cast<uint32_t>(tile_v),
+      static_cast<uint32_t>(variant));
   TORCH_CHECK(result == ACL_SUCCESS, "Replay SD compact launch failed: ", result);
 }
 }  // namespace vllm_ascend

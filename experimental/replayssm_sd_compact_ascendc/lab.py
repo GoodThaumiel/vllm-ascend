@@ -79,7 +79,9 @@ def compact_golden(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return result
 
 
-def invoke(case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, backend: str = "lab") -> None:
+def invoke(
+    case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, variant: int = 0, backend: str = "lab"
+) -> None:
     if backend == "lab":
         op = torch.ops.replayssm_sd_compact_lab.compact_
     elif backend == "framework":
@@ -100,6 +102,7 @@ def invoke(case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, 
         case["status"],
         tile_v,
         cores,
+        variant,
     )
 
 

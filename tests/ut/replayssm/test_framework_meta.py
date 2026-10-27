@@ -158,12 +158,15 @@ class FrameworkMetaTests(unittest.TestCase):
             t.empty((96,), dtype=integer, device="meta"),
             32,
             40,
+            1,
         ]
         schema = t.ops._C_ascend.replayssm_sd_compact_.default._schema
         self.assertEqual(
             [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write],
             [0, 8],
         )
+        self.assertIsNone(self.sd_compact_wrapper(*args))
+        args[-1] = 2
         self.assertIsNone(self.sd_compact_wrapper(*args))
 
     def test_sd_cursor_schema_and_meta(self):

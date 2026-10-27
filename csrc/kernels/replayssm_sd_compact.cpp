@@ -58,62 +58,144 @@ class ReplaySDCompact {
     scalar_ = vec[K_DIM + tileV_];
   }
 
-  __aicore__ inline void Process() {
-    for (uint32_t task = GetBlockIdx(); task < batch_ * valueHeads_ * tiles_; task += GetBlockNum()) {
-      const uint32_t row = task / (valueHeads_ * tiles_);
-      const uint32_t head = (task / tiles_) % valueHeads_;
-      const uint32_t vStart = (task % tiles_) * tileV_;
-      const uint32_t keyHead = head / (valueHeads_ / heads_);
-      const int32_t slot = ReadInt(slots_, row);
-      const int32_t pos = ReadInt(positions_, row);
-      const int32_t base = ReadInt(bases_, row);
-      const int32_t flush = ReadInt(flush_, row);
-      int32_t error = 0;
-      if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
-        error = 1;
-      } else if (slot == 0) {
-        if (pos != 0 || base != 0 || flush != 0) {
-          error = 4;
-        }
-      } else if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY)) {
-        error = 2;
-      } else if (base < 0 || base >= static_cast<int32_t>(ringLen_)) {
-        error = 3;
-      } else if (flush != 0 && flush != 1) {
-        error = 5;
-      }
-      if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
-        WriteStatus(task, error);
-        continue;
-      }
-
-      const uint64_t stateOffset = static_cast<uint64_t>(slot) * checkpointStride_ +
-                                   static_cast<uint64_t>(head) * V_DIM * K_DIM + vStart * K_DIM;
-      const uint64_t dOffset = static_cast<uint64_t>(slot) * dStride_ +
-                               static_cast<uint64_t>(head) * ringLen_ * V_DIM;
-      const uint64_t kOffset = static_cast<uint64_t>(slot) * kStride_ +
-                               static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
-      const uint64_t gOffset = static_cast<uint64_t>(slot) * gStride_ +
-                               static_cast<uint64_t>(head) * ringLen_;
-      Load(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
-      for (int32_t i = 0; i < pos; ++i) {
-        const uint32_t phys = (static_cast<uint32_t>(base) + static_cast<uint32_t>(i)) & (ringLen_ - 1);
-        Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, key_, K_DIM);
-        LoadD(dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart);
-        Load(gCache_, gOffset + phys, scalar_, 1);
-        Exp(scalar_, scalar_, 1);
-        PipeBarrier<PIPE_V>();
-        const float alpha = ReadLocal(scalar_, 0);
-        Muls(state_, state_, alpha, tileV_ * K_DIM);
-        PipeBarrier<PIPE_V>();
-        OuterAdd();
-      }
-      Store(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
-      WriteStatus(task, 0);
+  __aicore__ inline void Process(uint32_t variant) {
+    if (variant == 1) {
+      ProcessGrouped();
+    } else if (variant == 2) {
+      ProcessHybrid();
+    } else {
+      ProcessOriginal();
     }
   }
 
  private:
+  __aicore__ inline int32_t Validate(int32_t slot, int32_t pos, int32_t base, int32_t flush) {
+    if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
+      return 1;
+    }
+    if (slot == 0) {
+      return (pos != 0 || base != 0 || flush != 0) ? 4 : 0;
+    }
+    if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY)) {
+      return 2;
+    }
+    if (base < 0 || base >= static_cast<int32_t>(ringLen_)) {
+      return 3;
+    }
+    return (flush != 0 && flush != 1) ? 5 : 0;
+  }
+
+  __aicore__ inline void ProcessOriginal() {
+    for (uint32_t task = GetBlockIdx(); task < batch_ * valueHeads_ * tiles_; task += GetBlockNum()) {
+      const uint32_t row = task / (valueHeads_ * tiles_);
+      const int32_t slot = ReadInt(slots_, row);
+      const int32_t pos = ReadInt(positions_, row);
+      const int32_t base = ReadInt(bases_, row);
+      const int32_t flush = ReadInt(flush_, row);
+      const int32_t error = Validate(slot, pos, base, flush);
+      if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
+        WriteStatus(task, error);
+        continue;
+      }
+      Fold(task, slot, pos, base);
+    }
+  }
+
+  // At high batch, one task owns all V tiles for a (row, value head).
+  // The no-flush/status-only path writes the entire row from head zero.
+  // This keeps the graph launch fixed while reducing repeated metadata and
+  // four-byte status transfers; no host readback of the device flush flag.
+  __aicore__ inline void ProcessGrouped() {
+    const uint32_t rowTasks = valueHeads_ * tiles_;
+    for (uint32_t group = GetBlockIdx(); group < batch_ * valueHeads_; group += GetBlockNum()) {
+      const uint32_t row = group / valueHeads_;
+      const uint32_t head = group % valueHeads_;
+      const int32_t flush = ReadInt(flush_, row);
+      if (flush == 0 && head != 0) {
+        continue;
+      }
+      const int32_t slot = ReadInt(slots_, row);
+      const int32_t pos = ReadInt(positions_, row);
+      const int32_t base = ReadInt(bases_, row);
+      const int32_t error = Validate(slot, pos, base, flush);
+      if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
+        if (head == 0) {
+          WriteStatusSpan(row * rowTasks, rowTasks, error);
+        }
+        continue;
+      }
+      for (uint32_t tile = 0; tile < tiles_; ++tile) {
+        Fold(group * tiles_ + tile, slot, pos, base);
+      }
+    }
+  }
+
+  // Preserve the original tile-level flush parallelism while coalescing the
+  // no-flush status update into one aligned row write.
+  __aicore__ inline void ProcessHybrid() {
+    const uint32_t rowTasks = valueHeads_ * tiles_;
+    for (uint32_t task = GetBlockIdx(); task < batch_ * rowTasks; task += GetBlockNum()) {
+      const uint32_t row = task / rowTasks;
+      const int32_t flush = ReadInt(flush_, row);
+      if (flush == 0 && task % rowTasks != 0) {
+        continue;
+      }
+      const int32_t slot = ReadInt(slots_, row);
+      const int32_t pos = ReadInt(positions_, row);
+      const int32_t base = ReadInt(bases_, row);
+      const int32_t error = Validate(slot, pos, base, flush);
+      if (flush == 0) {
+        WriteStatusSpan(row * rowTasks, rowTasks, error);
+      } else if (error != 0 || slot == 0 || pos == 0) {
+        WriteStatus(task, error);
+      } else {
+        Fold(task, slot, pos, base);
+      }
+    }
+  }
+
+  __aicore__ inline void Fold(uint32_t task, int32_t slot, int32_t pos, int32_t base) {
+    const uint32_t head = (task / tiles_) % valueHeads_;
+    const uint32_t vStart = (task % tiles_) * tileV_;
+    const uint32_t keyHead = head / (valueHeads_ / heads_);
+    const uint64_t stateOffset =
+        static_cast<uint64_t>(slot) * checkpointStride_ + static_cast<uint64_t>(head) * V_DIM * K_DIM + vStart * K_DIM;
+    const uint64_t dOffset = static_cast<uint64_t>(slot) * dStride_ + static_cast<uint64_t>(head) * ringLen_ * V_DIM;
+    const uint64_t kOffset = static_cast<uint64_t>(slot) * kStride_ + static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
+    const uint64_t gOffset = static_cast<uint64_t>(slot) * gStride_ + static_cast<uint64_t>(head) * ringLen_;
+    Load(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
+    for (int32_t i = 0; i < pos; ++i) {
+      const uint32_t phys = (static_cast<uint32_t>(base) + static_cast<uint32_t>(i)) & (ringLen_ - 1);
+      Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, key_, K_DIM);
+      LoadD(dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart);
+      Load(gCache_, gOffset + phys, scalar_, 1);
+      Exp(scalar_, scalar_, 1);
+      PipeBarrier<PIPE_V>();
+      const float alpha = ReadLocal(scalar_, 0);
+      Muls(state_, state_, alpha, tileV_ * K_DIM);
+      PipeBarrier<PIPE_V>();
+      OuterAdd();
+    }
+    Store(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
+    WriteStatus(task, 0);
+  }
+
+  __aicore__ inline void WriteStatusSpan(uint32_t offset, uint32_t count, int32_t error) {
+    auto output = out_.AllocTensor<int32_t>();
+    for (uint32_t i = 0; i < count; ++i) {
+      output.SetValue(i, error);
+    }
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    out_.EnQue(output);
+    output = out_.DeQue<int32_t>();
+    DataCopyExtParams cp{1, count * sizeof(int32_t), 0, 0, 0};
+    DataCopyPad(status_[offset], output, cp);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    out_.FreeTensor(output);
+  }
+
   template <typename T>
   __aicore__ inline void Load(GlobalTensor<T>& source, uint64_t offset, LocalTensor<float> dest,
                               uint32_t count) {
@@ -214,10 +296,10 @@ extern "C" __global__ __aicore__ void replayssm_sd_compact(
     GM_ADDR positions, GM_ADDR bases, GM_ADDR flush, GM_ADDR status, uint32_t batch,
     uint32_t numSlots, uint32_t heads, uint32_t valueHeads, uint32_t ringLen,
     uint64_t checkpointStride, uint64_t dStride, uint64_t kStride, uint64_t gStride,
-    uint32_t tileV) {
+    uint32_t tileV, uint32_t variant) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   ReplaySDCompact op;
   op.Init(checkpoint, dCache, kCache, gCache, slots, positions, bases, flush, status, batch,
           numSlots, heads, valueHeads, ringLen, checkpointStride, dStride, kStride, gStride, tileV);
-  op.Process();
+  op.Process(variant);
 }

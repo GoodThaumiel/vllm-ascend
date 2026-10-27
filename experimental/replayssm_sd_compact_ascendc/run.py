@@ -33,6 +33,9 @@ def cases(tp: int, batch: int, tile_v: int):
         case["flush"].fill_(flush)
         yield f"pos{pos}_base{base}_flush{flush}", case
     if batch >= 2:
+        case = make_case(tp=tp, batch=batch, position=13, base=31, tile_v=tile_v, seed=1151)
+        case["flush"][0] = 0
+        yield "mixed_flush", case
         case = make_case(tp=tp, batch=batch, position=13, base=31, tile_v=tile_v, seed=1201)
         last = batch - 1
         for name in ("slots", "positions", "bases", "flush"):
@@ -56,6 +59,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
+    parser.add_argument("--variant", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
@@ -92,6 +96,7 @@ def main() -> None:
         "batch": args.batch,
         "tile_v": args.tile_v,
         "cores": args.cores,
+        "variant": args.variant,
         "packages": {name: importlib.metadata.version(name) for name in ("torch", "torch-npu", "vllm", "vllm-ascend")},
         "cases": [],
     }
@@ -100,13 +105,13 @@ def main() -> None:
         for label, cpu in cases(args.tp, args.batch, args.tile_v):
             gpu = clone_page_strided_case(cpu, device)
             if args.stage in ("smoke", "all"):
-                invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
+                invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
                 errors = compare_case(cpu, gpu)
                 report["cases"].append({"case": label, "stage": "smoke", "errors": errors})
             if args.stage in ("graph", "perf", "all"):
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph):
-                    invoke(gpu, tile_v=args.tile_v, cores=args.cores, backend=args.backend)
+                    invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
                 for name in cpu:
                     gpu[name].copy_(cpu[name].to(device))
                 graph.replay()
