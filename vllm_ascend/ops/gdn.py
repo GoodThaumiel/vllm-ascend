@@ -49,12 +49,16 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
-from vllm_ascend.ops.replayssm.ascendc import replayssm_ar_step
+from vllm_ascend.ops.replayssm.ascendc import replayssm_ar_step, replayssm_sd_compact, replayssm_sd_verify
 from vllm_ascend.ops.replayssm.cache import (
     REPLAYSSM_AR_CORES,
     REPLAYSSM_AR_TILE_V,
+    REPLAYSSM_SD_VERIFY_TILE_V,
+    REPLAYSSM_SD_VERIFY_VARIANT,
     append_gdn_replayssm_ar_dtypes,
     append_gdn_replayssm_ar_shapes,
+    replayssm_sd_enabled,
+    replayssm_sd_ring_len,
 )
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
@@ -330,11 +334,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if not self.cache_config.use_replayssm:
             return base_shapes
+        buffer_len = self.cache_config.replayssm_buffer_len
+        if self.num_spec > 0:
+            buffer_len = replayssm_sd_ring_len(buffer_len, self.num_spec)
         return append_gdn_replayssm_ar_shapes(
             base_shapes,
             num_k_heads=self.num_k_heads,
             tp_size=self.tp_size,
-            buffer_len=self.cache_config.replayssm_buffer_len,
+            buffer_len=buffer_len,
         )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
@@ -359,7 +366,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "ReplaySSM AR supports --mamba-cache-mode none or align; "
                 "mode 'all' does not preserve the Replay ring lifecycle"
             )
-        if self.num_spec > 0:
+        if self.num_spec > 0 and not replayssm_sd_enabled(vllm_config):
             raise ValueError(
                 "ReplaySSM AR cannot be combined with speculative decoding "
                 "until the ReplaySSM SD commit/rollback path is enabled"
@@ -376,6 +383,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             ),
             persistent=False,
         )
+        if replayssm_sd_enabled(vllm_config):
+            max_rows = max(max_rows, vllm_config.compilation_config.max_cudagraph_capture_size or 0)
+            tasks = max_rows * local_v_heads * (self.head_v_dim // REPLAYSSM_AR_TILE_V)
+            self.register_buffer(
+                "_replayssm_sd_verify_status",
+                torch.empty(tasks, dtype=torch.int32, device=self.A_log.device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_replayssm_sd_compact_status",
+                torch.empty(tasks, dtype=torch.int32, device=self.A_log.device),
+                persistent=False,
+            )
+            logger.info_once(
+                "ReplaySSM SD enabled for Qwen GDN: BF16 conv/checkpoint, "
+                "FP16 d/k rings, FP32 g ring, verify=v13/tile128, compact=v1/tile32, cores=40"
+            )
+            return
         logger.info_once(
             "ReplaySSM AR enabled for Qwen GDN: BF16 conv/checkpoint, "
             "FP16 d/k rings, FP32 g ring, buffer_len=%d, tile_v=%d, cores=%d",
@@ -421,6 +446,77 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             REPLAYSSM_AR_CORES,
         )
         return output.unsqueeze(0)
+
+    def _replayssm_sd_decode(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> torch.Tensor:
+        slots = attn_metadata.replayssm_sd_slots
+        positions = attn_metadata.replayssm_sd_positions
+        bases = attn_metadata.replayssm_sd_bases
+        flush = attn_metadata.replayssm_sd_flush
+        lengths = attn_metadata.replayssm_sd_lengths
+        pack = attn_metadata.replayssm_sd_pack_indices
+        batch = slots.numel()
+        max_tokens = self.num_spec + 1
+        key_heads = self.num_k_heads // self.tp_size
+        value_heads = self.num_v_heads // self.tp_size
+
+        def pack_tokens(src: torch.Tensor, tail: tuple[int, ...]) -> torch.Tensor:
+            padded = src.new_zeros((batch, max_tokens, *tail))
+            padded.view(batch * max_tokens, *tail).index_copy_(0, pack, src.squeeze(0).contiguous())
+            return padded
+
+        q = pack_tokens(query, (key_heads, self.head_k_dim))
+        k = pack_tokens(key, (key_heads, self.head_k_dim))
+        v = pack_tokens(value, (value_heads, self.head_v_dim))
+        gate = pack_tokens(g, (value_heads,))
+        rate = pack_tokens(beta, (value_heads,))
+        output = torch.empty_like(v)
+        verify_tasks = batch * value_heads * (self.head_v_dim // REPLAYSSM_SD_VERIFY_TILE_V)
+        compact_tasks = batch * value_heads * (self.head_v_dim // REPLAYSSM_AR_TILE_V)
+        replayssm_sd_verify(
+            q,
+            k,
+            v,
+            gate,
+            rate,
+            self.kv_cache[1],
+            self.kv_cache[2],
+            self.kv_cache[3],
+            self.kv_cache[4],
+            slots,
+            positions,
+            bases,
+            lengths,
+            output,
+            self._replayssm_sd_verify_status[:verify_tasks],
+            self.head_k_dim**-0.5,
+            REPLAYSSM_SD_VERIFY_TILE_V,
+            40,
+            REPLAYSSM_SD_VERIFY_VARIANT,
+        )
+        replayssm_sd_compact(
+            self.kv_cache[1],
+            self.kv_cache[2],
+            self.kv_cache[3],
+            self.kv_cache[4],
+            slots,
+            positions,
+            bases,
+            flush,
+            self._replayssm_sd_compact_status[:compact_tasks],
+            REPLAYSSM_AR_TILE_V,
+            40,
+            1,
+        )
+        return output.view(batch * max_tokens, value_heads, self.head_v_dim).index_select(0, pack).unsqueeze(0)
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
         return
@@ -741,15 +837,21 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
+        use_replayssm_sd = self.cache_config.use_replayssm and self.num_spec > 0
         use_replayssm_ar = (
-            self.cache_config.use_replayssm and spec_sequence_masks is None and attn_metadata.num_decodes > 0
+            self.cache_config.use_replayssm
+            and not use_replayssm_sd
+            and spec_sequence_masks is None
+            and attn_metadata.num_decodes > 0
         )
+        if use_replayssm_sd and spec_sequence_masks is None and attn_metadata.num_decodes > 0:
+            raise RuntimeError("ReplaySSM SD decode row was not routed through the speculative cache path")
         g, beta = DeviceOperator.fused_gdn_gating(
             self.A_log,
             a,
             b,
             self.dt_bias,
-            beta_dtype=torch.float32 if use_replayssm_ar else None,
+            beta_dtype=torch.float32 if use_replayssm_ar or use_replayssm_sd else None,
         )
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -778,18 +880,28 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
-            core_attn_out_spec = recurrent_gated_delta_rule(
-                query_spec.squeeze(0),
-                key_spec.squeeze(0),
-                value_spec.squeeze(0),
-                ssm_state,
-                g=g_spec.squeeze(0),
-                beta=beta_spec.squeeze(0),
-                scale=key_spec.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=spec_state_indices_tensor.flatten(),
-                num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
-            ).unsqueeze(0)
+            if use_replayssm_sd:
+                core_attn_out_spec = self._replayssm_sd_decode(
+                    query=query_spec,
+                    key=key_spec,
+                    value=value_spec,
+                    g=g_spec,
+                    beta=beta_spec,
+                    attn_metadata=attn_metadata,
+                )
+            else:
+                core_attn_out_spec = recurrent_gated_delta_rule(
+                    query_spec.squeeze(0),
+                    key_spec.squeeze(0),
+                    value_spec.squeeze(0),
+                    ssm_state,
+                    g=g_spec.squeeze(0),
+                    beta=beta_spec.squeeze(0),
+                    scale=key_spec.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=spec_state_indices_tensor.flatten(),
+                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                ).unsqueeze(0)
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
@@ -856,6 +968,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
                 if use_replayssm_ar:
                     beta_non_spec = beta_non_spec.to(value_non_spec.dtype)
+
+            if use_replayssm_sd:
+                beta_non_spec = beta_non_spec.to(value_non_spec.dtype)
 
             use_fla_gdn_prefill = get_pcp_group().world_size == 1 and get_current_hardware_profile().supports(
                 HardwareCapability.FLA_GDN_PREFILL

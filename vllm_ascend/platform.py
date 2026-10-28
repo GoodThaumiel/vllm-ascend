@@ -494,6 +494,45 @@ class NPUPlatform(Platform):
             logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
             return
 
+        # vLLM 0.30 validates --use-replayssm with speculative decoding as
+        # KDA-only before the platform hook runs. The Ascend GDN SD extension
+        # opts in here, after that validator and before cache planning/runner
+        # construction, so the common ReplaySSM request lifecycle is reused.
+        from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled, replayssm_sd_ring_len
+
+        if replayssm_sd_enabled(vllm_config):
+            spec = vllm_config.speculative_config
+            if spec is None:
+                raise ValueError("additional_config.replayssm_sd requires MTP3 speculative decoding")
+            replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
+            if getattr(spec, "method", None) != "mtp":
+                raise ValueError("Ascend ReplaySSM SD currently supports MTP3 only")
+            if vllm_config.model_config.architecture not in (
+                "Qwen3NextForCausalLM",
+                "Qwen3_5ForCausalLM",
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            ):
+                raise ValueError("Ascend ReplaySSM SD currently supports Qwen GDN models only")
+            if vllm_config.model_config.dtype != torch.bfloat16:
+                raise ValueError("Ascend ReplaySSM SD requires BF16 model dtype")
+            if (
+                vllm_config.cache_config.mamba_cache_dtype != "bfloat16"
+                or vllm_config.cache_config.mamba_ssm_cache_dtype != "bfloat16"
+            ):
+                raise ValueError("Ascend ReplaySSM SD requires BF16 mamba cache and SSM state")
+            if vllm_config.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("Ascend ReplaySSM SD currently requires PP=1")
+            if vllm_config.use_v2_model_runner:
+                raise ValueError("Ascend ReplaySSM SD currently requires V1 model runner")
+            if vllm_config.cache_config.use_replayssm:
+                raise ValueError("Use additional_config.replayssm_sd without --use-replayssm on vLLM 0.30")
+            if vllm_config.cache_config.mamba_cache_mode != "none":
+                raise ValueError("Ascend ReplaySSM SD currently requires --mamba-cache-mode none")
+            vllm_config.cache_config.use_replayssm = True
+            logger.info("Enabled Ascend ReplaySSM SD for MTP3 with BF16 checkpoint and 32-entry ring")
+
         _validate_model_runner_config(vllm_config)
         cls._validate_indexer_pp_config(vllm_config)
 

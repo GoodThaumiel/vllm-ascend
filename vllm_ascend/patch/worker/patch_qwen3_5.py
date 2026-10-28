@@ -17,6 +17,7 @@
 # mypy: ignore-errors
 
 
+from dataclasses import replace
 from functools import wraps
 
 import torch
@@ -38,10 +39,24 @@ import vllm_ascend.patch.platform.patch_replayssm_gdn  # noqa: F401
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
+from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.utils import enable_dense_sp
 
 _GDN_PATCH_TARGET = _GDNBaseCls
 _GDN_ORIGINAL_INIT = _GDN_PATCH_TARGET.__init__
+_GDN_ORIGINAL_GET_KV_SPEC = _GDN_PATCH_TARGET.get_kv_cache_spec
+
+
+def _gdn_get_kv_cache_spec_with_replayssm_sd(self, vllm_config):
+    spec = _GDN_ORIGINAL_GET_KV_SPEC(self, vllm_config)
+    if replayssm_sd_enabled(vllm_config) and spec is not None:
+        # Verify writes only the first physical block; the remaining MTP
+        # candidates live in the compact d/k/g ring on that block.
+        spec = replace(spec, num_speculative_blocks=0)
+    return spec
+
+
+_GDN_PATCH_TARGET.get_kv_cache_spec = _gdn_get_kv_cache_spec_with_replayssm_sd
 
 
 def _uses_multimodal_rope(attention: Qwen3NextAttention) -> bool:
@@ -314,5 +329,6 @@ else:
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
     _GDN_PATCH_TARGET._replayssm_ar_decode = AscendGatedDeltaNetAttention._replayssm_ar_decode
+    _GDN_PATCH_TARGET._replayssm_sd_decode = AscendGatedDeltaNetAttention._replayssm_sd_decode
     _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention.get_state_dtype
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels

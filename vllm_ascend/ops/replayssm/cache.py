@@ -10,6 +10,38 @@ REPLAYSSM_AR_MAX_BUFFER_LEN = 64
 REPLAYSSM_AR_HEAD_DIM = 128
 REPLAYSSM_AR_TILE_V = 32
 REPLAYSSM_AR_CORES = 8
+REPLAYSSM_SD_MAX_TOKENS = 4
+REPLAYSSM_SD_MAX_HISTORY = 16
+REPLAYSSM_SD_VERIFY_TILE_V = 128
+REPLAYSSM_SD_VERIFY_VARIANT = 13
+
+
+def replayssm_sd_enabled(vllm_config) -> bool:
+    """Ascend-only opt-in, applied after upstream vLLM config validation."""
+    value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise ValueError("additional_config.replayssm_sd must be a boolean")
+
+
+def replayssm_sd_ring_len(buffer_len: int, num_spec: int) -> int:
+    max_tokens = num_spec + 1
+    if buffer_len != REPLAYSSM_SD_MAX_HISTORY or max_tokens != REPLAYSSM_SD_MAX_TOKENS:
+        raise ValueError("Ascend ReplaySSM SD currently requires buffer_len=16 and MTP3 (T=4)")
+    return 1 << (buffer_len + max_tokens - 1).bit_length()
+
+
+def replayssm_sd_pack_indices(query_lengths: torch.Tensor, max_tokens: int = 4) -> torch.Tensor:
+    """Map packed speculative tokens to fixed-width [request, token] rows."""
+    if query_lengths.device.type != "cpu" or query_lengths.dim() != 1:
+        raise ValueError("ReplaySSM SD query lengths must be a CPU vector")
+    if bool(((query_lengths < 1) | (query_lengths > max_tokens)).any()):
+        raise ValueError("ReplaySSM SD query length must be in [1, 4]")
+    return torch.cat(
+        [torch.arange(int(length), dtype=torch.int64) + row * max_tokens for row, length in enumerate(query_lengths)]
+    )
 
 
 def prepare_replayssm_decode_base_cpu(
@@ -85,7 +117,7 @@ def reject_replayssm_ar_speculative_decode(vllm_config) -> None:
         )
     speculative_config = vllm_config.speculative_config
     num_spec = speculative_config.num_speculative_tokens if speculative_config is not None else 0
-    if num_spec:
+    if num_spec and not replayssm_sd_enabled(vllm_config):
         raise ValueError(
             "ReplaySSM AR is connected for target autoregressive decode only. "
             "Disable speculative decoding until the ReplaySSM SD commit/rollback path is enabled."

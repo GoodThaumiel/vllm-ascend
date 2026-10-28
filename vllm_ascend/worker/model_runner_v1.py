@@ -184,7 +184,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
-from vllm_ascend.ops.replayssm.cache import prepare_replayssm_decode_base_cpu
+from vllm_ascend.ops.replayssm.cache import prepare_replayssm_decode_base_cpu, replayssm_sd_enabled
 from vllm_ascend.ops.replayssm.memory_probe import memory_snapshot
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
@@ -389,6 +389,7 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+        self._replayssm_sd_deferred_state: dict[str, tuple[int, torch.Tensor]] = {}
         self.lookback_token_ids: CpuGpuBuffer | None = None
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
@@ -966,6 +967,24 @@ class NPUModelRunner(GPUModelRunner):
         # This can be removed after the upstream fix is merged.
         req_data = scheduler_output.scheduled_cached_reqs
 
+        if replayssm_sd_enabled(self.vllm_config):
+            for req_id in scheduler_output.finished_req_ids:
+                self._replayssm_sd_deferred_state.pop(req_id, None)
+            scheduled = scheduler_output.num_scheduled_tokens.keys()
+            resumed = req_data.resumed_req_ids
+            unscheduled = self.input_batch.req_id_to_index.keys() - (scheduled - resumed)
+            unscheduled -= scheduler_output.finished_req_ids
+            preempted = (scheduler_output.preempted_req_ids or set()) | resumed
+            for req_id in preempted:
+                self._replayssm_sd_deferred_state.pop(req_id, None)
+            for req_id in unscheduled - preempted:
+                row = self.input_batch.req_id_to_index.get(req_id)
+                if row is not None:
+                    self._replayssm_sd_deferred_state[req_id] = (
+                        int(self.input_batch.replayssm_decode_base[row]),
+                        self.num_accepted_tokens.gpu[row].clone(),
+                    )
+
         if self.use_async_scheduling:
             for i, req_id in enumerate(req_data.req_ids):
                 req_state = self.requests.get(req_id)
@@ -1504,6 +1523,15 @@ class NPUModelRunner(GPUModelRunner):
         else:
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
+
+        if self._replayssm_sd_deferred_state:
+            for req_id, (decode_base, accepted) in list(self._replayssm_sd_deferred_state.items()):
+                row = self.input_batch.req_id_to_index.get(req_id)
+                if row is None:
+                    continue
+                self.input_batch.replayssm_decode_base[row] = decode_base
+                self.num_accepted_tokens.gpu[row].copy_(accepted)
+                del self._replayssm_sd_deferred_state[req_id]
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
@@ -3778,7 +3806,7 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args["num_actual_reqs"] = num_reqs
-                if use_spec_decode:
+                if use_spec_decode or replayssm_sd_enabled(self.vllm_config):
                     extra_attn_metadata_args.update(
                         num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
                         num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],

@@ -21,6 +21,84 @@ SPEC.loader.exec_module(CACHE)
 
 
 class ReplaySSMModelARIntegrationTests(unittest.TestCase):
+    def test_sd_mtp3_ring_and_packed_token_mapping(self) -> None:
+        self.assertEqual(CACHE.replayssm_sd_ring_len(16, 3), 32)
+        lengths = torch.tensor([1, 4, 2], dtype=torch.int32)
+        indices = CACHE.replayssm_sd_pack_indices(lengths)
+        torch.testing.assert_close(indices, torch.tensor([0, 4, 5, 6, 7, 8, 9]))
+        source = torch.arange(indices.numel(), dtype=torch.float32)
+        padded = torch.zeros(12, dtype=torch.float32)
+        padded.index_copy_(0, indices, source)
+        torch.testing.assert_close(padded.index_select(0, indices), source)
+        torch.testing.assert_close(padded[[1, 2, 3, 10, 11]], torch.zeros(5))
+
+    def test_sd_rejects_unsupported_window_before_cache_allocation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "buffer_len=16"):
+            CACHE.replayssm_sd_ring_len(32, 3)
+        with self.assertRaisesRegex(ValueError, "MTP3"):
+            CACHE.replayssm_sd_ring_len(16, 2)
+        with self.assertRaisesRegex(ValueError, "query length"):
+            CACHE.replayssm_sd_pack_indices(torch.tensor([1, 5]))
+
+    def test_sd_opt_in_reuses_decode_base_without_ar_spec_guard(self) -> None:
+        config = SimpleNamespace(
+            additional_config={"replayssm_sd": True},
+            cache_config=SimpleNamespace(use_replayssm=True, mamba_cache_mode="none"),
+            speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        )
+        self.assertTrue(CACHE.replayssm_sd_enabled(config))
+        CACHE.reject_replayssm_ar_speculative_decode(config)
+        config.additional_config["replayssm_sd"] = "false"
+        self.assertFalse(CACHE.replayssm_sd_enabled(config))
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            config.additional_config["replayssm_sd"] = "enabled"
+            CACHE.replayssm_sd_enabled(config)
+
+    def test_sd_serve_verify_selects_v13_tile128(self) -> None:
+        self.assertEqual((CACHE.REPLAYSSM_SD_VERIFY_VARIANT, CACHE.REPLAYSSM_SD_VERIFY_TILE_V), (13, 128))
+        try:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"optional local vLLM dependencies are unavailable: {exc}")
+
+        batch, key_heads, value_heads, dim = 2, 1, 2, 128
+        layer = SimpleNamespace(
+            num_spec=3,
+            num_k_heads=key_heads,
+            num_v_heads=value_heads,
+            tp_size=1,
+            head_k_dim=dim,
+            head_v_dim=dim,
+            kv_cache=(None, *(torch.empty(1) for _ in range(4))),
+            _replayssm_sd_verify_status=torch.empty(batch * value_heads, dtype=torch.int32),
+            _replayssm_sd_compact_status=torch.empty(batch * value_heads * 4, dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(
+            replayssm_sd_slots=torch.tensor([1, 2], dtype=torch.int32),
+            replayssm_sd_positions=torch.zeros(batch, dtype=torch.int32),
+            replayssm_sd_bases=torch.zeros(batch, dtype=torch.int32),
+            replayssm_sd_flush=torch.zeros(batch, dtype=torch.int32),
+            replayssm_sd_lengths=torch.tensor([1, 4], dtype=torch.int32),
+            replayssm_sd_pack_indices=torch.tensor([0, 4, 5, 6, 7]),
+        )
+        query = torch.zeros(1, 5, key_heads, dim)
+        value = torch.arange(5 * value_heads * dim).view(1, 5, value_heads, dim).float()
+        gate = torch.zeros(1, 5, value_heads)
+
+        def fake_verify(*args):
+            args[13].copy_(args[2])
+
+        with (
+            patch("vllm_ascend.ops.gdn.replayssm_sd_verify", side_effect=fake_verify) as verify,
+            patch("vllm_ascend.ops.gdn.replayssm_sd_compact") as compact,
+        ):
+            result = AscendGatedDeltaNetAttention._replayssm_sd_decode(
+                layer, query=query, key=query, value=value, g=gate, beta=gate, attn_metadata=metadata
+            )
+        torch.testing.assert_close(result, value)
+        self.assertEqual(verify.call_args.args[-3:], (128, 40, 13))
+        self.assertEqual(compact.call_args.args[-3:], (32, 40, 1))
+
     def test_all_npu_input_batch_owners_keep_replayssm_lifecycle(self) -> None:
         input_batch_source = (ROOT / "vllm_ascend/worker/npu_input_batch.py").read_text()
         self.assertIn("self.replayssm_decode_base_cpu_tensor = torch.zeros(", input_batch_source)

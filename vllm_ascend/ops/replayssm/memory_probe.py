@@ -36,6 +36,7 @@ def cache_plan_snapshot(kv_cache_config: Any) -> dict[str, Any]:
             "logical_page_bytes": int(getattr(spec, "real_page_size_bytes", spec.page_size_bytes)),
         }
         sample_components: dict[str, list[dict[str, Any]]] = {}
+        sample_mamba_layout: dict[str, dict[str, int]] = {}
         for layer_spec in layer_specs.values():
             if not (hasattr(layer_spec, "shapes") and hasattr(layer_spec, "dtypes")):
                 continue
@@ -51,8 +52,19 @@ def cache_plan_snapshot(kv_cache_config: Any) -> dict[str, Any]:
                 parts.append(part)
                 component_bytes[f"{type(layer_spec).__name__}.state_{index}"] += bytes_per_state * num_blocks
             sample_components.setdefault(type(layer_spec).__name__, parts)
+            if hasattr(layer_spec, "num_speculative_blocks"):
+                sample_mamba_layout.setdefault(
+                    type(layer_spec).__name__,
+                    {
+                        "num_speculative_blocks": int(layer_spec.num_speculative_blocks),
+                        "page_size_bytes": int(layer_spec.page_size_bytes),
+                        "blocks_per_request_none": 1 + int(layer_spec.num_speculative_blocks),
+                    },
+                )
         if sample_components:
             entry["sample_components_by_kind"] = sample_components
+        if sample_mamba_layout:
+            entry["sample_mamba_layout_by_kind"] = sample_mamba_layout
         group_pages.append(entry)
     return {
         "num_blocks": num_blocks,

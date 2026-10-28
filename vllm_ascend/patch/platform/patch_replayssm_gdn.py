@@ -12,6 +12,8 @@ from vllm_ascend.ops.replayssm.cache import (
     append_gdn_replayssm_ar_dtypes,
     append_gdn_replayssm_ar_shapes,
     reject_replayssm_ar_speculative_decode,
+    replayssm_sd_enabled,
+    replayssm_sd_ring_len,
 )
 
 _REPLAYSSM_GDN_ARCHITECTURES = frozenset(
@@ -39,11 +41,14 @@ def _patch_config_methods(model_cls: type) -> None:
             return base_shapes
         reject_replayssm_ar_speculative_decode(vllm_config)
         hf_config = vllm_config.model_config.hf_text_config
+        buffer_len = vllm_config.cache_config.replayssm_buffer_len
+        if replayssm_sd_enabled(vllm_config):
+            buffer_len = replayssm_sd_ring_len(buffer_len, vllm_config.speculative_config.num_speculative_tokens)
         return append_gdn_replayssm_ar_shapes(
             base_shapes,
             num_k_heads=hf_config.linear_num_key_heads,
             tp_size=vllm_config.parallel_config.tensor_parallel_size,
-            buffer_len=vllm_config.cache_config.replayssm_buffer_len,
+            buffer_len=buffer_len,
         )
 
     def get_state_dtype(cls, vllm_config, _original: Callable = original_dtype):
