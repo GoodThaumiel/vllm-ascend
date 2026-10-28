@@ -23,6 +23,16 @@ from experimental.replayssm_sd_ascendc.lab import (  # noqa: E402
 __all__ = ["CACHE_NAMES", "clone_case", "clone_page_strided_case"]
 
 
+def pack_metadata_views(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Create four int32[B] column views over one device-side [B,4] allocation."""
+    result = dict(case)
+    names = ("slots", "positions", "bases", "flush")
+    packed = torch.stack([case[name] for name in names], dim=1).contiguous()
+    for column, name in enumerate(names):
+        result[name] = packed[:, column]
+    return result
+
+
 def make_case(
     *,
     tp: int = 4,
@@ -80,7 +90,7 @@ def compact_golden(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def invoke(
-    case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, variant: int = 0, backend: str = "lab"
+    case: dict[str, torch.Tensor], *, tile_v: int = 32, cores: int = 40, variant: int = 1, backend: str = "lab"
 ) -> None:
     if backend == "lab":
         op = torch.ops.replayssm_sd_compact_lab.compact_

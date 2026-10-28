@@ -113,7 +113,7 @@ def replayssm_sd_compact(
     status: torch.Tensor,
     tile_v: int = 32,
     cores: int = 40,
-    variant: int = 0,
+    variant: int = 1,
 ) -> None:
     """Fold committed SD history into BF16 checkpoint on flush rows."""
     torch.ops._C_ascend.replayssm_sd_compact_(

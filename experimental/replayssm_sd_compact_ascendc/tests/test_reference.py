@@ -9,6 +9,7 @@ from experimental.replayssm_sd_compact_ascendc.lab import (
     clone_page_strided_case,
     compact_golden,
     make_case,
+    pack_metadata_views,
 )
 
 
@@ -41,6 +42,19 @@ class TestSDCompactReference(unittest.TestCase):
         torch.testing.assert_close(result["checkpoint"][2], packed["checkpoint"][2], atol=0, rtol=0)
         self.assertTrue(torch.isfinite(result["checkpoint"][1]).all())
         self.assertTrue(torch.all(result["status"] == 0))
+
+    def test_packed_metadata_views_share_one_allocation(self):
+        case = make_case(tp=4, batch=3, position=13, base=30)
+        packed = pack_metadata_views(case)
+        names = ("slots", "positions", "bases", "flush")
+        start = packed["slots"].data_ptr()
+        for column, name in enumerate(names):
+            self.assertEqual(packed[name].stride(), (4,))
+            self.assertEqual(packed[name].data_ptr(), start + column * 4)
+            torch.testing.assert_close(packed[name], case[name])
+        packed["flush"][1] = 0
+        self.assertEqual(int(packed["flush"][1]), 0)
+        self.assertEqual(int(case["flush"][1]), 1)
 
 
 if __name__ == "__main__":

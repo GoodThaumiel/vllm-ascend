@@ -22,6 +22,7 @@ from lab import (
     compare,
     invoke,
     make_case,
+    pack_metadata_views,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,7 +60,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
-    parser.add_argument("--variant", type=int, choices=(0, 1, 2), default=0)
+    parser.add_argument("--variant", type=int, choices=(0, 1, 2, 3, 4), default=1)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
@@ -97,6 +98,7 @@ def main() -> None:
         "tile_v": args.tile_v,
         "cores": args.cores,
         "variant": args.variant,
+        "metadata_pack_in_timed_region": False,
         "packages": {name: importlib.metadata.version(name) for name in ("torch", "torch-npu", "vllm", "vllm-ascend")},
         "cases": [],
     }
@@ -104,6 +106,8 @@ def main() -> None:
     try:
         for label, cpu in cases(args.tp, args.batch, args.tile_v):
             gpu = clone_page_strided_case(cpu, device)
+            if args.variant == 4:
+                gpu = pack_metadata_views(gpu)
             if args.stage in ("smoke", "all"):
                 invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
                 errors = compare_case(cpu, gpu)

@@ -62,8 +62,15 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
   const int64_t batch = slots.numel();
   for (const auto& t : {slots, positions, bases, flush}) {
     TORCH_CHECK(t.dim() == 1 && t.numel() == batch && t.scalar_type() == at::kInt &&
-                    t.is_contiguous(),
-                "slots/positions/bases/flush must be contiguous int32[B]");
+                    (variant == 4 ? t.stride(0) == 4 : t.is_contiguous()),
+                "slots/positions/bases/flush must be int32[B] with the required metadata layout");
+  }
+  if (variant == 4) {
+    const auto* packed = slots.data_ptr<int32_t>();
+    TORCH_CHECK(positions.data_ptr<int32_t>() == packed + 1 &&
+                    bases.data_ptr<int32_t>() == packed + 2 &&
+                    flush.data_ptr<int32_t>() == packed + 3,
+                "variant 4 requires four views of one interleaved int32[B,4] allocation");
   }
   TORCH_CHECK(tile_v == 16 || tile_v == 32, "tile_v must be 16/32");
   const int64_t tasks = batch * value_heads * (128 / tile_v);
@@ -71,7 +78,7 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
                   status.is_contiguous(),
               "status must be contiguous int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 2, "variant must be 0 (original), 1 (grouped), or 2 (hybrid)");
+  TORCH_CHECK(variant >= 0 && variant <= 4, "variant must be 0..4");
   TORCH_CHECK(variant == 0 || (value_heads * (128 / tile_v)) % 8 == 0,
               "optimized compact requires a 32-byte aligned status row");
   TORCH_CHECK(variant == 0 || value_heads * (128 / tile_v) * sizeof(int32_t) <=
@@ -80,7 +87,7 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
 
   const c10_npu::OptionalNPUGuard guard(checkpoint.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const int64_t active_tasks = variant == 1 ? batch * value_heads : tasks;
+  const int64_t active_tasks = (variant == 1 || variant >= 3) ? batch * value_heads : tasks;
   const auto result = aclrtlaunch_replayssm_sd_compact(
       static_cast<uint32_t>(std::min(cores, active_tasks)), stream, checkpoint.data_ptr(),
       d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(), slots.data_ptr(),

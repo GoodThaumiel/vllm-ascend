@@ -10,9 +10,15 @@ The implementation follows the existing AR AscendC scalar staging, vector outer-
 
 The L3.4 ablation adds optional `--variant 1` (one task per row/value head) and
 `--variant 2` (original flush tiling with coalesced non-flush status writes).
-The default `--variant 0` retains the original mapping. Follow the
+The default is now `--variant 1` after the L3.4 on-device ablation; `0` remains
+available as the original mapping. Follow the
 [L3.4 validation checklist](../../docs/replayssm/checklists/LEVEL3_SD_COMPACT_ABLATION.md)
-before selecting an optimized version for the framework path.
+for the measured v0/v1/v2 comparison.
+
+The follow-up [L3.5 checklist](../../docs/replayssm/checklists/LEVEL3_SD_COMPACT_LAZY_BUNDLE.md)
+compares v1 with lazy UB initialization (v3) and pre-packed metadata (v4).
+The v4 runner packs metadata before graph timing; that packing cost must be
+included before adopting v4 in a serving path.
 
 ## On-machine checklist
 

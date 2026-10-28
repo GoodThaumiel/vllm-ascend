@@ -7,7 +7,7 @@
 #define VLLM_ASCEND_REPLAYSSM_SD_COMPACT_SCHEMA                                               \
   "(Tensor(a!) checkpoint, Tensor d_cache, Tensor k_cache, Tensor g_cache, Tensor slots, "   \
   "Tensor positions, Tensor bases, Tensor flush, Tensor(b!) status, int tile_v=32, "         \
-  "int cores=40, int variant=0) -> ()"
+  "int cores=40, int variant=1) -> ()"
 
 namespace vllm_ascend {
 void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
