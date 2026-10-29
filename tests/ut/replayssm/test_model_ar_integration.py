@@ -144,6 +144,12 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
                 self.assertIn("use_replayssm", keywords, f"missing at {path}:{node.lineno}")
         self.assertEqual(seen, 4)
 
+    def test_ascend_overrides_preserve_sd_cache_geometry_and_decode_base(self) -> None:
+        worker = (ROOT / "vllm_ascend/worker/worker.py").read_text()
+        metadata = (ROOT / "vllm_ascend/attention/utils.py").read_text()
+        self.assertIn("self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks", worker)
+        self.assertIn("replayssm_decode_base_cpu=_slice_reqs(self.replayssm_decode_base_cpu)", metadata)
+
     def test_decode_base_uses_live_buffer_and_zeroes_capture_dummy(self) -> None:
         live = torch.tensor([17, 33, 0], dtype=torch.int32)
         actual = CACHE.prepare_replayssm_decode_base_cpu(live, is_dummy_run=False)

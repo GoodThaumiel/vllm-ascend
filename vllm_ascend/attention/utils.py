@@ -416,6 +416,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             seq_lens=self.seq_lens[:num_actual_reqs],
             seq_lens_cpu=_slice_reqs(self.seq_lens_cpu),
             num_computed_tokens_cpu=_slice_reqs(self.num_computed_tokens_cpu),
+            replayssm_decode_base_cpu=_slice_reqs(self.replayssm_decode_base_cpu),
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,

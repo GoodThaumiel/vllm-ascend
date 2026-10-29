@@ -1173,6 +1173,9 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        # Keep the profiled block count visible to metadata builders during
+        # warmup and graph capture, as in upstream GPUWorker.
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         speculator = getattr(self.model_runner, "speculator", None)
         speculative = self.vllm_config.speculative_config
         if (

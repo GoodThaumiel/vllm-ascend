@@ -2,6 +2,8 @@
 """Local checks for the serve report's queue metric parser."""
 
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,29 @@ SPEC.loader.exec_module(MODULE)
 
 
 class SDServeValidatorTests(unittest.TestCase):
+    def test_prompt_jsonl_rejects_missing_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prompts.jsonl"
+            path.write_text(json.dumps({"prompt": "one"}) + "\n")
+            self.assertEqual(MODULE.read_prompt_jsonl(path), ["one"])
+            path.write_text(json.dumps({"text": "two"}) + "\n")
+            with self.assertRaisesRegex(ValueError, "nonempty prompt"):
+                MODULE.read_prompt_jsonl(path)
+
+    def test_first_divergence_records_margin_and_token_ids(self) -> None:
+        native = {"token_ids": [1, 2], "logprobs": {"top_logprobs": [{}, {"a": -0.1, "b": -0.2}]}}
+        replay = {"token_ids": [1, 3], "logprobs": {"top_logprobs": [{}, {"a": -0.3, "b": -0.4}]}}
+        self.assertEqual(
+            MODULE.first_divergence(native, replay),
+            {
+                "index": 1,
+                "native_token_id": 2,
+                "replay_token_id": 3,
+                "native_top_logprob_margin": 0.1,
+                "replay_top_logprob_margin": 0.1,
+            },
+        )
+
     def test_latency_summary_uses_successful_requests_only(self) -> None:
         rows = [{"status": "PASSED", "latency_s": value} for value in (1.0, 2.0, 3.0, 4.0)]
         rows.append({"status": "FAILED", "latency_s": 100.0})
