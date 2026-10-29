@@ -2,12 +2,13 @@
 
 本轮代码以 CANN 9.2.0 / Ascend910B4 / torch_npu 2.10.0.post4 / vLLM `0.30.0+empty` / 本分支源码编译的 vLLM Ascend 为目标。仅验证 Qwen3.5/Qwen3.6 GDN、MTP3、TP4/TP8、BF16 模型与 BF16 Mamba/SSM cache、`mamba-cache-mode none`、V1 runner。verify 固定 **v13/tile128/cores40**，compact 固定 **v1/tile32/cores40**，cursor 使用已有 AscendC kernel。v3/v4 compact 保留在算子消融入口，serve 不启用。
 
-插件通过 `--additional-config '{"replayssm_sd":true}'` 开启 SD。vLLM 0.30 原始配置校验将 `--use-replayssm` + MTP 解释为 KDA RecoverSSM 并拒绝 Qwen GDN，因此本轮 **不要同时传** `--use-replayssm`。Ascend 平台在上游校验后启用 `cache_config.use_replayssm`，复用上游 request 的 decode-base 生命周期；GDN cache spec 将 speculative block 数改为 0，候选都指向同一物理 block。此配置差异只在插件内实现，属于对 vLLM/Ascend 内部 cache-spec、metadata builder、model runner 与 GDN dispatch 的侵入式适配；没有修改 vLLM 源码。
+插件通过 `--additional-config '{"replayssm_sd":true}'` 开启 SD。vLLM 0.30 原始配置校验将 `--use-replayssm` + MTP 解释为 KDA RecoverSSM 并拒绝 Qwen GDN，因此 **不要同时传** `--use-replayssm`。Ascend SD 独立读取 `additional_config.replayssm_sd`，保持 `cache_config.use_replayssm=False`；模型、cache spec、metadata builder 和 NPU runner 在插件内启用 GDN ring 与 request decode-base 生命周期。GDN cache spec 将 speculative block 数改为 0，候选都指向同一物理 block。此配置差异属于对 vLLM/Ascend 内部 cache-spec、metadata builder、model runner 与 GDN dispatch 的侵入式适配；没有修改 vLLM 源码。
 
 ## 0. 构建与独立门槛
 
 1. 拉取本次提交，记录 `git rev-parse HEAD`、`git status --short`、实际 package 版本、CANN 路径和可见 910B4 卡数。服务器本地修改先另存，不要合并到本轮结果。
 2. 在 9.2.0 容器重新从此 checkout 编译安装 vLLM Ascend，确认三种 `_C_ascend.replayssm_sd_*_` op 和 Meta 注册、kernel `.so` RUNPATH 都来自新构建；编译失败时保留首个 CCE/链接错误，不运行旧 `.so`。
+   上一版 `46fe19c` 在配置校验阶段触发 KDA RecoverSSM 并停止；本版优先确认启动日志没有 `RecoverSSM is only supported for Kimi-K3 KDA`，且 `ReplaySSM SD enabled`、4 个 worker 的 `REPLAYSSM_MEMORY_JSON`、图 capture 和 `/health` 均出现。
 3. 复跑 verify v13/tile128、compact v1、cursor 的 TP4 B2 smoke/graph 与 TP8 B2 graph；cursor 特别检查 accepted=0/1/4、reset、slot0，compact 检查 base31 跨尾和混合 flush。若 v13 在某 TP 或图模式下未通过，先停在算子层并回传结果；v11/tile64 可作诊断对照。
 
 ## 1. 顺序启动 native 与 Replay 两个服务

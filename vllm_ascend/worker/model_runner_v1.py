@@ -637,7 +637,7 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config = getattr(self.vllm_config, "reasoning_config", None),
-            use_replayssm=self.cache_config.use_replayssm,
+            use_replayssm=self.cache_config.use_replayssm or replayssm_sd_enabled(self.vllm_config),
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
@@ -3650,7 +3650,7 @@ class NPUModelRunner(GPUModelRunner):
             num_computed_tokens_cpu = None
 
         replayssm_decode_base_cpu = None
-        if self.cache_config.use_replayssm:
+        if self.cache_config.use_replayssm or replayssm_sd_enabled(self.vllm_config):
             replayssm_decode_base_cpu = prepare_replayssm_decode_base_cpu(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded],
                 is_dummy_run=offload_dummy,
@@ -4416,7 +4416,7 @@ class NPUModelRunner(GPUModelRunner):
         try:
             report = memory_snapshot(
                 stage=stage,
-                use_replayssm=self.cache_config.use_replayssm,
+                use_replayssm=self.cache_config.use_replayssm or replayssm_sd_enabled(self.vllm_config),
                 kv_cache_config=getattr(self, "kv_cache_config", None),
                 kv_caches=kv_caches,
             )
@@ -6238,7 +6238,7 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config = getattr(self.vllm_config, "reasoning_config", None),
-                use_replayssm=self.cache_config.use_replayssm,
+                use_replayssm=self.cache_config.use_replayssm or replayssm_sd_enabled(self.vllm_config),
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

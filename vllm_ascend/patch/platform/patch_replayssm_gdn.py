@@ -12,6 +12,7 @@ from vllm_ascend.ops.replayssm.cache import (
     append_gdn_replayssm_ar_dtypes,
     append_gdn_replayssm_ar_shapes,
     reject_replayssm_ar_speculative_decode,
+    replayssm_gdn_enabled,
     replayssm_sd_enabled,
     replayssm_sd_ring_len,
 )
@@ -37,7 +38,7 @@ def _patch_config_methods(model_cls: type) -> None:
 
     def get_state_shape(cls, vllm_config, _original: Callable = original_shape):
         base_shapes = _original(cls, vllm_config)
-        if not vllm_config.cache_config.use_replayssm:
+        if not replayssm_gdn_enabled(vllm_config):
             return base_shapes
         reject_replayssm_ar_speculative_decode(vllm_config)
         hf_config = vllm_config.model_config.hf_text_config
@@ -53,7 +54,7 @@ def _patch_config_methods(model_cls: type) -> None:
 
     def get_state_dtype(cls, vllm_config, _original: Callable = original_dtype):
         base_dtypes = _original(cls, vllm_config)
-        if not vllm_config.cache_config.use_replayssm:
+        if not replayssm_gdn_enabled(vllm_config):
             return base_dtypes
         reject_replayssm_ar_speculative_decode(vllm_config)
         return append_gdn_replayssm_ar_dtypes(

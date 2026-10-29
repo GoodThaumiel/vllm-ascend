@@ -332,7 +332,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
-        if not self.cache_config.use_replayssm:
+        if not (self.cache_config.use_replayssm or getattr(self, "use_replayssm_sd", False)):
             return base_shapes
         buffer_len = self.cache_config.replayssm_buffer_len
         if self.num_spec > 0:
@@ -350,7 +350,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
         )
-        if not self.cache_config.use_replayssm:
+        if not (self.cache_config.use_replayssm or getattr(self, "use_replayssm_sd", False)):
             return base_dtypes
         return append_gdn_replayssm_ar_dtypes(
             base_dtypes,
@@ -359,7 +359,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def initialize_replayssm_ar(self, vllm_config) -> None:
         """Allocate one graph-stable status workspace per GDN layer."""
-        if not self.cache_config.use_replayssm:
+        self.use_replayssm_sd = replayssm_sd_enabled(vllm_config)
+        if not (self.cache_config.use_replayssm or self.use_replayssm_sd):
             return
         if self.cache_config.mamba_cache_mode not in ("none", "align"):
             raise ValueError(
@@ -837,10 +838,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
-        use_replayssm_sd = self.cache_config.use_replayssm and self.num_spec > 0
+        use_replayssm_sd = self.use_replayssm_sd and self.num_spec > 0
         use_replayssm_ar = (
             self.cache_config.use_replayssm
-            and not use_replayssm_sd
+            and not self.use_replayssm_sd
             and spec_sequence_masks is None
             and attn_metadata.num_decodes > 0
         )

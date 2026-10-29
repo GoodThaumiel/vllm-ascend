@@ -494,10 +494,9 @@ class NPUPlatform(Platform):
             logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
             return
 
-        # vLLM 0.30 validates --use-replayssm with speculative decoding as
-        # KDA-only before the platform hook runs. The Ascend GDN SD extension
-        # opts in here, after that validator and before cache planning/runner
-        # construction, so the common ReplaySSM request lifecycle is reused.
+        # vLLM 0.30 validates use_replayssm + MTP as KDA RecoverSSM after
+        # this platform hook. Keep the GDN SD opt-in separate from that flag;
+        # the Ascend model/cache/runner paths read additional_config directly.
         from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled, replayssm_sd_ring_len
 
         if replayssm_sd_enabled(vllm_config):
@@ -530,7 +529,6 @@ class NPUPlatform(Platform):
                 raise ValueError("Use additional_config.replayssm_sd without --use-replayssm on vLLM 0.30")
             if vllm_config.cache_config.mamba_cache_mode != "none":
                 raise ValueError("Ascend ReplaySSM SD currently requires --mamba-cache-mode none")
-            vllm_config.cache_config.use_replayssm = True
             logger.info("Enabled Ascend ReplaySSM SD for MTP3 with BF16 checkpoint and 32-entry ring")
 
         _validate_model_runner_config(vllm_config)

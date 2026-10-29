@@ -26,6 +26,11 @@ def replayssm_sd_enabled(vllm_config) -> bool:
     raise ValueError("additional_config.replayssm_sd must be a boolean")
 
 
+def replayssm_gdn_enabled(vllm_config) -> bool:
+    """The GDN cache/lifecycle contract for AR or Ascend-only SD."""
+    return vllm_config.cache_config.use_replayssm or replayssm_sd_enabled(vllm_config)
+
+
 def replayssm_sd_ring_len(buffer_len: int, num_spec: int) -> int:
     max_tokens = num_spec + 1
     if buffer_len != REPLAYSSM_SD_MAX_HISTORY or max_tokens != REPLAYSSM_SD_MAX_TOKENS:

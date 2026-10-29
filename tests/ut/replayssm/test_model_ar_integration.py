@@ -43,16 +43,32 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
     def test_sd_opt_in_reuses_decode_base_without_ar_spec_guard(self) -> None:
         config = SimpleNamespace(
             additional_config={"replayssm_sd": True},
-            cache_config=SimpleNamespace(use_replayssm=True, mamba_cache_mode="none"),
+            cache_config=SimpleNamespace(use_replayssm=False, mamba_cache_mode="none"),
             speculative_config=SimpleNamespace(num_speculative_tokens=3),
         )
         self.assertTrue(CACHE.replayssm_sd_enabled(config))
+        self.assertTrue(CACHE.replayssm_gdn_enabled(config))
+        self.assertFalse(config.cache_config.use_replayssm)
         CACHE.reject_replayssm_ar_speculative_decode(config)
         config.additional_config["replayssm_sd"] = "false"
         self.assertFalse(CACHE.replayssm_sd_enabled(config))
+        self.assertFalse(CACHE.replayssm_gdn_enabled(config))
         with self.assertRaisesRegex(ValueError, "boolean"):
             config.additional_config["replayssm_sd"] = "enabled"
             CACHE.replayssm_sd_enabled(config)
+
+    def test_sd_opt_in_does_not_set_upstream_kda_recover_flag(self) -> None:
+        # The vLLM mode="after" validator runs after the Ascend platform hook.
+        # Writing this flag there turns Qwen MTP into KDA RecoverSSM.
+        tree = ast.parse((ROOT / "vllm_ascend/platform.py").read_text())
+        assignments = (node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)))
+        for node in assignments:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                self.assertFalse(
+                    isinstance(target, ast.Attribute) and target.attr == "use_replayssm",
+                    "the Ascend platform hook must leave the upstream RecoverSSM flag unset for SD",
+                )
 
     def test_sd_serve_verify_selects_v13_tile128(self) -> None:
         self.assertEqual((CACHE.REPLAYSSM_SD_VERIFY_VARIANT, CACHE.REPLAYSSM_SD_VERIFY_TILE_V), (13, 128))
