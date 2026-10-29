@@ -41,10 +41,16 @@ def _patch_config_methods(model_cls: type) -> None:
         if not replayssm_gdn_enabled(vllm_config):
             return base_shapes
         reject_replayssm_ar_speculative_decode(vllm_config)
+        if replayssm_sd_enabled(vllm_config):
+            # SD rings belong to requests and are allocated separately by the
+            # runner. Only conv and checkpoint consume a physical cache block.
+            replayssm_sd_ring_len(
+                vllm_config.cache_config.replayssm_buffer_len,
+                vllm_config.speculative_config.num_speculative_tokens,
+            )
+            return base_shapes
         hf_config = vllm_config.model_config.hf_text_config
         buffer_len = vllm_config.cache_config.replayssm_buffer_len
-        if replayssm_sd_enabled(vllm_config):
-            buffer_len = replayssm_sd_ring_len(buffer_len, vllm_config.speculative_config.num_speculative_tokens)
         return append_gdn_replayssm_ar_shapes(
             base_shapes,
             num_k_heads=hf_config.linear_num_key_heads,
@@ -57,6 +63,9 @@ def _patch_config_methods(model_cls: type) -> None:
         if not replayssm_gdn_enabled(vllm_config):
             return base_dtypes
         reject_replayssm_ar_speculative_decode(vllm_config)
+        if replayssm_sd_enabled(vllm_config):
+            append_gdn_replayssm_ar_dtypes(base_dtypes, vllm_config.model_config.dtype)
+            return base_dtypes
         return append_gdn_replayssm_ar_dtypes(
             base_dtypes,
             vllm_config.model_config.dtype,

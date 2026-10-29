@@ -184,7 +184,13 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
-from vllm_ascend.ops.replayssm.cache import prepare_replayssm_decode_base_cpu, replayssm_sd_enabled
+from vllm_ascend.ops.replayssm.cache import (
+    ReplaySSMSDRingSlots,
+    prepare_replayssm_decode_base_cpu,
+    replayssm_sd_enabled,
+    replayssm_sd_ring_capacity,
+    replayssm_sd_ring_len,
+)
 from vllm_ascend.ops.replayssm.memory_probe import memory_snapshot
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
@@ -390,6 +396,17 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         self._replayssm_sd_deferred_state: dict[str, tuple[int, torch.Tensor]] = {}
+        self._replayssm_sd_ring_slots = (
+            ReplaySSMSDRingSlots(replayssm_sd_ring_capacity(vllm_config))
+            if replayssm_sd_enabled(vllm_config)
+            else None
+        )
+        self._replayssm_sd_ring_slots_cpu = (
+            torch.zeros(self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY)
+            if self._replayssm_sd_ring_slots is not None
+            else None
+        )
+        self._replayssm_sd_ring_bytes = 0
         self.lookback_token_ids: CpuGpuBuffer | None = None
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
@@ -970,6 +987,9 @@ class NPUModelRunner(GPUModelRunner):
         if replayssm_sd_enabled(self.vllm_config):
             for req_id in scheduler_output.finished_req_ids:
                 self._replayssm_sd_deferred_state.pop(req_id, None)
+            assert self._replayssm_sd_ring_slots is not None
+            self._replayssm_sd_ring_slots.release(scheduler_output.finished_req_ids)
+            self._replayssm_sd_ring_slots.release(scheduler_output.preempted_req_ids or ())
             scheduled = scheduler_output.num_scheduled_tokens.keys()
             resumed = req_data.resumed_req_ids
             unscheduled = self.input_batch.req_id_to_index.keys() - (scheduled - resumed)
@@ -1015,6 +1035,8 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_block_copies=[],
             )
         sampling_metadata = super()._update_states(scheduler_output)
+        if self._replayssm_sd_ring_slots is not None:
+            self._replayssm_sd_ring_slots.assign(self.input_batch.req_id_to_index)
         self._track_tmp_encoder_cache_refs(scheduler_output)
         return sampling_metadata
 
@@ -3650,11 +3672,23 @@ class NPUModelRunner(GPUModelRunner):
             num_computed_tokens_cpu = None
 
         replayssm_decode_base_cpu = None
+        replayssm_sd_ring_slots_cpu = None
         if self.cache_config.use_replayssm or replayssm_sd_enabled(self.vllm_config):
             replayssm_decode_base_cpu = prepare_replayssm_decode_base_cpu(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded],
                 is_dummy_run=offload_dummy,
             )
+        if self._replayssm_sd_ring_slots is not None:
+            # Request IDs, unlike batch rows or physical KV blocks, remain
+            # stable when vLLM reorders the batch or copies a checkpoint.
+            assert self._replayssm_sd_ring_slots_cpu is not None
+            ring_ids = self._replayssm_sd_ring_slots_cpu[:num_reqs_padded]
+            ring_ids.zero_()
+            if not offload_dummy:
+                for req_id, row in self.input_batch.req_id_to_index.items():
+                    if row < num_reqs_padded:
+                        ring_ids[row] = self._replayssm_sd_ring_slots.slot_for(req_id)
+            replayssm_sd_ring_slots_cpu = ring_ids
 
         req_doc_ranges = None
         if self.is_mm_prefix_lm:
@@ -3706,6 +3740,7 @@ class NPUModelRunner(GPUModelRunner):
             _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             replayssm_decode_base_cpu=replayssm_decode_base_cpu,
+            replayssm_sd_ring_slots_cpu=replayssm_sd_ring_slots_cpu,
             # TODO
             seq_lens_cpu=seq_lens_cpu,
             # TODO
@@ -4420,6 +4455,17 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config=getattr(self, "kv_cache_config", None),
                 kv_caches=kv_caches,
             )
+            if self._replayssm_sd_ring_slots is not None:
+                report["independent_sd_ring"] = {
+                    "capacity": self._replayssm_sd_ring_slots.capacity,
+                    "active_request_slots": len(self._replayssm_sd_ring_slots),
+                    "allocated_bytes_per_rank": self._replayssm_sd_ring_bytes,
+                    "dtype": {"d": "float16", "k": "float16", "g": "float32"},
+                    "ring_len": replayssm_sd_ring_len(
+                        self.cache_config.replayssm_buffer_len,
+                        self.speculative_config.num_speculative_tokens,
+                    ),
+                }
             logger.info("REPLAYSSM_MEMORY_JSON %s", json.dumps(report, sort_keys=True))
         except Exception:
             logger.exception("ReplaySSM memory probe failed at %s", stage)
@@ -4636,6 +4682,54 @@ class NPUModelRunner(GPUModelRunner):
 
         self.debugger.step(**kwargs)
 
+    def initialize_replayssm_sd_ring(self) -> int:
+        """Reserve per-request d/k/g storage before KV block profiling.
+
+        The allocation is graph-stable and shared across all calls of each
+        GDN layer. It is intentionally outside the block-indexed Mamba spec.
+        """
+        slots = self._replayssm_sd_ring_slots
+        if slots is None or self._replayssm_sd_ring_bytes:
+            return self._replayssm_sd_ring_bytes
+        ring_len = replayssm_sd_ring_len(
+            self.cache_config.replayssm_buffer_len,
+            self.speculative_config.num_speculative_tokens,
+        )
+        total = 0
+        for module in self.model.modules():
+            if not getattr(module, "use_replayssm_sd", False):
+                continue
+            value_heads = module.num_v_heads // module.tp_size
+            key_heads = module.num_k_heads // module.tp_size
+            shapes = (
+                (slots.capacity + 1, value_heads, ring_len, module.head_v_dim),
+                (slots.capacity + 1, key_heads, ring_len, module.head_k_dim),
+                (slots.capacity + 1, value_heads, ring_len),
+            )
+            for name, shape, dtype in zip(
+                ("_replayssm_sd_d_ring", "_replayssm_sd_k_ring", "_replayssm_sd_g_ring"),
+                shapes,
+                (torch.float16, torch.float16, torch.float32),
+            ):
+                if name not in module._buffers:
+                    module.register_buffer(
+                        name,
+                        torch.empty(shape, dtype=dtype, device=module.A_log.device),
+                        persistent=False,
+                    )
+                tensor = module._buffers[name]
+                total += tensor.numel() * tensor.element_size()
+        if total == 0:
+            raise RuntimeError("ReplaySSM SD enabled, but no GDN layers were found for independent ring allocation")
+        self._replayssm_sd_ring_bytes = total
+        logger.info(
+            "ReplaySSM SD independent request ring: capacity=%d, bytes_per_rank=%d, layers=%d",
+            slots.capacity,
+            total,
+            sum(bool(getattr(m, "use_replayssm_sd", False)) for m in self.model.modules()),
+        )
+        return total
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -4650,6 +4744,7 @@ class NPUModelRunner(GPUModelRunner):
             KV backing allocations.
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        self.initialize_replayssm_sd_ring()
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None

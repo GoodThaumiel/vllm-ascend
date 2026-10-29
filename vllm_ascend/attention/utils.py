@@ -393,6 +393,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     copy_sfa_draft_index: int | None = None
     copy_sfa_restore_tails: bool = False
     offload_dummy: bool = False
+    # Stable request-owned SD ring ids, distinct from block-table ids.
+    replayssm_sd_ring_slots_cpu: torch.Tensor | None = None
 
     # vLLM main (#55353) removed the deprecated
     # CommonAttentionMetadata._seq_lens_cpu / _num_computed_tokens_cpu
@@ -417,6 +419,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             seq_lens_cpu=_slice_reqs(self.seq_lens_cpu),
             num_computed_tokens_cpu=_slice_reqs(self.num_computed_tokens_cpu),
             replayssm_decode_base_cpu=_slice_reqs(self.replayssm_decode_base_cpu),
+            replayssm_sd_ring_slots_cpu=_slice_reqs(self.replayssm_sd_ring_slots_cpu),
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,

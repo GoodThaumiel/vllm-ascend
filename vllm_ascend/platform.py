@@ -497,13 +497,18 @@ class NPUPlatform(Platform):
         # vLLM 0.30 validates use_replayssm + MTP as KDA RecoverSSM after
         # this platform hook. Keep the GDN SD opt-in separate from that flag;
         # the Ascend model/cache/runner paths read additional_config directly.
-        from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled, replayssm_sd_ring_len
+        from vllm_ascend.ops.replayssm.cache import (
+            replayssm_sd_enabled,
+            replayssm_sd_ring_capacity,
+            replayssm_sd_ring_len,
+        )
 
         if replayssm_sd_enabled(vllm_config):
             spec = vllm_config.speculative_config
             if spec is None:
                 raise ValueError("additional_config.replayssm_sd requires MTP3 speculative decoding")
             replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
+            replayssm_sd_ring_capacity(vllm_config)
             if getattr(spec, "method", None) != "mtp":
                 raise ValueError("Ascend ReplaySSM SD currently supports MTP3 only")
             if vllm_config.model_config.architecture not in (

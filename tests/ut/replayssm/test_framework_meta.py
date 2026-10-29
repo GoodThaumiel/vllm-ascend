@@ -131,6 +131,9 @@ class FrameworkMetaTests(unittest.TestCase):
         self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta")))
         for variant in range(14):
             self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta"), variant))
+        self.assertIsNone(
+            self.sd_wrapper(*self.sd_arguments("meta"), 13, self.torch.empty(2, dtype=self.torch.int32, device="meta"))
+        )
 
     def test_sd_fake_tensor_tracing_retains_operator(self):
         from torch.fx.experimental.proxy_tensor import make_fx
@@ -161,7 +164,8 @@ class FrameworkMetaTests(unittest.TestCase):
             1,
         ]
         schema = t.ops._C_ascend.replayssm_sd_compact_.default._schema
-        self.assertEqual(schema.arguments[-1].default_value, 1)
+        self.assertEqual(schema.arguments[-2].default_value, 1)
+        self.assertIsNone(schema.arguments[-1].default_value)
         self.assertEqual(
             [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write],
             [0, 8],

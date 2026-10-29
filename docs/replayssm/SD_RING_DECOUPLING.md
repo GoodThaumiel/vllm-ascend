@@ -1,5 +1,15 @@
 # ReplaySSM SD ring 与 GDN checkpoint 解耦评估
 
+## L3.8 实施状态（待 910B 上机验收）
+
+插件现已把 SD GDN `MambaSpec` 缩回 conv/checkpoint 两个分量，保持 `num_speculative_blocks=0`；NPU runner 在内存 profile 期间为每个 GDN 层单独分配 d/k/g ring。ring 槽由 request id 管理，默认容量取 `--max-num-seqs`，可用 `--additional-config '{"replayssm_sd":true,"replayssm_sd_ring_capacity":64}'` 固定为更大的整数；slot 0 为图捕获 dummy 保留。请求结束或明确抢占时释放，batch 行重排不改变槽号。verify/compact 分别接受 block slot 与 ring slot，cursor 只用 ring slot。
+
+容量为 32/64 时，按 TP4、48 层、每槽 132,608 B 计算，含 slot 0 的 ring 逻辑载荷约为 200/395 MiB 每 rank。该内存在 vLLM 确定 `num_gpu_blocks` 前计入非 KV profile；显式 `--kv-cache-memory` 属用户指定的 KV 预算，需额外留出 ring 物理内存。`REPLAYSSM_MEMORY_JSON.independent_sd_ring` 单独报告容量与分配字节。旧页式设计的 `num_blocks=1051` 对比 native `1315` 只能作为估算依据；实际页数与 32k/512 并发收益以 [L3.8 上机清单](checklists/LEVEL3_SD_INDEPENDENT_RING.md)为准。
+
+以当前 TP4/32k/512 的旧 Replay 实际并发 16 为锚，若独立 ring 后 `num_blocks` 从 1051 回到约 1200–1300、且 KV block 仍是主要限制，简单按块数比例估算可运行并发约 **18–20**（增加约 2–4 条）。这只是容量情景，不是性能承诺；混合 cache overlay、全注意力页数、调度和固定 ring 的实际物理占用都可能把收益压低。尤其要用实际 running/waiting 和吞吐验收，而不是只用估算值。
+
+当前实现限定已有的 MTP3、PP1、V1 runner、`mamba-cache-mode none`。L3.7 的数值精度口径保持不变，未借此修复 BF16/FP16 敏感 token 的分叉。
+
 ## 当前问题
 
 当前 d/k/g ring 是 `MambaSpec.shapes` 的第 3–5 个分量，跟 conv/checkpoint 一起占用**每个可分配 GDN block**。TP4 的 Qwen GDN 每层每 block 的 ring 逻辑载荷为 d `12×32×128×2=98,304 B`、k `4×32×128×2=32,768 B`、g `12×32×4=1,536 B`，合计 **132,608 B（129.5 KiB）**。48 个 GDN 层时，每个 ring 槽约 **6.07 MiB**。上一轮相同 KV 预算下，native `num_blocks=1315`，当前 Replay `1051`；页变大导致可分配 block 数减少约 20%。混合 cache group 可 overlay，不能将这个逻辑载荷直接当作净 HBM 差额。
@@ -12,7 +22,7 @@
 
 按 48 层估算，32/64 个活跃请求槽的 ring 逻辑载荷约为 **194/389 MiB**。这是 ring 自身容量估算，不是预计净显存节省或吞吐提升：分配器会把释放的预算变成更多 KV block，最终收益要看 full-attention 与 GDN 哪一组先限制可运行请求数。
 
-## 实施门槛
+## 历史评估门槛（L3.8 实施前）
 
 1. 先完成 L3.7 数值定位与单物理 block 的 serve 稳定性；当前分叉不能带入新生命周期重构。
 2. 增加 request-id→ring-slot 的分配/释放与抢占/重排测试；验证混合 batch、padding、取消请求、block 回收、图 replay 和 32/64 并发。

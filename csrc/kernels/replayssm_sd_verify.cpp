@@ -26,9 +26,10 @@ template <int VARIANT>
 class ReplaySDVerify {
  public:
   __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
-                              GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR positions,
+                              GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR ringSlots, GM_ADDR positions,
                               GM_ADDR bases, GM_ADDR lengths, GM_ADDR out, GM_ADDR status, uint32_t batch,
-                              uint32_t numSlots, uint32_t heads, uint32_t valueHeads, uint32_t ringLen,
+                              uint32_t numSlots, uint32_t numRingSlots, uint32_t heads, uint32_t valueHeads,
+                              uint32_t ringLen,
                               uint64_t checkpointSlotStride, uint64_t dSlotStride, uint64_t kSlotStride,
                               uint64_t gSlotStride, uint32_t tileV, float scale) {
     q_.SetGlobalBuffer((__gm__ bfloat16_t*)q);
@@ -41,6 +42,7 @@ class ReplaySDVerify {
     kCache_.SetGlobalBuffer((__gm__ half*)kCache);
     gCache_.SetGlobalBuffer((__gm__ float*)gCache);
     slots_.SetGlobalBuffer((__gm__ int32_t*)slots);
+    ringSlots_.SetGlobalBuffer((__gm__ int32_t*)ringSlots);
     positions_.SetGlobalBuffer((__gm__ int32_t*)positions);
     bases_.SetGlobalBuffer((__gm__ int32_t*)bases);
     lengths_.SetGlobalBuffer((__gm__ int32_t*)lengths);
@@ -48,6 +50,7 @@ class ReplaySDVerify {
     status_.SetGlobalBuffer((__gm__ int32_t*)status);
     batch_ = batch;
     numSlots_ = numSlots;
+    numRingSlots_ = numRingSlots;
     heads_ = heads;
     valueHeads_ = valueHeads;
     ringLen_ = ringLen;
@@ -163,6 +166,7 @@ class ReplaySDVerify {
       const uint32_t vStart = (task % tiles_) * tileV_;
       const uint32_t keyHead = head / (valueHeads_ / heads_);
       const int32_t slot = ReadInt(slots_, row);
+      const int32_t ringSlot = ReadInt(ringSlots_, row);
       const int32_t pos = ReadInt(positions_, row);
       const int32_t base = ReadInt(bases_, row);
       const int32_t length = ReadInt(lengths_, row);
@@ -173,6 +177,8 @@ class ReplaySDVerify {
         if (pos != 0 || base != 0 || length != 0) {
           error = 4;
         }
+      } else if (ringSlot < 0 || ringSlot >= static_cast<int32_t>(numRingSlots_)) {
+        error = 5;
       } else if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY) || length < 1 ||
                  length > static_cast<int32_t>(MAX_TOKENS) || pos + length > static_cast<int32_t>(MAX_WINDOW) ||
                  pos + length > static_cast<int32_t>(ringLen_)) {
@@ -192,11 +198,11 @@ class ReplaySDVerify {
 
       const uint64_t stateOffset = static_cast<uint64_t>(slot) * checkpointStride_ +
                                    static_cast<uint64_t>(head) * V_DIM * K_DIM + vStart * K_DIM;
-      const uint64_t dOffset = static_cast<uint64_t>(slot) * dStride_ +
+      const uint64_t dOffset = static_cast<uint64_t>(ringSlot) * dStride_ +
                                static_cast<uint64_t>(head) * ringLen_ * V_DIM;
-      const uint64_t kOffset = static_cast<uint64_t>(slot) * kStride_ +
+      const uint64_t kOffset = static_cast<uint64_t>(ringSlot) * kStride_ +
                                static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
-      const uint64_t gOffset = static_cast<uint64_t>(slot) * gStride_ +
+      const uint64_t gOffset = static_cast<uint64_t>(ringSlot) * gStride_ +
                                static_cast<uint64_t>(head) * ringLen_;
       Load(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
       float historyAlpha[MAX_HISTORY];
@@ -329,6 +335,7 @@ class ReplaySDVerify {
       const uint32_t head = task % valueHeads_;
       const uint32_t keyHead = head / (valueHeads_ / heads_);
       const int32_t slot = ReadInt(slots_, row);
+      const int32_t ringSlot = ReadInt(ringSlots_, row);
       const int32_t pos = ReadInt(positions_, row);
       const int32_t base = ReadInt(bases_, row);
       const int32_t length = ReadInt(lengths_, row);
@@ -339,6 +346,8 @@ class ReplaySDVerify {
         if (pos != 0 || base != 0 || length != 0) {
           error = 4;
         }
+      } else if (ringSlot < 0 || ringSlot >= static_cast<int32_t>(numRingSlots_)) {
+        error = 5;
       } else if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY) || length < 1 ||
                  length > static_cast<int32_t>(MAX_TOKENS) || pos + length > static_cast<int32_t>(MAX_WINDOW) ||
                  pos + length > static_cast<int32_t>(ringLen_)) {
@@ -358,11 +367,11 @@ class ReplaySDVerify {
         continue;
       }
 
-      const uint64_t dOffset = static_cast<uint64_t>(slot) * dStride_ +
+      const uint64_t dOffset = static_cast<uint64_t>(ringSlot) * dStride_ +
                                static_cast<uint64_t>(head) * ringLen_ * V_DIM;
-      const uint64_t kOffset = static_cast<uint64_t>(slot) * kStride_ +
+      const uint64_t kOffset = static_cast<uint64_t>(ringSlot) * kStride_ +
                                static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
-      const uint64_t gOffset = static_cast<uint64_t>(slot) * gStride_ +
+      const uint64_t gOffset = static_cast<uint64_t>(ringSlot) * gStride_ +
                                static_cast<uint64_t>(head) * ringLen_;
       const uint64_t stateOffset = static_cast<uint64_t>(slot) * checkpointStride_ +
                                    static_cast<uint64_t>(head) * V_DIM * K_DIM;
@@ -954,8 +963,8 @@ class ReplaySDVerify {
   GlobalTensor<bfloat16_t> q_, k_, v_, checkpoint_, out_;
   GlobalTensor<half> dCache_, kCache_;
   GlobalTensor<float> g_, beta_, gCache_;
-  GlobalTensor<int32_t> slots_, positions_, bases_, lengths_, status_;
-  uint32_t batch_, numSlots_, heads_, valueHeads_, ringLen_, tileV_, tiles_;
+  GlobalTensor<int32_t> slots_, ringSlots_, positions_, bases_, lengths_, status_;
+  uint32_t batch_, numSlots_, numRingSlots_, heads_, valueHeads_, ringLen_, tileV_, tiles_;
   uint64_t checkpointStride_, dStride_, kStride_, gStride_;
   float scale_;
 };
@@ -964,14 +973,14 @@ class ReplaySDVerify {
 #ifndef REPLAY_SD_NO_ENTRY
 extern "C" __global__ __aicore__ void replayssm_sd_verify(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint, GM_ADDR dCache,
-    GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR positions, GM_ADDR bases, GM_ADDR lengths,
-    GM_ADDR out, GM_ADDR status, uint32_t batch, uint32_t numSlots, uint32_t heads, uint32_t valueHeads,
+    GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR ringSlots, GM_ADDR positions, GM_ADDR bases, GM_ADDR lengths,
+    GM_ADDR out, GM_ADDR status, uint32_t batch, uint32_t numSlots, uint32_t numRingSlots, uint32_t heads, uint32_t valueHeads,
     uint32_t ringLen, uint64_t checkpointSlotStride, uint64_t dSlotStride, uint64_t kSlotStride,
     uint64_t gSlotStride, uint32_t tileV, float scale) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   ReplaySDVerify<0> op;
-  op.Init(q, k, v, g, beta, checkpoint, dCache, kCache, gCache, slots, positions, bases, lengths, out,
-          status, batch, numSlots, heads, valueHeads, ringLen, checkpointSlotStride, dSlotStride,
+  op.Init(q, k, v, g, beta, checkpoint, dCache, kCache, gCache, slots, ringSlots, positions, bases, lengths, out,
+          status, batch, numSlots, numRingSlots, heads, valueHeads, ringLen, checkpointSlotStride, dSlotStride,
           kSlotStride, gSlotStride, tileV, scale);
   op.Process();
 }

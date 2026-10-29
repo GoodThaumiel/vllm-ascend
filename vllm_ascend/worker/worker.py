@@ -95,6 +95,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -576,6 +577,10 @@ class NPUWorker(WorkerBase):
         # --kv-cache-memory. Still run profile_run() to compile the model,
         # but skip the memory profiling calculation entirely.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            # The explicit KV budget remains caller-owned; request rings use
+            # additional physical HBM and are reported separately.
+            if replayssm_sd_enabled(self.vllm_config):
+                self.model_runner.initialize_replayssm_sd_ring()
             self.model_runner.profile_run()
             logger.info(
                 "Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache "
@@ -598,6 +603,10 @@ class NPUWorker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            # Allocate inside profiling so the independent request ring is
+            # counted in non-KV memory before vLLM sizes its KV blocks.
+            if replayssm_sd_enabled(self.vllm_config):
+                self.model_runner.initialize_replayssm_sd_ring()
             self.model_runner.profile_run()
 
             # Record torch peak INSIDE the context and BEFORE graph capture,

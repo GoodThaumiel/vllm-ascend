@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import heapq
+
 import torch
 
 REPLAYSSM_AR_MAX_BUFFER_LEN = 64
@@ -24,6 +26,55 @@ def replayssm_sd_enabled(vllm_config) -> bool:
     if isinstance(value, str) and value.lower() in ("true", "false"):
         return value.lower() == "true"
     raise ValueError("additional_config.replayssm_sd must be a boolean")
+
+
+def replayssm_sd_ring_capacity(vllm_config) -> int:
+    """Number of request-owned ring slots, excluding reserved slot zero."""
+    max_seqs = vllm_config.scheduler_config.max_num_seqs
+    value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd_ring_capacity", max_seqs)
+    if isinstance(value, bool) or not isinstance(value, int) or value < max_seqs:
+        raise ValueError(
+            "additional_config.replayssm_sd_ring_capacity must be an integer "
+            f">= max_num_seqs ({max_seqs})"
+        )
+    return value
+
+
+class ReplaySSMSDRingSlots:
+    """Stable request identities for a fixed, request-owned ring allocation."""
+
+    def __init__(self, capacity: int):
+        if capacity < 1:
+            raise ValueError("ReplaySSM SD ring capacity must be positive")
+        self.capacity = capacity
+        self._free = list(range(1, capacity + 1))
+        heapq.heapify(self._free)
+        self._by_request: dict[str, int] = {}
+
+    def release(self, req_ids) -> None:
+        for req_id in req_ids:
+            slot = self._by_request.pop(req_id, None)
+            if slot is not None:
+                heapq.heappush(self._free, slot)
+
+    def assign(self, req_ids) -> None:
+        new_ids = [req_id for req_id in dict.fromkeys(req_ids) if req_id not in self._by_request]
+        if len(new_ids) > len(self._free):
+            raise RuntimeError(
+                "ReplaySSM SD ring slots exhausted; increase "
+                "additional_config.replayssm_sd_ring_capacity"
+            )
+        for req_id in new_ids:
+            self._by_request[req_id] = heapq.heappop(self._free)
+
+    def slots_for(self, req_ids: list[str]) -> list[int]:
+        return [self._by_request[req_id] for req_id in req_ids]
+
+    def slot_for(self, req_id: str) -> int:
+        return self._by_request[req_id]
+
+    def __len__(self) -> int:
+        return len(self._by_request)
 
 
 def replayssm_gdn_enabled(vllm_config) -> bool:

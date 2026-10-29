@@ -334,6 +334,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if not (self.cache_config.use_replayssm or getattr(self, "use_replayssm_sd", False)):
             return base_shapes
+        if getattr(self, "use_replayssm_sd", False):
+            replayssm_sd_ring_len(self.cache_config.replayssm_buffer_len, self.num_spec)
+            return base_shapes
         buffer_len = self.cache_config.replayssm_buffer_len
         if self.num_spec > 0:
             buffer_len = replayssm_sd_ring_len(buffer_len, self.num_spec)
@@ -351,6 +354,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.cache_config.mamba_ssm_cache_dtype,
         )
         if not (self.cache_config.use_replayssm or getattr(self, "use_replayssm_sd", False)):
+            return base_dtypes
+        if getattr(self, "use_replayssm_sd", False):
+            append_gdn_replayssm_ar_dtypes(base_dtypes, self.model_config.dtype)
             return base_dtypes
         return append_gdn_replayssm_ar_dtypes(
             base_dtypes,
@@ -458,7 +464,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         beta: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
     ) -> torch.Tensor:
-        slots = attn_metadata.replayssm_sd_slots
+        slots = attn_metadata.replayssm_sd_block_slots
+        ring_slots = attn_metadata.replayssm_sd_ring_slots
         positions = attn_metadata.replayssm_sd_positions
         bases = attn_metadata.replayssm_sd_bases
         flush = attn_metadata.replayssm_sd_flush
@@ -489,9 +496,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             gate,
             rate,
             self.kv_cache[1],
-            self.kv_cache[2],
-            self.kv_cache[3],
-            self.kv_cache[4],
+            self._replayssm_sd_d_ring,
+            self._replayssm_sd_k_ring,
+            self._replayssm_sd_g_ring,
             slots,
             positions,
             bases,
@@ -502,12 +509,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             REPLAYSSM_SD_VERIFY_TILE_V,
             40,
             REPLAYSSM_SD_VERIFY_VARIANT,
+            ring_slots,
         )
         replayssm_sd_compact(
             self.kv_cache[1],
-            self.kv_cache[2],
-            self.kv_cache[3],
-            self.kv_cache[4],
+            self._replayssm_sd_d_ring,
+            self._replayssm_sd_k_ring,
+            self._replayssm_sd_g_ring,
             slots,
             positions,
             bases,
@@ -516,6 +524,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             REPLAYSSM_AR_TILE_V,
             40,
             1,
+            ring_slots,
         )
         return output.view(batch * max_tokens, value_heads, self.head_v_dim).index_select(0, pack).unsqueeze(0)
 

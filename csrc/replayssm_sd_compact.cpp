@@ -16,30 +16,38 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
                           const at::Tensor& slots, const at::Tensor& positions,
                           const at::Tensor& bases, const at::Tensor& flush,
                           const at::Tensor& status, int64_t tile_v, int64_t cores,
-                          int64_t variant) {
+                          int64_t variant, c10::optional<at::Tensor> ring_slots) {
+  const at::Tensor& ring_ids = ring_slots.has_value() ? *ring_slots : slots;
   TORCH_CHECK(checkpoint.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& t : {d_cache, k_cache, g_cache, slots, positions, bases, flush, status}) {
     TORCH_CHECK(t.device() == checkpoint.device(), "All tensors must be on one NPU");
   }
+  TORCH_CHECK(ring_ids.device() == checkpoint.device() &&
+                  (ring_ids.is_contiguous() || (variant == 4 && ring_ids.stride(0) == 4)) &&
+                  ring_ids.scalar_type() == at::kInt && ring_ids.dim() == 1 &&
+                  ring_ids.numel() == slots.numel(),
+              "ring_slots must be contiguous int32[B] on the same NPU");
   TORCH_CHECK(checkpoint.dim() == 4 && checkpoint.size(0) > 1 && checkpoint.size(2) == 128 &&
                   checkpoint.size(3) == 128 && checkpoint.scalar_type() == at::kBFloat16,
               "checkpoint must be BF16[slots,HV,128,128]");
   const int64_t num_slots = checkpoint.size(0);
   const int64_t value_heads = checkpoint.size(1);
-  TORCH_CHECK(d_cache.dim() == 4 && d_cache.size(0) == num_slots &&
+  TORCH_CHECK(d_cache.dim() == 4, "d_cache must be a rank-4 ring tensor");
+  const int64_t num_ring_slots = d_cache.size(0);
+  TORCH_CHECK(num_ring_slots > 1 &&
                   d_cache.size(1) == value_heads && d_cache.size(3) == 128 &&
                   d_cache.scalar_type() == at::kHalf,
               "d_cache must be FP16[slots,HV,R,128]");
   const int64_t ring_len = d_cache.size(2);
   TORCH_CHECK(ring_len == 16 || ring_len == 32 || ring_len == 64, "R must be 16/32/64");
-  TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(0) == num_slots &&
+  TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(0) == num_ring_slots &&
                   k_cache.size(2) == ring_len && k_cache.size(3) == 128 &&
                   k_cache.scalar_type() == at::kHalf,
               "k_cache must be FP16[slots,H,R,128]");
   const int64_t heads = k_cache.size(1);
   TORCH_CHECK(heads > 0 && value_heads > 0 && value_heads % heads == 0,
               "Invalid head geometry");
-  TORCH_CHECK(g_cache.sizes() == at::IntArrayRef({num_slots, value_heads, ring_len}) &&
+  TORCH_CHECK(g_cache.sizes() == at::IntArrayRef({num_ring_slots, value_heads, ring_len}) &&
                   g_cache.scalar_type() == at::kFloat,
               "g_cache must be FP32[slots,HV,R]");
   TORCH_CHECK(checkpoint.stride(3) == 1 && checkpoint.stride(2) == 128 &&
@@ -79,6 +87,8 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
               "status must be contiguous int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
   TORCH_CHECK(variant >= 0 && variant <= 4, "variant must be 0..4");
+  TORCH_CHECK(variant != 4 || !ring_slots.has_value(),
+              "variant 4 packed metadata does not support independent ring slots");
   TORCH_CHECK(variant == 0 || (value_heads * (128 / tile_v)) % 8 == 0,
               "optimized compact requires a 32-byte aligned status row");
   TORCH_CHECK(variant == 0 || value_heads * (128 / tile_v) * sizeof(int32_t) <=
@@ -90,9 +100,9 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
   const int64_t active_tasks = (variant == 1 || variant >= 3) ? batch * value_heads : tasks;
   const auto result = aclrtlaunch_replayssm_sd_compact(
       static_cast<uint32_t>(std::min(cores, active_tasks)), stream, checkpoint.data_ptr(),
-      d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(), slots.data_ptr(),
+      d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(), slots.data_ptr(), ring_ids.data_ptr(),
       positions.data_ptr(), bases.data_ptr(), flush.data_ptr(), status.data_ptr(),
-      static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots),
+      static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots), static_cast<uint32_t>(num_ring_slots),
       static_cast<uint32_t>(heads), static_cast<uint32_t>(value_heads),
       static_cast<uint32_t>(ring_len), static_cast<uint64_t>(checkpoint.stride(0)),
       static_cast<uint64_t>(d_cache.stride(0)), static_cast<uint64_t>(k_cache.stride(0)),

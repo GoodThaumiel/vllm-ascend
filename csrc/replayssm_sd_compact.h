@@ -3,11 +3,12 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <c10/util/Optional.h>
 
 #define VLLM_ASCEND_REPLAYSSM_SD_COMPACT_SCHEMA                                               \
   "(Tensor(a!) checkpoint, Tensor d_cache, Tensor k_cache, Tensor g_cache, Tensor slots, "   \
   "Tensor positions, Tensor bases, Tensor flush, Tensor(b!) status, int tile_v=32, "         \
-  "int cores=40, int variant=1) -> ()"
+  "int cores=40, int variant=1, Tensor? ring_slots=None) -> ()"
 
 namespace vllm_ascend {
 void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
@@ -15,10 +16,10 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
                           const at::Tensor& slots, const at::Tensor& positions,
                           const at::Tensor& bases, const at::Tensor& flush,
                           const at::Tensor& status, int64_t tile_v, int64_t cores,
-                          int64_t variant);
+                          int64_t variant, c10::optional<at::Tensor> ring_slots);
 
 inline void replayssm_sd_compact_meta(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                       const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                       const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t,
-                                      int64_t, int64_t) {}
+                                      int64_t, int64_t, c10::optional<at::Tensor>) {}
 }  // namespace vllm_ascend

@@ -37,13 +37,17 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
             const at::Tensor& k_cache, const at::Tensor& g_cache, const at::Tensor& slots,
             const at::Tensor& positions, const at::Tensor& bases, const at::Tensor& lengths,
             const at::Tensor& out, const at::Tensor& status, double scale, int64_t tile_v, int64_t cores,
-            int64_t variant) {
+            int64_t variant, c10::optional<at::Tensor> ring_slots) {
+  const at::Tensor& ring_ids = ring_slots.has_value() ? *ring_slots : slots;
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   const std::vector<at::Tensor> tensors = {q,      k,         v,      g,      beta,   checkpoint, d_cache,
                                             k_cache, g_cache,   slots,  positions, bases,  lengths,    out, status};
   for (const auto& t : tensors) {
     TORCH_CHECK(t.device() == q.device(), "All tensors must be on one NPU");
   }
+  TORCH_CHECK(ring_ids.device() == q.device() && ring_ids.is_contiguous() &&
+                  ring_ids.scalar_type() == at::kInt && ring_ids.dim() == 1 &&
+                  ring_ids.numel() == q.size(0), "ring_slots must be contiguous int32[B] on the same NPU");
   for (size_t i : {0u, 1u, 2u, 3u, 4u, 9u, 10u, 11u, 12u, 13u, 14u}) {
     TORCH_CHECK(tensors[i].is_contiguous(), "Non-cache tensors must be contiguous");
   }
@@ -61,13 +65,15 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
                   checkpoint.size(2) == K_DIM && checkpoint.size(3) == K_DIM,
               "checkpoint must be [slots,HV,128,128]");
   const int64_t num_slots = checkpoint.size(0);
-  TORCH_CHECK(d_cache.dim() == 4 && d_cache.size(0) == num_slots && d_cache.size(1) == value_heads &&
+  TORCH_CHECK(d_cache.dim() == 4, "d_cache must be a rank-4 ring tensor");
+  const int64_t num_ring_slots = d_cache.size(0);
+  TORCH_CHECK(num_ring_slots > 1 && d_cache.size(1) == value_heads &&
                   d_cache.size(3) == K_DIM,
               "d_cache must be [slots,HV,R,128]");
   const int64_t ring_len = d_cache.size(2);
   TORCH_CHECK(ring_len == 16 || ring_len == 32 || ring_len == 64, "R must be 16/32/64");
-  TORCH_CHECK(k_cache.sizes() == at::IntArrayRef({num_slots, heads, ring_len, K_DIM}) &&
-                  g_cache.sizes() == at::IntArrayRef({num_slots, value_heads, ring_len}),
+  TORCH_CHECK(k_cache.sizes() == at::IntArrayRef({num_ring_slots, heads, ring_len, K_DIM}) &&
+                  g_cache.sizes() == at::IntArrayRef({num_ring_slots, value_heads, ring_len}),
               "k/g cache shape mismatch");
   TORCH_CHECK(checkpoint.stride(3) == 1 && checkpoint.stride(2) == K_DIM &&
                   checkpoint.stride(1) == K_DIM * K_DIM &&
@@ -112,9 +118,9 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
 #define REPLAY_SD_LAUNCH_ARGS                                                                       \
   block_dim, stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(),        \
       checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(),             \
-      slots.data_ptr(), positions.data_ptr(), bases.data_ptr(), lengths.data_ptr(),                  \
+      slots.data_ptr(), ring_ids.data_ptr(), positions.data_ptr(), bases.data_ptr(), lengths.data_ptr(), \
       out.data_ptr(), status.data_ptr(), static_cast<uint32_t>(batch),                                \
-      static_cast<uint32_t>(num_slots), static_cast<uint32_t>(heads),                                 \
+      static_cast<uint32_t>(num_slots), static_cast<uint32_t>(num_ring_slots), static_cast<uint32_t>(heads), \
       static_cast<uint32_t>(value_heads), static_cast<uint32_t>(ring_len),                            \
       static_cast<uint64_t>(checkpoint.stride(0)), static_cast<uint64_t>(d_cache.stride(0)),          \
       static_cast<uint64_t>(k_cache.stride(0)), static_cast<uint64_t>(g_cache.stride(0)),             \

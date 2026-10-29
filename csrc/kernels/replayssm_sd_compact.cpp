@@ -18,8 +18,8 @@ constexpr uint32_t FP32_BLOCK = 8;
 class ReplaySDCompact {
  public:
   __aicore__ inline void Init(GM_ADDR checkpoint, GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache,
-                              GM_ADDR slots, GM_ADDR positions, GM_ADDR bases, GM_ADDR flush,
-                              GM_ADDR status, uint32_t batch, uint32_t numSlots, uint32_t heads,
+                              GM_ADDR slots, GM_ADDR ringSlots, GM_ADDR positions, GM_ADDR bases, GM_ADDR flush,
+                              GM_ADDR status, uint32_t batch, uint32_t numSlots, uint32_t numRingSlots, uint32_t heads,
                               uint32_t valueHeads, uint32_t ringLen, uint64_t checkpointStride,
                               uint64_t dStride, uint64_t kStride, uint64_t gStride, uint32_t tileV,
                               uint32_t variant) {
@@ -28,12 +28,14 @@ class ReplaySDCompact {
     kCache_.SetGlobalBuffer((__gm__ half*)kCache);
     gCache_.SetGlobalBuffer((__gm__ float*)gCache);
     slots_.SetGlobalBuffer((__gm__ int32_t*)slots);
+    ringSlots_.SetGlobalBuffer((__gm__ int32_t*)ringSlots);
     positions_.SetGlobalBuffer((__gm__ int32_t*)positions);
     bases_.SetGlobalBuffer((__gm__ int32_t*)bases);
     flush_.SetGlobalBuffer((__gm__ int32_t*)flush);
     status_.SetGlobalBuffer((__gm__ int32_t*)status);
     batch_ = batch;
     numSlots_ = numSlots;
+    numRingSlots_ = numRingSlots;
     heads_ = heads;
     valueHeads_ = valueHeads;
     ringLen_ = ringLen;
@@ -87,12 +89,15 @@ class ReplaySDCompact {
   }
 
  private:
-  __aicore__ inline int32_t Validate(int32_t slot, int32_t pos, int32_t base, int32_t flush) {
+  __aicore__ inline int32_t Validate(int32_t slot, int32_t ringSlot, int32_t pos, int32_t base, int32_t flush) {
     if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
       return 1;
     }
     if (slot == 0) {
       return (pos != 0 || base != 0 || flush != 0) ? 4 : 0;
+    }
+    if (flush != 0 && (ringSlot < 0 || ringSlot >= static_cast<int32_t>(numRingSlots_))) {
+      return 6;
     }
     if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY)) {
       return 2;
@@ -110,12 +115,13 @@ class ReplaySDCompact {
       const int32_t pos = ReadInt(positions_, row);
       const int32_t base = ReadInt(bases_, row);
       const int32_t flush = ReadInt(flush_, row);
-      const int32_t error = Validate(slot, pos, base, flush);
+      const int32_t ringSlot = flush == 0 ? 0 : ReadInt(ringSlots_, row);
+      const int32_t error = Validate(slot, ringSlot, pos, base, flush);
       if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
         WriteStatus(task, error);
         continue;
       }
-      Fold(task, slot, pos, base);
+      Fold(task, slot, ringSlot, pos, base);
     }
   }
 
@@ -135,7 +141,8 @@ class ReplaySDCompact {
       const int32_t slot = ReadInt(slots_, row);
       const int32_t pos = ReadInt(positions_, row);
       const int32_t base = ReadInt(bases_, row);
-      const int32_t error = Validate(slot, pos, base, flush);
+      const int32_t ringSlot = flush == 0 ? 0 : ReadInt(ringSlots_, row);
+      const int32_t error = Validate(slot, ringSlot, pos, base, flush);
       if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
         if (head == 0) {
           WriteStatusSpan(row * rowTasks, rowTasks, error);
@@ -143,13 +150,14 @@ class ReplaySDCompact {
         continue;
       }
       for (uint32_t tile = 0; tile < tiles_; ++tile) {
-        Fold(group * tiles_ + tile, slot, pos, base);
+        Fold(group * tiles_ + tile, slot, ringSlot, pos, base);
       }
     }
   }
 
   struct Metadata {
     int32_t slot;
+    int32_t ringSlot;
     int32_t pos;
     int32_t base;
     int32_t flush;
@@ -177,7 +185,8 @@ class ReplaySDCompact {
         md.pos = ReadIntLight(positions_, row);
         md.base = ReadIntLight(bases_, row);
       }
-      const int32_t error = Validate(md.slot, md.pos, md.base, md.flush);
+      md.ringSlot = md.flush == 0 ? 0 : ReadIntLight(ringSlots_, variant_ == 4 ? row * 4 : row);
+      const int32_t error = Validate(md.slot, md.ringSlot, md.pos, md.base, md.flush);
       if (error != 0 || md.slot == 0 || md.flush == 0 || md.pos == 0) {
         if (head == 0) {
           WriteStatusSpanLight(row * rowTasks, rowTasks, error);
@@ -189,7 +198,7 @@ class ReplaySDCompact {
         heavyReady_ = true;
       }
       for (uint32_t tile = 0; tile < tiles_; ++tile) {
-        Fold(group * tiles_ + tile, md.slot, md.pos, md.base);
+        Fold(group * tiles_ + tile, md.slot, md.ringSlot, md.pos, md.base);
       }
     }
   }
@@ -207,26 +216,27 @@ class ReplaySDCompact {
       const int32_t slot = ReadInt(slots_, row);
       const int32_t pos = ReadInt(positions_, row);
       const int32_t base = ReadInt(bases_, row);
-      const int32_t error = Validate(slot, pos, base, flush);
+      const int32_t ringSlot = flush == 0 ? 0 : ReadInt(ringSlots_, row);
+      const int32_t error = Validate(slot, ringSlot, pos, base, flush);
       if (flush == 0) {
         WriteStatusSpan(row * rowTasks, rowTasks, error);
       } else if (error != 0 || slot == 0 || pos == 0) {
         WriteStatus(task, error);
       } else {
-        Fold(task, slot, pos, base);
+        Fold(task, slot, ringSlot, pos, base);
       }
     }
   }
 
-  __aicore__ inline void Fold(uint32_t task, int32_t slot, int32_t pos, int32_t base) {
+  __aicore__ inline void Fold(uint32_t task, int32_t slot, int32_t ringSlot, int32_t pos, int32_t base) {
     const uint32_t head = (task / tiles_) % valueHeads_;
     const uint32_t vStart = (task % tiles_) * tileV_;
     const uint32_t keyHead = head / (valueHeads_ / heads_);
     const uint64_t stateOffset =
         static_cast<uint64_t>(slot) * checkpointStride_ + static_cast<uint64_t>(head) * V_DIM * K_DIM + vStart * K_DIM;
-    const uint64_t dOffset = static_cast<uint64_t>(slot) * dStride_ + static_cast<uint64_t>(head) * ringLen_ * V_DIM;
-    const uint64_t kOffset = static_cast<uint64_t>(slot) * kStride_ + static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
-    const uint64_t gOffset = static_cast<uint64_t>(slot) * gStride_ + static_cast<uint64_t>(head) * ringLen_;
+    const uint64_t dOffset = static_cast<uint64_t>(ringSlot) * dStride_ + static_cast<uint64_t>(head) * ringLen_ * V_DIM;
+    const uint64_t kOffset = static_cast<uint64_t>(ringSlot) * kStride_ + static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
+    const uint64_t gOffset = static_cast<uint64_t>(ringSlot) * gStride_ + static_cast<uint64_t>(head) * ringLen_;
     Load(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
     for (int32_t i = 0; i < pos; ++i) {
       const uint32_t phys = (static_cast<uint32_t>(base) + static_cast<uint32_t>(i)) & (ringLen_ - 1);
@@ -339,7 +349,7 @@ class ReplaySDCompact {
     input = metaIn_.DeQue<int32_t>();
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    Metadata md{input.GetValue(0), input.GetValue(1), input.GetValue(2), input.GetValue(3)};
+    Metadata md{input.GetValue(0), 0, input.GetValue(1), input.GetValue(2), input.GetValue(3)};
     SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
     metaIn_.FreeTensor(input);
@@ -399,23 +409,23 @@ class ReplaySDCompact {
   GlobalTensor<bfloat16_t> checkpoint_;
   GlobalTensor<half> dCache_, kCache_;
   GlobalTensor<float> gCache_;
-  GlobalTensor<int32_t> slots_, positions_, bases_, flush_, status_;
-  uint32_t batch_, numSlots_, heads_, valueHeads_, ringLen_, tileV_, tiles_, variant_;
+  GlobalTensor<int32_t> slots_, ringSlots_, positions_, bases_, flush_, status_;
+  uint32_t batch_, numSlots_, numRingSlots_, heads_, valueHeads_, ringLen_, tileV_, tiles_, variant_;
   bool heavyReady_;
   uint64_t checkpointStride_, dStride_, kStride_, gStride_;
 };
 }  // namespace
 
 extern "C" __global__ __aicore__ void replayssm_sd_compact(
-    GM_ADDR checkpoint, GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots,
+    GM_ADDR checkpoint, GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR ringSlots,
     GM_ADDR positions, GM_ADDR bases, GM_ADDR flush, GM_ADDR status, uint32_t batch,
-    uint32_t numSlots, uint32_t heads, uint32_t valueHeads, uint32_t ringLen,
+    uint32_t numSlots, uint32_t numRingSlots, uint32_t heads, uint32_t valueHeads, uint32_t ringLen,
     uint64_t checkpointStride, uint64_t dStride, uint64_t kStride, uint64_t gStride,
     uint32_t tileV, uint32_t variant) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   ReplaySDCompact op;
-  op.Init(checkpoint, dCache, kCache, gCache, slots, positions, bases, flush, status, batch,
-          numSlots, heads, valueHeads, ringLen, checkpointStride, dStride, kStride, gStride, tileV,
+  op.Init(checkpoint, dCache, kCache, gCache, slots, ringSlots, positions, bases, flush, status, batch,
+          numSlots, numRingSlots, heads, valueHeads, ringLen, checkpointStride, dStride, kStride, gStride, tileV,
           variant);
   op.Process(variant);
 }

@@ -57,6 +57,25 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
             config.additional_config["replayssm_sd"] = "enabled"
             CACHE.replayssm_sd_enabled(config)
 
+    def test_request_ring_slots_survive_reorder_and_reuse_after_release(self) -> None:
+        slots = CACHE.ReplaySSMSDRingSlots(2)
+        slots.assign(["first", "second"])
+        self.assertEqual(slots.slots_for(["second", "first"]), [2, 1])
+        slots.release(["first"])
+        slots.assign(["third"])
+        self.assertEqual(slots.slots_for(["second", "third"]), [2, 1])
+        with self.assertRaisesRegex(RuntimeError, "ring slots exhausted"):
+            slots.assign(["fourth"])
+
+    def test_sd_ring_capacity_defaults_to_max_num_seqs(self) -> None:
+        config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=64), additional_config={})
+        self.assertEqual(CACHE.replayssm_sd_ring_capacity(config), 64)
+        config.additional_config["replayssm_sd_ring_capacity"] = 96
+        self.assertEqual(CACHE.replayssm_sd_ring_capacity(config), 96)
+        config.additional_config["replayssm_sd_ring_capacity"] = 32
+        with self.assertRaisesRegex(ValueError, ">= max_num_seqs"):
+            CACHE.replayssm_sd_ring_capacity(config)
+
     def test_sd_opt_in_does_not_set_upstream_kda_recover_flag(self) -> None:
         # The vLLM mode="after" validator runs after the Ascend platform hook.
         # Writing this flag there turns Qwen MTP into KDA RecoverSSM.
@@ -86,11 +105,16 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
             head_k_dim=dim,
             head_v_dim=dim,
             kv_cache=(None, *(torch.empty(1) for _ in range(4))),
+            _replayssm_sd_d_ring=torch.empty(1),
+            _replayssm_sd_k_ring=torch.empty(1),
+            _replayssm_sd_g_ring=torch.empty(1),
             _replayssm_sd_verify_status=torch.empty(batch * value_heads, dtype=torch.int32),
             _replayssm_sd_compact_status=torch.empty(batch * value_heads * 4, dtype=torch.int32),
         )
         metadata = SimpleNamespace(
             replayssm_sd_slots=torch.tensor([1, 2], dtype=torch.int32),
+            replayssm_sd_block_slots=torch.tensor([1, 2], dtype=torch.int32),
+            replayssm_sd_ring_slots=torch.tensor([2, 1], dtype=torch.int32),
             replayssm_sd_positions=torch.zeros(batch, dtype=torch.int32),
             replayssm_sd_bases=torch.zeros(batch, dtype=torch.int32),
             replayssm_sd_flush=torch.zeros(batch, dtype=torch.int32),
@@ -112,8 +136,10 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
                 layer, query=query, key=query, value=value, g=gate, beta=gate, attn_metadata=metadata
             )
         torch.testing.assert_close(result, value)
-        self.assertEqual(verify.call_args.args[-3:], (128, 40, 13))
-        self.assertEqual(compact.call_args.args[-3:], (32, 40, 1))
+        self.assertEqual(verify.call_args.args[-4:-1], (128, 40, 13))
+        self.assertEqual(compact.call_args.args[-4:-1], (32, 40, 1))
+        torch.testing.assert_close(verify.call_args.args[-1], metadata.replayssm_sd_ring_slots)
+        torch.testing.assert_close(compact.call_args.args[-1], metadata.replayssm_sd_ring_slots)
 
     def test_all_npu_input_batch_owners_keep_replayssm_lifecycle(self) -> None:
         input_batch_source = (ROOT / "vllm_ascend/worker/npu_input_batch.py").read_text()
