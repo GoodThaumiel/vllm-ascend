@@ -422,6 +422,7 @@ class AscendConfig:
             "refresh": false,
             "enable_cpu_binding": true,
             "replayssm_sd": false,
+            "replayssm_sd_ring_capacity": null,
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
             "enable_prefill_mc2": false,
@@ -565,13 +566,17 @@ class AscendConfig:
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
     replayssm_sd: bool = False
+    # None uses max_num_seqs; the request-ring allocator validates the
+    # effective capacity against max_num_seqs before allocating its buffers.
+    replayssm_sd_ring_capacity: int | None = None
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False

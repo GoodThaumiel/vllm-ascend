@@ -70,6 +70,8 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
     def test_sd_ring_capacity_defaults_to_max_num_seqs(self) -> None:
         config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=64), additional_config={})
         self.assertEqual(CACHE.replayssm_sd_ring_capacity(config), 64)
+        config.additional_config["replayssm_sd_ring_capacity"] = None
+        self.assertEqual(CACHE.replayssm_sd_ring_capacity(config), 64)
         config.additional_config["replayssm_sd_ring_capacity"] = 96
         self.assertEqual(CACHE.replayssm_sd_ring_capacity(config), 96)
         config.additional_config["replayssm_sd_ring_capacity"] = 32

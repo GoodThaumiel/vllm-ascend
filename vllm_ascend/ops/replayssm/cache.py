@@ -31,11 +31,12 @@ def replayssm_sd_enabled(vllm_config) -> bool:
 def replayssm_sd_ring_capacity(vllm_config) -> int:
     """Number of request-owned ring slots, excluding reserved slot zero."""
     max_seqs = vllm_config.scheduler_config.max_num_seqs
-    value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd_ring_capacity", max_seqs)
+    value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd_ring_capacity")
+    if value is None:
+        value = max_seqs
     if isinstance(value, bool) or not isinstance(value, int) or value < max_seqs:
         raise ValueError(
-            "additional_config.replayssm_sd_ring_capacity must be an integer "
-            f">= max_num_seqs ({max_seqs})"
+            f"additional_config.replayssm_sd_ring_capacity must be an integer >= max_num_seqs ({max_seqs})"
         )
     return value
 
@@ -61,8 +62,7 @@ class ReplaySSMSDRingSlots:
         new_ids = [req_id for req_id in dict.fromkeys(req_ids) if req_id not in self._by_request]
         if len(new_ids) > len(self._free):
             raise RuntimeError(
-                "ReplaySSM SD ring slots exhausted; increase "
-                "additional_config.replayssm_sd_ring_capacity"
+                "ReplaySSM SD ring slots exhausted; increase additional_config.replayssm_sd_ring_capacity"
             )
         for req_id in new_ids:
             self._by_request[req_id] = heapq.heappop(self._free)

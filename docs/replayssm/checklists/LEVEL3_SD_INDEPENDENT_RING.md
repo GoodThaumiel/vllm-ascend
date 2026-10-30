@@ -5,7 +5,7 @@
 ## 1. 构建与算子隔离
 
 1. 记录 `git rev-parse HEAD`、`git status --short`、CANN 路径和 package 版本。从当前 checkout **重新编译** vllm_ascend；确认扩展和 AscendC kernel `.so` 生成时间/路径来自本轮，不运行旧 `.so`。若编译失败，回传第一条 CCE 或 C++ 错误及其上下文。
-2. 运行 `python3 -m unittest tests.ut.replayssm.test_model_ar_integration tests.ut.replayssm.test_framework_meta tests.ut.replayssm.test_sd_serve_validator`。Meta schema 应多一个可选的 `ring_slots`，旧的同槽独立算子调用仍能运行。
+2. 运行 `python3 -m unittest tests.ut.test_ascend_config.TestTopLevelSwitchTypeValidation.test_replayssm_sd_ring_capacity_is_accepted tests.ut.replayssm.test_model_ar_integration tests.ut.replayssm.test_framework_meta tests.ut.replayssm.test_sd_serve_validator`。配置构造应接受显式 `replayssm_sd_ring_capacity=64`；Meta schema 应多一个可选的 `ring_slots`，旧的同槽独立算子调用仍能运行。
 3. 单卡先运行：
 
    ```bash
