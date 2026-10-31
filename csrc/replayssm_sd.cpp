@@ -30,6 +30,7 @@ namespace {
 constexpr int64_t K_DIM = 128;
 constexpr int64_t MAX_TOKENS = 4;
 constexpr int64_t MAX_HISTORY = 16;
+constexpr int64_t MAX_VALUE_HEADS = 32;
 }  // namespace
 
 void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
@@ -56,7 +57,8 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(v.dim() == 4 && v.size(0) == q.size(0) && v.size(1) == MAX_TOKENS && v.size(3) == K_DIM,
               "v must be [B,4,HV,128]");
   const int64_t batch = q.size(0), heads = q.size(2), value_heads = v.size(2);
-  TORCH_CHECK(batch > 0 && batch <= 1024 && heads > 0 && value_heads > 0 && value_heads % heads == 0,
+  TORCH_CHECK(batch > 0 && batch <= 1024 && heads > 0 && value_heads > 0 &&
+                  value_heads <= MAX_VALUE_HEADS && value_heads % heads == 0,
               "Invalid batch/head dimensions");
   TORCH_CHECK(g.sizes() == at::IntArrayRef({batch, MAX_TOKENS, value_heads}) && beta.sizes() == g.sizes(),
               "g/beta must be [B,4,HV]");

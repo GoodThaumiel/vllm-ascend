@@ -17,17 +17,20 @@ import torch
 from lab import MUTABLE, clone_case, invoke, make_case, reference_step
 
 
-def cases(batch: int) -> list[tuple[str, dict[str, torch.Tensor]]]:
+def cases(batch: int, mtp_size: int) -> list[tuple[str, dict[str, torch.Tensor]]]:
+    max_tokens = mtp_size + 1
+    logical_limit = 16 + max_tokens
+
     def initial() -> dict[str, torch.Tensor]:
-        return make_case(batch=batch, slots=max(batch + 1, 129))
+        return make_case(batch=batch, slots=max(batch + 1, 129), logical_limit=logical_limit, max_spec_len=max_tokens)
 
     normal = initial()
     normal["write_pos"][1 : batch + 1] = 7
     normal["accepted"][:] = 2
 
     boundary = initial()
-    boundary["write_pos"][1 : batch + 1] = 12
-    boundary["accepted"][:] = 4
+    boundary["write_pos"][1 : batch + 1] = 16 - max_tokens
+    boundary["accepted"][:] = max_tokens
 
     flush = initial()
     flush["write_pos"][1 : batch + 1] = 16
@@ -61,10 +64,10 @@ def cases(batch: int) -> list[tuple[str, dict[str, torch.Tensor]]]:
     if batch >= 4:
         invalid = initial()
         invalid["slots"][0] = -1
-        invalid["accepted"][1] = 5
+        invalid["accepted"][1] = max_tokens + 1
         invalid["cache_base"][3] = -1
-        invalid["write_pos"][4] = 19
-        invalid["accepted"][3] = 4
+        invalid["write_pos"][4] = logical_limit - 1
+        invalid["accepted"][3] = max_tokens
         result.append(("invalid_rows", invalid))
     return result
 
@@ -83,9 +86,12 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--stage", choices=("smoke", "graph", "perf"), default="smoke")
     parser.add_argument("--backend", choices=("lab", "framework"), default="lab")
+    parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    max_tokens = args.mtp_size + 1
+    logical_limit = 16 + max_tokens
     if args.batch < 1 or args.batch > 128 or args.iterations < 1:
         parser.error("batch must be 1..128 and iterations must be positive")
 
@@ -94,6 +100,7 @@ def main() -> None:
         "device": args.device,
         "batch": args.batch,
         "backend": args.backend,
+        "mtp_size": args.mtp_size,
         "status": "FAILED",
         "cases": [],
         "source_commit": subprocess.check_output(
@@ -122,24 +129,24 @@ def main() -> None:
         report["library"] = str(library)
         report["library_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
         device = torch.device(f"npu:{args.device}")
-        scenarios = cases(args.batch)
+        scenarios = cases(args.batch, args.mtp_size)
         allocated = clone_case(scenarios[0][1], device)
         if args.stage in ("graph", "perf"):
-            invoke(allocated, backend=args.backend)
+            invoke(allocated, logical_limit, max_tokens, backend=args.backend)
             torch.npu.synchronize()
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph):
-                invoke(allocated, backend=args.backend)
+                invoke(allocated, logical_limit, max_tokens, backend=args.backend)
 
         for name, source in scenarios:
             for key, tensor in source.items():
                 allocated[key].copy_(tensor.to(device))
             if args.stage == "smoke":
-                invoke(allocated, backend=args.backend)
+                invoke(allocated, logical_limit, max_tokens, backend=args.backend)
             else:
                 graph.replay()
             torch.npu.synchronize()
-            compare(allocated, reference_step(source))
+            compare(allocated, reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens))
             report["cases"].append({"name": name, "status": "PASSED"})
 
         if args.stage == "perf":
@@ -157,7 +164,7 @@ def main() -> None:
                     end.record()
                     end.synchronize()
                     samples.append(start.elapsed_time(end) * 1000)
-                compare(allocated, reference_step(source))
+                compare(allocated, reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens))
                 ordered = sorted(samples)
                 timings[name] = {
                     "device_us_p50": statistics.median(samples),

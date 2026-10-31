@@ -14,7 +14,7 @@ constexpr uint32_t SPEC_ROWS = 8;
 constexpr uint32_t MAX_WINDOW = MAX_HISTORY + MAX_TOKENS;
 constexpr uint32_t FP32_BLOCK = 8;
 constexpr uint32_t MAX_RING = 64;
-constexpr uint32_t MAX_VALUE_HEADS = 12;
+constexpr uint32_t MAX_VALUE_HEADS = 32;
 
 // L3.1 non-flush pilot: the baseline AIV task owns one V tile; shared variants
 // process all V tiles for a (request, value head) in one task.

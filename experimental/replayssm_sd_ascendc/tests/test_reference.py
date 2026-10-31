@@ -25,6 +25,14 @@ class SDReferenceTests(unittest.TestCase):
                 replay = output_only_reference(case)
                 torch.testing.assert_close(replay, dense, rtol=0, atol=0)
 
+    def test_qwen35_9b_tp1_mtp1_to_mtp3_geometry(self):
+        for length in (2, 3, 4):
+            with self.subTest(length=length):
+                case = make_case(geometry="9b", tp=1, batch=1, position=7, length=length, base=31)
+                self.assertEqual(case["q"].shape[2], 16)
+                self.assertEqual(case["v"].shape[2], 32)
+                torch.testing.assert_close(output_only_reference(case), recurrent_golden(case)["out"], rtol=0, atol=0)
+
     def test_verify_keeps_checkpoint_and_poisoned_tail(self):
         case = make_case(position=7, length=2, base=31)
         before = clone_case(case)

@@ -18,6 +18,7 @@ CACHE_NAMES = ("checkpoint", "d_cache", "k_cache", "g_cache")
 def make_case(
     *,
     tp: int = 4,
+    geometry: str = "27b",
     batch: int = 2,
     position: int = 7,
     length: int = 4,
@@ -27,7 +28,7 @@ def make_case(
     seed: int = 0,
     padding: bool = False,
 ) -> dict[str, torch.Tensor]:
-    if tp not in (4, 8) or batch < 1 or ring_len not in (16, 32, 64):
+    if (geometry, tp) not in (("27b", 4), ("27b", 8), ("9b", 1)) or batch < 1 or ring_len not in (16, 32, 64):
         raise ValueError("Invalid TP, batch, or ring length")
     if not 0 <= position <= MAX_HISTORY or not 1 <= length <= MAX_TOKENS:
         raise ValueError("Invalid history position or verify length")
@@ -36,7 +37,7 @@ def make_case(
     if tile_v not in (16, 32, 64, 128):
         raise ValueError("Invalid tile_v")
     generator = torch.Generator().manual_seed(seed)
-    heads, value_heads = 16 // tp, 48 // tp
+    heads, value_heads = 16 // tp, (48 if geometry == "27b" else 32) // tp
     slots = batch + 1
 
     def rand(*shape, dtype=torch.float32, multiplier=1.0):

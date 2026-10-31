@@ -52,7 +52,10 @@ from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
 from vllm_ascend.ops.replayssm.ascendc import replayssm_ar_step, replayssm_sd_compact, replayssm_sd_verify
 from vllm_ascend.ops.replayssm.cache import (
     REPLAYSSM_AR_CORES,
+    REPLAYSSM_AR_HEAD_DIM,
     REPLAYSSM_AR_TILE_V,
+    REPLAYSSM_SD_MAX_TOKENS,
+    REPLAYSSM_SD_MAX_VALUE_HEADS,
     REPLAYSSM_SD_VERIFY_TILE_V,
     REPLAYSSM_SD_VERIFY_VARIANT,
     append_gdn_replayssm_ar_dtypes,
@@ -336,6 +339,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             return base_shapes
         if getattr(self, "use_replayssm_sd", False):
             replayssm_sd_ring_len(self.cache_config.replayssm_buffer_len, self.num_spec)
+            local_v_heads, head_v_dim, head_k_dim = base_shapes[1]
+            if (
+                head_k_dim != REPLAYSSM_AR_HEAD_DIM
+                or head_v_dim != REPLAYSSM_AR_HEAD_DIM
+                or local_v_heads > REPLAYSSM_SD_MAX_VALUE_HEADS
+            ):
+                raise ValueError(
+                    "ReplaySSM SD requires 128-dimensional GDN heads and at most "
+                    f"{REPLAYSSM_SD_MAX_VALUE_HEADS} local value heads"
+                )
             return base_shapes
         buffer_len = self.cache_config.replayssm_buffer_len
         if self.num_spec > 0:
@@ -472,7 +485,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         lengths = attn_metadata.replayssm_sd_lengths
         pack = attn_metadata.replayssm_sd_pack_indices
         batch = slots.numel()
-        max_tokens = self.num_spec + 1
+        max_tokens = REPLAYSSM_SD_MAX_TOKENS
         key_heads = self.num_k_heads // self.tp_size
         value_heads = self.num_v_heads // self.tp_size
 

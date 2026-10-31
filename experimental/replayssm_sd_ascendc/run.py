@@ -33,7 +33,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--backend", choices=("lab", "framework"), default="lab")
-    parser.add_argument("--tp", type=int, choices=(4, 8), default=4)
+    parser.add_argument("--tp", type=int, choices=(1, 4, 8), default=4)
+    parser.add_argument("--geometry", choices=("27b", "9b"), default="27b")
+    parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32, 64, 128), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
@@ -48,6 +50,7 @@ def parse_args() -> argparse.Namespace:
 def _cpu_case(args: argparse.Namespace, pos: int, length: int, base: int, seed: int, padding: bool = False):
     case = make_case(
         tp=args.tp,
+        geometry=args.geometry,
         batch=args.batch,
         position=pos,
         length=length,
@@ -80,7 +83,8 @@ def _run_once(args, device, pos, length, base, seed, padding=False):
 def _graph_case(args, device, perf=False):
     import torch
 
-    cpu = _cpu_case(args, 7, 4, 29, 157)
+    max_tokens = args.mtp_size + 1
+    cpu = _cpu_case(args, 7, max_tokens, 29, 157)
     gpu = _device_case(cpu, device, args.layout)
     invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
     torch.npu.synchronize()
@@ -90,14 +94,14 @@ def _graph_case(args, device, perf=False):
     records = []
     for pos, length, base, padding in (
         (0, 1, 0, False),
-        (7, 2, 29, False),
-        (7, 3, 30, False),
-        (7, 4, 29, False),
-        (7, 4, 0, False),
-        (12, 4, 31, False),
-        (16, 4, 31, False),
-        (16, 4, 0, False),
-        (7, 4, 30, True),
+        (7, min(2, max_tokens), 29, False),
+        (7, min(3, max_tokens), 30, False),
+        (7, max_tokens, 29, False),
+        (7, max_tokens, 0, False),
+        (12, max_tokens, 31, False),
+        (16, max_tokens, 31, False),
+        (16, max_tokens, 0, False),
+        (7, max_tokens, 30, True),
     ):
         cpu = _cpu_case(args, pos, length, base, seed=160 + pos, padding=padding)
         for name in cpu:
@@ -117,7 +121,7 @@ def _graph_case(args, device, perf=False):
         return {"graph_cases": records}
 
     timings = {}
-    for pos, length, base in ((0, 1, 0), (7, 4, 29), (12, 4, 31), (16, 4, 31)):
+    for pos, length, base in ((0, 1, 0), (7, max_tokens, 29), (12, max_tokens, 31), (16, max_tokens, 31)):
         pristine = _cpu_case(args, pos, length, base, seed=177 + pos)
         pristine_device = {name: tensor.to(device) for name, tensor in pristine.items()}
         for name in pristine:
@@ -152,6 +156,9 @@ def _graph_case(args, device, perf=False):
 
 def main() -> None:
     args = parse_args()
+    if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1)):
+        raise SystemExit("27b requires TP4/TP8; 9b requires TP1")
+    value_heads = (48 if args.geometry == "27b" else 32) // args.tp
     report = {
         "stage": args.stage,
         "device": args.device,
@@ -161,9 +168,10 @@ def main() -> None:
         "cores": args.cores,
         "variant": args.variant,
         "effective_cores": min(
-            args.cores,
-            args.batch * (48 // args.tp) * (1 if args.variant >= 3 else (128 // args.tile_v)),
+            args.cores, args.batch * value_heads * (1 if args.variant >= 3 else (128 // args.tile_v))
         ),
+        "geometry": args.geometry,
+        "mtp_size": args.mtp_size,
         "layout": args.layout,
         "backend": args.backend,
         "status": "FAILED",
@@ -201,16 +209,17 @@ def main() -> None:
         report["library_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
         device = f"npu:{args.device}"
         if args.stage in ("smoke", "all"):
+            max_tokens = args.mtp_size + 1
             for pos, length, base, padding in (
                 (0, 1, 0, False),
-                (7, 2, 29, False),
-                (7, 3, 30, False),
-                (7, 4, 29, False),
-                (7, 4, 0, False),
-                (12, 4, 31, False),
-                (16, 4, 31, False),
-                (16, 4, 0, False),
-                (7, 4, 30, True),
+                (7, min(2, max_tokens), 29, False),
+                (7, min(3, max_tokens), 30, False),
+                (7, max_tokens, 29, False),
+                (7, max_tokens, 0, False),
+                (12, max_tokens, 31, False),
+                (16, max_tokens, 31, False),
+                (16, max_tokens, 0, False),
+                (7, max_tokens, 30, True),
             ):
                 errors = _run_once(args, device, pos, length, base, 101 + pos, padding=padding)
                 report["cases"].append(

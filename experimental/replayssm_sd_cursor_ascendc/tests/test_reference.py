@@ -8,6 +8,18 @@ from experimental.replayssm_sd_cursor_ascendc.lab import make_case, reference_st
 
 
 class CursorReferenceTests(unittest.TestCase):
+    def test_mtp1_to_mtp3_flush_boundary(self):
+        for mtp_size in (1, 2, 3):
+            with self.subTest(mtp_size=mtp_size):
+                max_tokens = mtp_size + 1
+                logical_limit = 16 + max_tokens
+                case = make_case(logical_limit=logical_limit, max_spec_len=max_tokens)
+                case["write_pos"][1:5] = 16 - max_tokens
+                case["accepted"][:] = max_tokens
+                result = reference_step(case, logical_limit=logical_limit, max_spec_len=max_tokens)
+                self.assertEqual(result["write_pos"][1:5].tolist(), [16] * 4)
+                self.assertEqual(result["is_flush"][1:5].tolist(), [1] * 4)
+
     def test_partial_accept_reject_and_padding(self):
         case = make_case()
         case["write_pos"][1:5] = torch.tensor([0, 7, 12, 9], dtype=torch.int32)

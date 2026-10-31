@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_cursor
 from vllm_ascend.ops.replayssm.cache import (
+    REPLAYSSM_SD_MAX_TOKENS,
     derive_replayssm_ar_cursors,
     replayssm_sd_enabled,
     replayssm_sd_pack_indices,
@@ -527,7 +528,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.sd_lengths[:rows].copy_(query_start_loc[1 : rows + 1] - query_start_loc[:rows])
 
         query_lens_cpu = torch.diff(m.query_start_loc_cpu)[spec_sequence_masks_cpu]
-        pack = replayssm_sd_pack_indices(query_lens_cpu, self.num_spec + 1)
+        pack = replayssm_sd_pack_indices(query_lens_cpu, self.num_spec + 1, REPLAYSSM_SD_MAX_TOKENS)
         if pack.numel() != attn_metadata.num_spec_decode_tokens:
             raise ValueError("ReplaySSM SD token pack does not match speculative token count")
         self.sd_pack_indices[: pack.numel()].copy_(pack, non_blocking=True)
@@ -892,7 +893,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     out=spec_sequence_masks_cpu,
                 )
                 if bool((query_lens_cpu[:num_reqs][spec_sequence_masks_cpu] > self.num_spec + 1).any()):
-                    raise ValueError("ReplaySSM SD decode window exceeds four tokens")
+                    raise ValueError(f"ReplaySSM SD decode window exceeds MTP{self.num_spec} width")
             elif runtime_draft_tokens.sum().item() > 0:
                 torch.ge(
                     num_decode_draft_tokens_cpu,

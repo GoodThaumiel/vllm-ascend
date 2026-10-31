@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 from experimental.replayssm_sd_ascendc.lab import clone_page_strided_case, make_case  # noqa: E402
 
 
-def run(tp: int, device: int) -> dict:
+def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3) -> dict:
     import torch_npu  # noqa: F401
 
     from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_compact, replayssm_sd_verify
@@ -32,9 +32,19 @@ def run(tp: int, device: int) -> dict:
     if not enable_custom_op():
         raise RuntimeError("ReplaySSM SD operators unavailable; rebuild the extension")
     npu = torch.device(f"npu:{device}")
-    report = {"status": "RUNNING", "tp": tp, "device": device, "cases": []}
+    report = {"status": "RUNNING", "tp": tp, "geometry": geometry, "mtp_size": mtp_size, "device": device, "cases": []}
+    max_tokens = mtp_size + 1
     for position, base, flush in ((0, 0, 0), (7, 31, 0), (12, 31, 1), (16, 31, 1)):
-        source = make_case(tp=tp, batch=2, position=position, length=4, ring_len=32, tile_v=128, base=base)
+        source = make_case(
+            tp=tp,
+            geometry=geometry,
+            batch=2,
+            position=position,
+            length=max_tokens,
+            ring_len=32,
+            tile_v=128,
+            base=base,
+        )
         tied = clone_page_strided_case(source, npu)
         detached = {name: tensor.clone() for name, tensor in tied.items() if name not in ("checkpoint", "slots")}
         detached["checkpoint"] = torch.zeros((17, *source["checkpoint"].shape[1:]), dtype=torch.bfloat16, device=npu)
@@ -45,8 +55,26 @@ def run(tp: int, device: int) -> dict:
 
         for case, request_slots in ((tied, None), (detached, ring_slots)):
             replayssm_sd_verify(
-                *(case[name] for name in ("q", "k", "v", "g", "beta", "checkpoint", "d_cache", "k_cache", "g_cache",
-                                          "slots", "positions", "bases", "lengths", "out", "status")),
+                *(
+                    case[name]
+                    for name in (
+                        "q",
+                        "k",
+                        "v",
+                        "g",
+                        "beta",
+                        "checkpoint",
+                        "d_cache",
+                        "k_cache",
+                        "g_cache",
+                        "slots",
+                        "positions",
+                        "bases",
+                        "lengths",
+                        "out",
+                        "status",
+                    )
+                ),
                 128**-0.5,
                 128,
                 40,
@@ -54,10 +82,22 @@ def run(tp: int, device: int) -> dict:
                 request_slots,
             )
             case["flush"] = torch.full((2,), flush, dtype=torch.int32, device=npu)
-            case["compact_status"] = torch.empty((2 * (48 // tp) * 4,), dtype=torch.int32, device=npu)
+            case["compact_status"] = torch.empty((2 * case["v"].shape[2] * 4,), dtype=torch.int32, device=npu)
             replayssm_sd_compact(
-                *(case[name] for name in ("checkpoint", "d_cache", "k_cache", "g_cache", "slots", "positions",
-                                          "bases", "flush", "compact_status")),
+                *(
+                    case[name]
+                    for name in (
+                        "checkpoint",
+                        "d_cache",
+                        "k_cache",
+                        "g_cache",
+                        "slots",
+                        "positions",
+                        "bases",
+                        "flush",
+                        "compact_status",
+                    )
+                ),
                 32,
                 40,
                 1,
@@ -79,16 +119,20 @@ def run(tp: int, device: int) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tp", type=int, choices=(4, 8), default=4)
+    parser.add_argument("--tp", type=int, choices=(1, 4, 8), default=4)
+    parser.add_argument("--geometry", choices=("27b", "9b"), default="27b")
+    parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1)):
+        parser.error("27b requires TP4/TP8; 9b requires TP1")
     if args.output.exists():
         parser.error(f"output already exists: {args.output}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()}
     try:
-        report.update(run(args.tp, args.device))
+        report.update(run(args.tp, args.device, args.geometry, args.mtp_size))
     except Exception as exc:
         report.update({"status": "FAILED", "error": repr(exc), "traceback": traceback.format_exc()})
         raise

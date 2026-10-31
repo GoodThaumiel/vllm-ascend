@@ -506,11 +506,11 @@ class NPUPlatform(Platform):
         if replayssm_sd_enabled(vllm_config):
             spec = vllm_config.speculative_config
             if spec is None:
-                raise ValueError("additional_config.replayssm_sd requires MTP3 speculative decoding")
+                raise ValueError("additional_config.replayssm_sd requires MTP1/2/3 speculative decoding")
             replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
             replayssm_sd_ring_capacity(vllm_config)
             if getattr(spec, "method", None) != "mtp":
-                raise ValueError("Ascend ReplaySSM SD currently supports MTP3 only")
+                raise ValueError("Ascend ReplaySSM SD currently supports MTP1/2/3 only")
             if vllm_config.model_config.architecture not in (
                 "Qwen3NextForCausalLM",
                 "Qwen3_5ForCausalLM",
@@ -534,7 +534,11 @@ class NPUPlatform(Platform):
                 raise ValueError("Use additional_config.replayssm_sd without --use-replayssm on vLLM 0.30")
             if vllm_config.cache_config.mamba_cache_mode != "none":
                 raise ValueError("Ascend ReplaySSM SD currently requires --mamba-cache-mode none")
-            logger.info("Enabled Ascend ReplaySSM SD for MTP3 with BF16 checkpoint and 32-entry ring")
+            logger.info(
+                "Enabled Ascend ReplaySSM SD for MTP%d with BF16 checkpoint and %d-entry ring",
+                spec.num_speculative_tokens,
+                replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens),
+            )
 
         _validate_model_runner_config(vllm_config)
         cls._validate_indexer_pp_config(vllm_config)
