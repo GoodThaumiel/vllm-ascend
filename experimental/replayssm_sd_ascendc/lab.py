@@ -28,7 +28,11 @@ def make_case(
     seed: int = 0,
     padding: bool = False,
 ) -> dict[str, torch.Tensor]:
-    if (geometry, tp) not in (("27b", 4), ("27b", 8), ("9b", 1)) or batch < 1 or ring_len not in (16, 32, 64):
+    if (
+        (geometry, tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2))
+        or batch < 1
+        or ring_len not in (16, 32, 64)
+    ):
         raise ValueError("Invalid TP, batch, or ring length")
     if not 0 <= position <= MAX_HISTORY or not 1 <= length <= MAX_TOKENS:
         raise ValueError("Invalid history position or verify length")

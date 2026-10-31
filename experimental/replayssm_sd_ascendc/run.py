@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--backend", choices=("lab", "framework"), default="lab")
-    parser.add_argument("--tp", type=int, choices=(1, 4, 8), default=4)
+    parser.add_argument("--tp", type=int, choices=(1, 2, 4, 8), default=4)
     parser.add_argument("--geometry", choices=("27b", "9b"), default="27b")
     parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--batch", type=int, default=2)
@@ -156,8 +156,8 @@ def _graph_case(args, device, perf=False):
 
 def main() -> None:
     args = parse_args()
-    if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1)):
-        raise SystemExit("27b requires TP4/TP8; 9b requires TP1")
+    if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2)):
+        raise SystemExit("27b requires TP4/TP8; 9b requires TP1/TP2")
     value_heads = (48 if args.geometry == "27b" else 32) // args.tp
     report = {
         "stage": args.stage,

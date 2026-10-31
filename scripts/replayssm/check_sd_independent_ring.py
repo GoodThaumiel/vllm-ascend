@@ -119,14 +119,14 @@ def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tp", type=int, choices=(1, 4, 8), default=4)
+    parser.add_argument("--tp", type=int, choices=(1, 2, 4, 8), default=4)
     parser.add_argument("--geometry", choices=("27b", "9b"), default="27b")
     parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1)):
-        parser.error("27b requires TP4/TP8; 9b requires TP1")
+    if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2)):
+        parser.error("27b requires TP4/TP8; 9b requires TP1/TP2")
     if args.output.exists():
         parser.error(f"output already exists: {args.output}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
