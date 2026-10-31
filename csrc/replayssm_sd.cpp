@@ -111,8 +111,6 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
   TORCH_CHECK(variant >= 0 && variant <= 13, "variant must be in [0,13]");
   TORCH_CHECK((variant != 12 && variant != 13) || tile_v == 128, "variant 12/13 requires tile_v=128");
-  TORCH_CHECK(variant < 2 || value_heads <= 12,
-              "bulk/shared variants require at most 12 value heads per rank");
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "scale must be finite and positive");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();

@@ -2,7 +2,7 @@
 
 目标环境：Ascend910B4、CANN 9.2.0、torch_npu 2.10.0.post4、vLLM `0.30.0+empty`、本分支源码编译的 vllm-ascend。沿用 BF16 模型/conv/checkpoint、FP16 D/K ring、FP32 G ring、history=16、独立请求 ring。verify 仍用 v13/tile128/cores40，compact 用 v1/tile32/cores40。本轮不改变已知 FP16 ring 数值口径。
 
-TP2 是在 L3.9 首版之上的独立补测：这次仅扩展测试几何和清单，不改 C++/AscendC 或运行时 Python。已经从 L3.9 首版源码重建的扩展可以继续使用；正在进行的 TP1/27B 测试无需重跑。
+TP2 是在 L3.9 首版之上的独立补测：当时仅扩展了测试几何。此后修复了 C++ 入口遗留的 `variant>=2` 且 `value_heads<=12` 限制。9B TP1/TP2 使用 v13 时分别需要 32/16 个本地 value heads；执行这两组验证前必须从包含此修复的源码重新编译并加载扩展，不能沿用仅含 L3.9 首版的 `.so`。原先在该校验处失败的 9B 组合按下文 smoke/graph 用例重测；已通过的 27B 组合不必重复。
 
 `--speculative-config` 的 `num_speculative_tokens=N` 决定逻辑 MTP size（N=1、2、3）。verify 的物理输入保持 `[B,4,...]`，缺少的候选补零，真实 `lengths` 为 1 到 N+1；ring 长度仍为 32。KV `--block-size` 与这个 N 无关。9B TP1/TP2 每 rank 本地 QK/V head 数分别为 16/32、8/16；verify 的候选 gate/beta UB 暂存容量已扩到 32 个 value heads，C++ 入口超过 32 时明确拒绝。按 v13/tile128 的 `InitBuffer` 字节数相加约 184,352 B，距 192 KiB UB 上限约 12,256 B；编译器实际分配仍以上机结果为准。TP2 不改算子，只补验证几何和服务入口。
 
