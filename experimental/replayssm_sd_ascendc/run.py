@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32, 64, 128), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
-    parser.add_argument("--variant", type=int, choices=range(14), default=0)
+    parser.add_argument("--variant", type=int, choices=(*range(14), *range(15, 20)), default=0)
     parser.add_argument("--layout", choices=("compact", "page_strided"), default="page_strided")
     parser.add_argument("--stage", choices=("smoke", "graph", "perf", "all"), default="smoke")
     parser.add_argument("--iterations", type=int, default=50)
@@ -94,11 +94,16 @@ def _graph_case(args, device, perf=False):
     records = []
     for pos, length, base, padding in (
         (0, 1, 0, False),
+        (0, max_tokens, 0, False),
+        (7, 1, 29, False),
         (7, min(2, max_tokens), 29, False),
         (7, min(3, max_tokens), 30, False),
         (7, max_tokens, 29, False),
         (7, max_tokens, 0, False),
         (12, max_tokens, 31, False),
+        (15, 1, 0, False),
+        (15, max_tokens, 31, False),
+        (15, max_tokens, 16, False),
         (16, max_tokens, 31, False),
         (16, max_tokens, 0, False),
         (7, max_tokens, 30, True),
@@ -121,7 +126,16 @@ def _graph_case(args, device, perf=False):
         return {"graph_cases": records}
 
     timings = {}
-    for pos, length, base in ((0, 1, 0), (7, max_tokens, 29), (12, max_tokens, 31), (16, max_tokens, 31)):
+    for pos, length, base in (
+        (0, 1, 0),
+        (0, max_tokens, 0),
+        (7, 1, 29),
+        (7, max_tokens, 29),
+        (12, max_tokens, 31),
+        (15, 1, 31),
+        (15, max_tokens, 31),
+        (16, max_tokens, 31),
+    ):
         pristine = _cpu_case(args, pos, length, base, seed=177 + pos)
         pristine_device = {name: tensor.to(device) for name, tensor in pristine.items()}
         for name in pristine:
@@ -158,6 +172,8 @@ def main() -> None:
     args = parse_args()
     if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2)):
         raise SystemExit("27b requires TP4/TP8; 9b requires TP1/TP2")
+    if args.variant >= 15 and (args.backend != "framework" or args.tile_v != 128):
+        raise SystemExit("Variants 15-19 require --backend framework --tile-v 128")
     value_heads = (48 if args.geometry == "27b" else 32) // args.tp
     report = {
         "stage": args.stage,
@@ -212,11 +228,16 @@ def main() -> None:
             max_tokens = args.mtp_size + 1
             for pos, length, base, padding in (
                 (0, 1, 0, False),
+                (0, max_tokens, 0, False),
+                (7, 1, 29, False),
                 (7, min(2, max_tokens), 29, False),
                 (7, min(3, max_tokens), 30, False),
                 (7, max_tokens, 29, False),
                 (7, max_tokens, 0, False),
                 (12, max_tokens, 31, False),
+                (15, 1, 0, False),
+                (15, max_tokens, 31, False),
+                (15, max_tokens, 16, False),
                 (16, max_tokens, 31, False),
                 (16, max_tokens, 0, False),
                 (7, max_tokens, 30, True),

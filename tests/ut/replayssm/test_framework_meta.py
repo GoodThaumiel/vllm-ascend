@@ -130,7 +130,7 @@ class FrameworkMetaTests(unittest.TestCase):
         )
         self.assertEqual(len(schema.returns), 0)
         self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta")))
-        for variant in range(14):
+        for variant in (*range(14), *range(15, 20)):
             self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta"), variant))
         self.assertIsNone(
             self.sd_wrapper(*self.sd_arguments("meta"), 13, self.torch.empty(2, dtype=self.torch.int32, device="meta"))

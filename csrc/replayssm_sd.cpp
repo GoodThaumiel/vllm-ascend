@@ -20,6 +20,11 @@
 #include "aclrtlaunch_replayssm_sd_verify_bulk_qkv.h"
 #include "aclrtlaunch_replayssm_sd_verify_tile128.h"
 #include "aclrtlaunch_replayssm_sd_verify_tile128_bulk_qkv.h"
+#include "aclrtlaunch_replayssm_sd_verify_v15_history_fma.h"
+#include "aclrtlaunch_replayssm_sd_verify_v16_chunk8k.h"
+#include "aclrtlaunch_replayssm_sd_verify_v17_spec_rows_ub.h"
+#include "aclrtlaunch_replayssm_sd_verify_v18_paired_matvec.h"
+#include "aclrtlaunch_replayssm_sd_verify_v19_gate_batch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,14 +108,14 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(g.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat &&
                   g_cache.scalar_type() == at::kFloat,
               "g/beta/g_cache must be FP32");
-  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && (variant == 12 || variant == 13)),
-              "tile_v must be 16/32/64, or 128 with variant 12/13");
+  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && (variant == 12 || variant == 13 || (variant >= 15 && variant <= 19))),
+              "tile_v must be 16/32/64, or 128 with variant 12/13/15-19");
   const int64_t tasks = batch * value_heads * (K_DIM / tile_v);
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 13, "variant must be in [0,13]");
-  TORCH_CHECK((variant != 12 && variant != 13) || tile_v == 128, "variant 12/13 requires tile_v=128");
+  TORCH_CHECK(variant >= 0 && variant <= 19 && variant != 14, "variant must be in 0-13 or 15-19 (14 is the separate fusion operator)");
+  TORCH_CHECK((variant != 12 && variant != 13 && (variant < 15 || variant > 19)) || tile_v == 128, "variant 12/13/15-19 requires tile_v=128");
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "scale must be finite and positive");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
@@ -165,6 +170,21 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
       break;
     case 12:
       result = aclrtlaunch_replayssm_sd_verify_tile128(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 15:
+      result = aclrtlaunch_replayssm_sd_verify_v15_history_fma(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 16:
+      result = aclrtlaunch_replayssm_sd_verify_v16_chunk8k(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 17:
+      result = aclrtlaunch_replayssm_sd_verify_v17_spec_rows_ub(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 18:
+      result = aclrtlaunch_replayssm_sd_verify_v18_paired_matvec(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 19:
+      result = aclrtlaunch_replayssm_sd_verify_v19_gate_batch(REPLAY_SD_LAUNCH_ARGS);
       break;
     default:
       result = aclrtlaunch_replayssm_sd_verify_tile128_bulk_qkv(REPLAY_SD_LAUNCH_ARGS);

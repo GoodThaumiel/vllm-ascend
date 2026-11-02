@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 from experimental.replayssm_sd_ascendc.lab import clone_page_strided_case, make_case  # noqa: E402
 
 
-def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3) -> dict:
+def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3, variant: int = 13) -> dict:
     import torch_npu  # noqa: F401
 
     from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_compact, replayssm_sd_verify
@@ -32,9 +32,17 @@ def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3) -> dict:
     if not enable_custom_op():
         raise RuntimeError("ReplaySSM SD operators unavailable; rebuild the extension")
     npu = torch.device(f"npu:{device}")
-    report = {"status": "RUNNING", "tp": tp, "geometry": geometry, "mtp_size": mtp_size, "device": device, "cases": []}
+    report = {
+        "status": "RUNNING",
+        "tp": tp,
+        "geometry": geometry,
+        "mtp_size": mtp_size,
+        "device": device,
+        "variant": variant,
+        "cases": [],
+    }
     max_tokens = mtp_size + 1
-    for position, base, flush in ((0, 0, 0), (7, 31, 0), (12, 31, 1), (16, 31, 1)):
+    for position, base, flush in ((0, 0, 0), (7, 31, 0), (12, 31, 1), (15, 16, 0), (16, 31, 1)):
         source = make_case(
             tp=tp,
             geometry=geometry,
@@ -78,7 +86,7 @@ def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3) -> dict:
                 128**-0.5,
                 128,
                 40,
-                13,
+                variant,
                 request_slots,
             )
             case["flush"] = torch.full((2,), flush, dtype=torch.int32, device=npu)
@@ -122,6 +130,7 @@ def main() -> int:
     parser.add_argument("--tp", type=int, choices=(1, 2, 4, 8), default=4)
     parser.add_argument("--geometry", choices=("27b", "9b"), default="27b")
     parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--variant", type=int, choices=(13, 15, 16, 17, 18, 19), default=13)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -132,7 +141,7 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()}
     try:
-        report.update(run(args.tp, args.device, args.geometry, args.mtp_size))
+        report.update(run(args.tp, args.device, args.geometry, args.mtp_size, args.variant))
     except Exception as exc:
         report.update({"status": "FAILED", "error": repr(exc), "traceback": traceback.format_exc()})
         raise
