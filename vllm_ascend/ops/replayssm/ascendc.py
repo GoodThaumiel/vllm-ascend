@@ -103,6 +103,55 @@ def replayssm_sd_verify(
     )
 
 
+def replayssm_sd_verify_compact_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    checkpoint: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    slots: torch.Tensor,
+    positions: torch.Tensor,
+    bases: torch.Tensor,
+    lengths: torch.Tensor,
+    flush: torch.Tensor,
+    out: torch.Tensor,
+    verify_status: torch.Tensor,
+    compact_status: torch.Tensor,
+    scale: float,
+    tile_v: int = 128,
+    cores: int = 40,
+    ring_slots: torch.Tensor | None = None,
+) -> None:
+    """Experimental MTP3 27B verify then compact in one AscendC launch."""
+    torch.ops._C_ascend.replayssm_sd_verify_compact_fused_(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        checkpoint,
+        d_cache,
+        k_cache,
+        g_cache,
+        slots,
+        positions,
+        bases,
+        lengths,
+        flush,
+        out,
+        verify_status,
+        compact_status,
+        scale,
+        tile_v,
+        cores,
+        ring_slots,
+    )
+
+
 def replayssm_sd_compact(
     checkpoint: torch.Tensor,
     d_cache: torch.Tensor,

@@ -64,9 +64,9 @@ class ReplaySDVerify {
 
     // Tile128 variants stage the checkpoint in bounded input chunks.
     pipe_.InitBuffer(in_, 1,
-                     VARIANT == 12 ? 8192 : (VARIANT == 13 ? 4096 : tileV * K_DIM * sizeof(bfloat16_t)));
+                     VARIANT == 12 ? 8192 : ((VARIANT == 13 || VARIANT == 14) ? 4096 : tileV * K_DIM * sizeof(bfloat16_t)));
     // A key-cache store casts all 128 elements to FP16 in this queue.
-    pipe_.InitBuffer(outQueue_, 1, K_DIM * sizeof(float));
+    pipe_.InitBuffer(outQueue_, 1, VARIANT == 14 ? 4096 : K_DIM * sizeof(float));
     pipe_.InitBuffer(checkpointBuffer_, tileV * K_DIM * sizeof(float));
     pipe_.InitBuffer(productBuffer_, tileV * K_DIM * sizeof(float));
     pipe_.InitBuffer(historyKBuffer_, MAX_HISTORY * K_DIM * sizeof(float));
@@ -79,9 +79,10 @@ class ReplaySDVerify {
     }
     if constexpr (VARIANT >= 2) {
       pipe_.InitBuffer(historyGateBuffer_, MAX_RING * sizeof(float));
-      pipe_.InitBuffer(candidateGateBuffer_, MAX_TOKENS * MAX_VALUE_HEADS * sizeof(float));
-      pipe_.InitBuffer(candidateLogGateBuffer_, MAX_TOKENS * MAX_VALUE_HEADS * sizeof(float));
-      pipe_.InitBuffer(candidateBetaBuffer_, MAX_TOKENS * MAX_VALUE_HEADS * sizeof(float));
+      constexpr uint32_t HEAD_CAPACITY = VARIANT == 14 ? 12 : MAX_VALUE_HEADS;
+      pipe_.InitBuffer(candidateGateBuffer_, MAX_TOKENS * HEAD_CAPACITY * sizeof(float));
+      pipe_.InitBuffer(candidateLogGateBuffer_, MAX_TOKENS * HEAD_CAPACITY * sizeof(float));
+      pipe_.InitBuffer(candidateBetaBuffer_, MAX_TOKENS * HEAD_CAPACITY * sizeof(float));
       historyGate_ = historyGateBuffer_.Get<float>();
       candidateGate_ = candidateGateBuffer_.Get<float>();
       candidateLogGate_ = candidateLogGateBuffer_.Get<float>();
@@ -91,7 +92,7 @@ class ReplaySDVerify {
       pipe_.InitBuffer(allQBuffer_, MAX_TOKENS * K_DIM * sizeof(float));
       allQ_ = allQBuffer_.Get<float>();
     }
-    if constexpr (VARIANT == 11 || VARIANT == 13) {
+    if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14) {
       pipe_.InitBuffer(allVBuffer_, MAX_TOKENS * tileV_ * sizeof(float));
       allV_ = allVBuffer_.Get<float>();
     }
@@ -153,6 +154,13 @@ class ReplaySDVerify {
     result_ = vec[3 * K_DIM + 4 * tileV];
     term_ = vec[3 * K_DIM + 5 * tileV];
     scalar_ = vec[3 * K_DIM + 7 * tileV];
+  }
+
+  __aicore__ inline void SetFusionOutputs(GM_ADDR flush, GM_ADDR compactStatus) {
+    if constexpr (VARIANT == 14) {
+      flush_.SetGlobalBuffer((__gm__ int32_t*)flush);
+      compactStatus_.SetGlobalBuffer((__gm__ int32_t*)compactStatus);
+    }
   }
 
   __aicore__ inline void Process() {
@@ -339,6 +347,10 @@ class ReplaySDVerify {
       const int32_t pos = ReadInt(positions_, row);
       const int32_t base = ReadInt(bases_, row);
       const int32_t length = ReadInt(lengths_, row);
+      int32_t flush = 0;
+      if constexpr (VARIANT == 14) {
+        flush = ReadInt(flush_, row);
+      }
       int32_t error = 0;
       if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
         error = 1;
@@ -363,6 +375,11 @@ class ReplaySDVerify {
             Store(out_, OutputOffset(row, s, head, tile * tileV_), result_, tileV_);
           }
           WriteStatus(task * tiles_ + tile, error);
+        }
+        if constexpr (VARIANT == 14) {
+          if (head == 0) {
+            WriteCompactStatus(row, CompactError(slot, ringSlot, pos, base, flush));
+          }
         }
         continue;
       }
@@ -397,11 +414,11 @@ class ReplaySDVerify {
         const uint32_t phys = Physical(base, i);
         historyAlpha[i] = historyGate_.GetValue(phys);
         historyProduct *= historyAlpha[i];
-        if constexpr (VARIANT != 9 && VARIANT != 11 && VARIANT != 12 && VARIANT != 13) {
+        if constexpr (VARIANT != 9 && VARIANT != 11 && VARIANT != 12 && VARIANT != 13 && VARIANT != 14) {
           Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
         }
       }
-      if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12 || VARIANT == 13) {
+      if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12 || VARIANT == 13 || VARIANT == 14) {
         // Logical history crosses the physical ring at most once. Two large
         // copies replace up to 16 per-record K copies and casts.
         const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
@@ -431,7 +448,7 @@ class ReplaySDVerify {
         alpha[s] = candidateGate_.GetValue(gateIndex);
         beta[s] = candidateBeta_.GetValue(gateIndex);
         logGate[s] = candidateLogGate_.GetValue(gateIndex);
-        if constexpr (VARIANT != 11 && VARIANT != 13) {
+        if constexpr (VARIANT != 11 && VARIANT != 13 && VARIANT != 14) {
           const uint64_t qkOffset = (static_cast<uint64_t>(row) * MAX_TOKENS + s) * heads_ * K_DIM +
                                     static_cast<uint64_t>(keyHead) * K_DIM;
           Load(q_, qkOffset, allQ_[s * K_DIM], K_DIM);
@@ -440,7 +457,7 @@ class ReplaySDVerify {
           Load(k_, qkOffset, specK_[s * K_DIM], K_DIM);
         }
       }
-      if constexpr (VARIANT == 11 || VARIANT == 13) {
+      if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14) {
         // Q/K are [B, 4, H, 128]. Copy the active tokens as packed UB rows.
         const uint64_t qkOffset = static_cast<uint64_t>(row) * MAX_TOKENS * heads_ * K_DIM +
                                   static_cast<uint64_t>(keyHead) * K_DIM;
@@ -537,7 +554,7 @@ class ReplaySDVerify {
           if (tile + 2 < tiles_) {
             PrefetchCheckpoint(stateOffset + (tile + 2) * tileV_ * K_DIM);
           }
-        } else if constexpr (VARIANT == 12 || VARIANT == 13) {
+        } else if constexpr (VARIANT == 12 || VARIANT == 13 || VARIANT == 14) {
           // V12: four 8 KiB chunks; V13: eight 4 KiB chunks so history
           // correction keeps separate UB buffers instead of aliasing product_.
           const uint32_t chunk = VARIANT == 12 ? 4096 : 2048;
@@ -547,7 +564,7 @@ class ReplaySDVerify {
         } else {
           Load(checkpoint_, stateOffset + vStart * K_DIM, state_, tileV_ * K_DIM);
         }
-        if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12 || VARIANT == 13) {
+        if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12 || VARIANT == 13 || VARIANT == 14) {
           const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
           const uint32_t first = static_cast<uint32_t>(pos) < available ? static_cast<uint32_t>(pos) : available;
           if (first > 0) {
@@ -580,7 +597,7 @@ class ReplaySDVerify {
           Duplicate(specD_, 0.0f, SPEC_ROWS * tileV_);
           PipeBarrier<PIPE_V>();
         }
-        if constexpr (VARIANT == 11 || VARIANT == 13) {
+        if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14) {
           // V is [B, 4, HV, 128]; each V tile has its own row offset.
           LoadCandidateRows(v_, OutputOffset(row, 0, head, vStart), allV_,
                             static_cast<uint32_t>(length), tileV_, valueHeads_ * V_DIM);
@@ -588,7 +605,7 @@ class ReplaySDVerify {
         float specProduct = 1.0f;
         for (int32_t s = 0; s < length; ++s) {
           const uint64_t vOffset = OutputOffset(row, s, head, vStart);
-          if constexpr (VARIANT != 11 && VARIANT != 13) {
+          if constexpr (VARIANT != 11 && VARIANT != 13 && VARIANT != 14) {
             Load(v_, vOffset, value_, tileV_);
           }
           MatVec(allQ_[s * K_DIM], prevQ_);
@@ -630,7 +647,7 @@ class ReplaySDVerify {
           }
           Muls(prevK_, prevK_, alpha[s], tileV_);
           PipeBarrier<PIPE_V>();
-          if constexpr (VARIANT == 11 || VARIANT == 13) {
+          if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14) {
             Sub(delta_, allV_[s * tileV_], prevK_, tileV_);
           } else {
             Sub(delta_, value_, prevK_, tileV_);
@@ -664,6 +681,64 @@ class ReplaySDVerify {
         }
         WriteStatus(task * tiles_ + tile, 0);
       }
+      if constexpr (VARIANT == 14) {
+        const int32_t compactError = CompactError(slot, ringSlot, pos, base, flush);
+        if (compactError == 0 && flush == 1 && pos > 0) {
+          // The tile128 checkpoint and committed history remain in UB after
+          // verify. Fold only old records after all draft outputs are written.
+          FoldHistoryInUB(historyAlpha, pos);
+          for (uint32_t k = 0; k < tileV_ * K_DIM; k += 2048) {
+            Store(checkpoint_, stateOffset + k, state_[k], 2048);
+          }
+        }
+        if (head == 0) {
+          WriteCompactStatus(row, compactError);
+        }
+      }
+    }
+  }
+
+  __aicore__ inline int32_t CompactError(int32_t slot, int32_t ringSlot, int32_t pos,
+                                          int32_t base, int32_t flush) {
+    if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) return 1;
+    if (slot == 0) return (pos != 0 || base != 0 || flush != 0) ? 4 : 0;
+    if (flush != 0 && (ringSlot < 0 || ringSlot >= static_cast<int32_t>(numRingSlots_))) return 6;
+    if (pos < 0 || pos > static_cast<int32_t>(MAX_HISTORY)) return 2;
+    if (base < 0 || base >= static_cast<int32_t>(ringLen_)) return 3;
+    return (flush != 0 && flush != 1) ? 5 : 0;
+  }
+
+  __aicore__ inline void WriteCompactStatus(uint32_t row, int32_t error) {
+    auto output = outQueue_.AllocTensor<int32_t>();
+    const uint32_t count = valueHeads_ * 4;
+    for (uint32_t index = 0; index < count; ++index) {
+      output.SetValue(index, error);
+    }
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    outQueue_.EnQue(output);
+    output = outQueue_.DeQue<int32_t>();
+    DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
+    DataCopyPad(compactStatus_[row * count], output, cp);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    outQueue_.FreeTensor(output);
+  }
+
+  __aicore__ inline void FoldHistoryInUB(const float* historyAlpha, int32_t pos) {
+    uint32_t shape[2] = {tileV_, K_DIM};
+    uint32_t deltaShape[2] = {tileV_, 1};
+    for (int32_t i = 0; i < pos; ++i) {
+      Muls(state_, state_, historyAlpha[i], tileV_ * K_DIM);
+      PipeBarrier<PIPE_V>();
+      Broadcast<float, 2, 1>(product_, historyD_[i * tileV_], shape, deltaShape);
+      PipeBarrier<PIPE_V>();
+      auto key = historyK_[i * K_DIM];
+      Mul(product_, product_, key, 64, tileV_, {1, 1, 1, 16, 16, 0});
+      Mul(product_[64], product_[64], key[64], 64, tileV_, {1, 1, 1, 16, 16, 0});
+      PipeBarrier<PIPE_V>();
+      Add(state_, state_, product_, tileV_ * K_DIM);
+      PipeBarrier<PIPE_V>();
     }
   }
 
@@ -804,7 +879,7 @@ class ReplaySDVerify {
     // each step updates disjoint destinations and halves the active rows.
     for (uint32_t step = 1; step < MAX_HISTORY; step *= 2) {
       const uint8_t repeats = MAX_HISTORY / (2 * step);
-      if constexpr (VARIANT == 13) {
+      if constexpr (VARIANT == 13 || VARIANT == 14) {
         if (step == 8) {
           // One remaining pair: use the count API for all 128 FP32 values.
           Add(weightedHistory_, weightedHistory_, weightedHistory_[step * tileV_], tileV_);
@@ -963,7 +1038,7 @@ class ReplaySDVerify {
   GlobalTensor<bfloat16_t> q_, k_, v_, checkpoint_, out_;
   GlobalTensor<half> dCache_, kCache_;
   GlobalTensor<float> g_, beta_, gCache_;
-  GlobalTensor<int32_t> slots_, ringSlots_, positions_, bases_, lengths_, status_;
+  GlobalTensor<int32_t> slots_, ringSlots_, positions_, bases_, lengths_, status_, flush_, compactStatus_;
   uint32_t batch_, numSlots_, numRingSlots_, heads_, valueHeads_, ringLen_, tileV_, tiles_;
   uint64_t checkpointStride_, dStride_, kStride_, gStride_;
   float scale_;

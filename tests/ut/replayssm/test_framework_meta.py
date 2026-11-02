@@ -43,6 +43,7 @@ class FrameworkMetaTests(unittest.TestCase):
         spec.loader.exec_module(module)
         cls.wrapper = staticmethod(module.replayssm_ar_step)
         cls.sd_wrapper = staticmethod(module.replayssm_sd_verify)
+        cls.sd_fused_wrapper = staticmethod(module.replayssm_sd_verify_compact_fused)
         cls.sd_compact_wrapper = staticmethod(module.replayssm_sd_compact)
         cls.sd_cursor_wrapper = staticmethod(module.replayssm_sd_cursor)
 
@@ -147,6 +148,27 @@ class FrameworkMetaTests(unittest.TestCase):
         graph = make_fx(forward, tracing_mode="fake")(*args)
         self.assertTrue(
             any(node.target == self.torch.ops._C_ascend.replayssm_sd_verify_.default for node in graph.graph.nodes)
+        )
+
+    def test_sd_fused_schema_and_meta_dispatch(self):
+        schema = self.torch.ops._C_ascend.replayssm_sd_verify_compact_fused_.default._schema
+        self.assertEqual(
+            [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write],
+            [5, 6, 7, 8, 14, 15, 16],
+        )
+        args = self.sd_arguments("meta")
+        compact_status = self.torch.empty(2 * 12 * 4, dtype=self.torch.int32, device="meta")
+        self.assertIsNone(
+            self.sd_fused_wrapper(
+                *args[:13],
+                self.torch.zeros(2, dtype=self.torch.int32, device="meta"),
+                args[13],
+                args[14],
+                compact_status,
+                args[15],
+                128,
+                40,
+            )
         )
 
     def test_sd_compact_schema_and_meta(self):
