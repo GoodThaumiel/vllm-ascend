@@ -72,6 +72,7 @@ def replayssm_sd_verify(
     cores: int = 40,
     variant: int = 0,
     ring_slots: torch.Tensor | None = None,
+    packed_metadata: torch.Tensor | None = None,
 ) -> None:
     """Verify a non-flush MTP window through the framework-owned SD op.
 
@@ -100,6 +101,7 @@ def replayssm_sd_verify(
         cores,
         variant,
         ring_slots,
+        packed_metadata,
     )
 
 

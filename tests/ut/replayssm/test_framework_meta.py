@@ -130,10 +130,20 @@ class FrameworkMetaTests(unittest.TestCase):
         )
         self.assertEqual(len(schema.returns), 0)
         self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta")))
-        for variant in (*range(14), *range(15, 20)):
+        for variant in (*range(14), *range(15, 23)):
             self.assertIsNone(self.sd_wrapper(*self.sd_arguments("meta"), variant))
         self.assertIsNone(
             self.sd_wrapper(*self.sd_arguments("meta"), 13, self.torch.empty(2, dtype=self.torch.int32, device="meta"))
+        )
+        self.assertEqual(schema.arguments[-1].name, "packed_metadata")
+        self.assertIsNone(schema.arguments[-1].default_value)
+        self.assertIsNone(
+            self.sd_wrapper(
+                *self.sd_arguments("meta"),
+                21,
+                self.torch.empty(2, dtype=self.torch.int32, device="meta"),
+                self.torch.empty((2, 8), dtype=self.torch.int32, device="meta"),
+            )
         )
 
     def test_sd_fake_tensor_tracing_retains_operator(self):
@@ -148,6 +158,28 @@ class FrameworkMetaTests(unittest.TestCase):
         graph = make_fx(forward, tracing_mode="fake")(*args)
         self.assertTrue(
             any(node.target == self.torch.ops._C_ascend.replayssm_sd_verify_.default for node in graph.graph.nodes)
+        )
+
+    def test_sd_metadata_probe_schema_and_meta_dispatch(self):
+        t = self.torch
+        meta = lambda shape: t.empty(shape, dtype=t.int32, device="meta")
+        schema = t.ops._C_ascend.replayssm_sd_metadata_probe_.default._schema
+        self.assertEqual(
+            [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write], [6]
+        )
+        self.assertIsNone(
+            t.ops._C_ascend.replayssm_sd_metadata_probe_(
+                meta((2,)),
+                meta((2,)),
+                meta((2,)),
+                meta((2,)),
+                meta((2,)),
+                meta((2, 8)),
+                meta((24, 8)),
+                12,
+                40,
+                1,
+            )
         )
 
     def test_sd_fused_schema_and_meta_dispatch(self):

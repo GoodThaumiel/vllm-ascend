@@ -25,6 +25,9 @@
 #include "aclrtlaunch_replayssm_sd_verify_v17_spec_rows_ub.h"
 #include "aclrtlaunch_replayssm_sd_verify_v18_paired_matvec.h"
 #include "aclrtlaunch_replayssm_sd_verify_v19_gate_batch.h"
+#include "aclrtlaunch_replayssm_sd_verify_v20_chunk8k_gate_batch.h"
+#include "aclrtlaunch_replayssm_sd_verify_v21_packed_metadata.h"
+#include "aclrtlaunch_replayssm_sd_verify_v22_grouped_key_heads.h"
 
 #include <algorithm>
 #include <cmath>
@@ -43,7 +46,7 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
             const at::Tensor& k_cache, const at::Tensor& g_cache, const at::Tensor& slots,
             const at::Tensor& positions, const at::Tensor& bases, const at::Tensor& lengths,
             const at::Tensor& out, const at::Tensor& status, double scale, int64_t tile_v, int64_t cores,
-            int64_t variant, c10::optional<at::Tensor> ring_slots) {
+            int64_t variant, c10::optional<at::Tensor> ring_slots, c10::optional<at::Tensor> packed_metadata) {
   const at::Tensor& ring_ids = ring_slots.has_value() ? *ring_slots : slots;
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   const std::vector<at::Tensor> tensors = {q,      k,         v,      g,      beta,   checkpoint, d_cache,
@@ -108,22 +111,35 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(g.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat &&
                   g_cache.scalar_type() == at::kFloat,
               "g/beta/g_cache must be FP32");
-  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && (variant == 12 || variant == 13 || (variant >= 15 && variant <= 19))),
-              "tile_v must be 16/32/64, or 128 with variant 12/13/15-19");
+  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && (variant == 12 || variant == 13 || (variant >= 15 && variant <= 22))),
+              "tile_v must be 16/32/64, or 128 with variant 12/13/15-22");
   const int64_t tasks = batch * value_heads * (K_DIM / tile_v);
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 19 && variant != 14, "variant must be in 0-13 or 15-19 (14 is the separate fusion operator)");
-  TORCH_CHECK((variant != 12 && variant != 13 && (variant < 15 || variant > 19)) || tile_v == 128, "variant 12/13/15-19 requires tile_v=128");
+  TORCH_CHECK(variant >= 0 && variant <= 22 && variant != 14, "variant must be in 0-13 or 15-22 (14 is the separate fusion operator)");
+  TORCH_CHECK((variant != 12 && variant != 13 && (variant < 15 || variant > 22)) || tile_v == 128, "variant 12/13/15-22 requires tile_v=128");
+  if (variant == 21) {
+    TORCH_CHECK(packed_metadata.has_value(), "variant 21 requires packed_metadata [B,8]");
+    const auto& meta = *packed_metadata;
+    TORCH_CHECK(meta.device() == q.device() && meta.scalar_type() == at::kInt &&
+                    meta.is_contiguous() && meta.sizes() == at::IntArrayRef({batch, 8}),
+                "packed_metadata must be contiguous int32[B,8] on the same NPU");
+  } else {
+    TORCH_CHECK(!packed_metadata.has_value(), "packed_metadata is only valid with variant 21");
+  }
+  if (variant == 22) {
+    TORCH_CHECK(heads == 4 && value_heads == 12, "variant 22 requires Qwen3.5-27B TP4 geometry");
+  }
+  const at::Tensor& slot_input = variant == 21 ? *packed_metadata : slots;
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "scale must be finite and positive");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const auto block_dim = static_cast<uint32_t>(std::min(cores, variant >= 3 ? batch * value_heads : tasks));
+  const auto block_dim = static_cast<uint32_t>(std::min(cores, variant == 22 ? batch * heads : (variant >= 3 ? batch * value_heads : tasks)));
 #define REPLAY_SD_LAUNCH_ARGS                                                                       \
   block_dim, stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(),        \
       checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(),             \
-      slots.data_ptr(), ring_ids.data_ptr(), positions.data_ptr(), bases.data_ptr(), lengths.data_ptr(), \
+      slot_input.data_ptr(), ring_ids.data_ptr(), positions.data_ptr(), bases.data_ptr(), lengths.data_ptr(), \
       out.data_ptr(), status.data_ptr(), static_cast<uint32_t>(batch),                                \
       static_cast<uint32_t>(num_slots), static_cast<uint32_t>(num_ring_slots), static_cast<uint32_t>(heads), \
       static_cast<uint32_t>(value_heads), static_cast<uint32_t>(ring_len),                            \
@@ -185,6 +201,15 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
       break;
     case 19:
       result = aclrtlaunch_replayssm_sd_verify_v19_gate_batch(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 20:
+      result = aclrtlaunch_replayssm_sd_verify_v20_chunk8k_gate_batch(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 21:
+      result = aclrtlaunch_replayssm_sd_verify_v21_packed_metadata(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 22:
+      result = aclrtlaunch_replayssm_sd_verify_v22_grouped_key_heads(REPLAY_SD_LAUNCH_ARGS);
       break;
     default:
       result = aclrtlaunch_replayssm_sd_verify_tile128_bulk_qkv(REPLAY_SD_LAUNCH_ARGS);

@@ -23,7 +23,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "experimental/replayssm_sd_ascendc"))
-from lab import CACHE_NAMES, clone_page_strided_case, make_case  # noqa: E402
+from lab import CACHE_NAMES, clone_page_strided_case, make_case, pack_metadata_  # noqa: E402
 
 HEAD_DIM = 128
 PAGE_ALIGNMENT_BYTES = 256 * 1024
@@ -118,6 +118,10 @@ def run_case(args: argparse.Namespace, batch: int, context: int, length: int, po
     beta_native = beta_native_cpu.to(device)
     cpu["beta"] = beta_native_cpu.float()
     replay = clone_page_strided_case(cpu, device)
+    packed = None
+    if args.variant == 21:
+        packed = torch.zeros((batch, 8), dtype=torch.int32, device=device)
+        pack_metadata_(replay, packed)
     native_state, native_page_bytes = native_state_page(device, args.tp, batch, length)
     native_start = reconstruct_native_start(cpu, position).to(device)
     state_indices = torch.arange(1, batch * length + 1, dtype=torch.int32, device=device)
@@ -179,6 +183,8 @@ def run_case(args: argparse.Namespace, batch: int, context: int, length: int, po
             args.tile_v,
             args.cores,
             args.variant,
+            None,
+            packed,
         )
 
     reset_native()
@@ -266,7 +272,7 @@ def main() -> None:
     parser.add_argument("--ring", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument("--tile-v", type=int, choices=(16, 32, 64, 128), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
-    parser.add_argument("--variant", type=int, choices=(*range(14), *range(15, 20)), default=0)
+    parser.add_argument("--variant", type=int, choices=(*range(14), *range(15, 23)), default=0)
     parser.add_argument("--repetitions", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--max-abs-error", type=float, default=0.05)
@@ -274,6 +280,10 @@ def main() -> None:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.variant == 22 and args.tp != 4:
+        parser.error("variant 22 requires TP4 geometry")
+    if args.variant >= 15 and args.tile_v != 128:
+        parser.error("variants 15-22 require --tile-v 128")
     if any(length > 4 for length in args.lengths) or any(pos > 16 for pos in args.positions):
         parser.error("lengths must be 1..4 and positions 0..16")
     if args.accepted < 1 or args.accepted > min(args.lengths):

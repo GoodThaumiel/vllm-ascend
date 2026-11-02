@@ -36,6 +36,7 @@
 #ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD
 #include "replayssm_sd.h"
 #include "replayssm_sd_fused.h"
+#include "replayssm_sd_metadata_probe.h"
 #endif
 #ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD_COMPACT
 #include "replayssm_sd_compact.h"
@@ -2730,6 +2731,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("replayssm_ar_step_", torch::kPrivateUse1, &vllm_ascend::replayssm_ar_step);
 #endif
 #ifdef VLLM_ASCEND_ENABLE_REPLAYSSM_SD
+    ops.def("replayssm_sd_metadata_probe_" VLLM_ASCEND_REPLAYSSM_SD_METADATA_PROBE_SCHEMA);
+    ops.impl("replayssm_sd_metadata_probe_", torch::kPrivateUse1, &vllm_ascend::replayssm_sd_metadata_probe);
     ops.def("replayssm_sd_verify_" VLLM_ASCEND_REPLAYSSM_SD_SCHEMA);
     ops.impl("replayssm_sd_verify_", torch::kPrivateUse1, &vllm_ascend::replayssm_sd_verify);
     ops.def("replayssm_sd_verify_compact_fused_" VLLM_ASCEND_REPLAYSSM_SD_FUSED_SCHEMA);

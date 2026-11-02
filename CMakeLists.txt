@@ -85,9 +85,13 @@ else()
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_v17_spec_rows_ub.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_v18_paired_matvec.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_v19_gate_batch.cpp")
+    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_v20_chunk8k_gate_batch.cpp")
+    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_v21_packed_metadata.cpp")
+    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_v22_grouped_key_heads.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_compact_fused.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_compact.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_cursor.cpp")
+    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_metadata_probe.cpp")
 endif()
 
 set(VLLM_ASCEND_CUSTOM_OP

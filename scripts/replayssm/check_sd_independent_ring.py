@@ -19,7 +19,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from experimental.replayssm_sd_ascendc.lab import clone_page_strided_case, make_case  # noqa: E402
+from experimental.replayssm_sd_ascendc.lab import clone_page_strided_case, make_case, pack_metadata_  # noqa: E402
 
 
 def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3, variant: int = 13) -> dict:
@@ -62,6 +62,10 @@ def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3, variant:
             detached["checkpoint"][new_slot].copy_(tied["checkpoint"][old_slot])
 
         for case, request_slots in ((tied, None), (detached, ring_slots)):
+            packed = None
+            if variant == 21:
+                packed = torch.zeros((2, 8), dtype=torch.int32, device=npu)
+                pack_metadata_(case, packed, request_slots)
             replayssm_sd_verify(
                 *(
                     case[name]
@@ -88,6 +92,7 @@ def run(tp: int, device: int, geometry: str = "27b", mtp_size: int = 3, variant:
                 40,
                 variant,
                 request_slots,
+                packed,
             )
             case["flush"] = torch.full((2,), flush, dtype=torch.int32, device=npu)
             case["compact_status"] = torch.empty((2 * case["v"].shape[2] * 4,), dtype=torch.int32, device=npu)
@@ -130,12 +135,14 @@ def main() -> int:
     parser.add_argument("--tp", type=int, choices=(1, 2, 4, 8), default=4)
     parser.add_argument("--geometry", choices=("27b", "9b"), default="27b")
     parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
-    parser.add_argument("--variant", type=int, choices=(13, 15, 16, 17, 18, 19), default=13)
+    parser.add_argument("--variant", type=int, choices=(13, 15, 16, 17, 18, 19, 20, 21, 22), default=13)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2)):
         parser.error("27b requires TP4/TP8; 9b requires TP1/TP2")
+    if args.variant == 22 and (args.geometry, args.tp) != ("27b", 4):
+        parser.error("variant 22 requires 27b TP4 geometry")
     if args.output.exists():
         parser.error(f"output already exists: {args.output}")
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -217,6 +217,19 @@ def check_result(actual: dict[str, torch.Tensor], expected: dict[str, torch.Tens
     return errors
 
 
+def pack_metadata_(case: dict[str, torch.Tensor], packed: torch.Tensor, ring_slots=None) -> None:
+    """Pack metadata on-device into a stable [B,8] buffer for v21."""
+    fields = (
+        case["slots"],
+        case["slots"] if ring_slots is None else ring_slots,
+        case["positions"],
+        case["bases"],
+        case["lengths"],
+    )
+    for index, field in enumerate(fields):
+        packed[:, index].copy_(field)
+
+
 def invoke(
     case: dict[str, torch.Tensor],
     *,
@@ -258,4 +271,5 @@ def invoke(
         tile_v,
         cores,
         variant,
+        *([None, case.get("packed_metadata")] if backend == "framework" and variant == 21 else []),
     )

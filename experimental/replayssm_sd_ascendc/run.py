@@ -22,6 +22,7 @@ from lab import (
     clone_page_strided_case,
     invoke,
     make_case,
+    pack_metadata_,
     recurrent_golden,
 )
 
@@ -39,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32, 64, 128), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
-    parser.add_argument("--variant", type=int, choices=(*range(14), *range(15, 20)), default=0)
+    parser.add_argument("--variant", type=int, choices=(*range(14), *range(15, 23)), default=0)
     parser.add_argument("--layout", choices=("compact", "page_strided"), default="page_strided")
     parser.add_argument("--stage", choices=("smoke", "graph", "perf", "all"), default="smoke")
     parser.add_argument("--iterations", type=int, default=50)
@@ -64,8 +65,14 @@ def _cpu_case(args: argparse.Namespace, pos: int, length: int, base: int, seed: 
     return case
 
 
-def _device_case(case, device, layout):
-    return (clone_page_strided_case if layout == "page_strided" else clone_case)(case, device)
+def _device_case(case, device, layout, variant):
+    result = (clone_page_strided_case if layout == "page_strided" else clone_case)(case, device)
+    if variant == 21:
+        import torch
+
+        result["packed_metadata"] = torch.zeros((case["slots"].numel(), 8), dtype=torch.int32, device=device)
+        pack_metadata_(result, result["packed_metadata"])
+    return result
 
 
 def _run_once(args, device, pos, length, base, seed, padding=False):
@@ -73,7 +80,7 @@ def _run_once(args, device, pos, length, base, seed, padding=False):
 
     cpu = _cpu_case(args, pos, length, base, seed, padding=padding)
     expected = recurrent_golden(cpu)
-    gpu = _device_case(cpu, device, args.layout)
+    gpu = _device_case(cpu, device, args.layout, args.variant)
     invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
     torch.npu.synchronize()
     actual = clone_case(gpu)
@@ -85,12 +92,18 @@ def _graph_case(args, device, perf=False):
 
     max_tokens = args.mtp_size + 1
     cpu = _cpu_case(args, 7, max_tokens, 29, 157)
-    gpu = _device_case(cpu, device, args.layout)
+    gpu = _device_case(cpu, device, args.layout, args.variant)
     invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
+    combined_graph = None
+    if args.variant == 21:
+        combined_graph = torch.npu.NPUGraph()
+        with torch.npu.graph(combined_graph):
+            pack_metadata_(gpu, gpu["packed_metadata"])
+            invoke(gpu, tile_v=args.tile_v, cores=args.cores, variant=args.variant, backend=args.backend)
     records = []
     for pos, length, base, padding in (
         (0, 1, 0, False),
@@ -111,21 +124,32 @@ def _graph_case(args, device, perf=False):
         cpu = _cpu_case(args, pos, length, base, seed=160 + pos, padding=padding)
         for name in cpu:
             gpu[name].copy_(cpu[name].to(device))
+        if args.variant == 21:
+            pack_metadata_(gpu, gpu["packed_metadata"])
         graph.replay()
         torch.npu.synchronize()
-        records.append(
-            {
-                "position": pos,
-                "length": length,
-                "base": base,
-                "padding": padding,
-                "errors": check_result(clone_case(gpu), recurrent_golden(cpu)),
-            }
-        )
+        expected = recurrent_golden(cpu)
+        record = {
+            "position": pos,
+            "length": length,
+            "base": base,
+            "padding": padding,
+            "errors": check_result(clone_case(gpu), expected),
+        }
+        if combined_graph is not None:
+            for name in (*CACHE_NAMES, "out", "status"):
+                gpu[name].copy_(cpu[name].to(device))
+            # Deliberately invalidate old packed rows: replay must rebuild them.
+            gpu["packed_metadata"].zero_()
+            combined_graph.replay()
+            torch.npu.synchronize()
+            record["pack_plus_verify_errors"] = check_result(clone_case(gpu), expected)
+        records.append(record)
     if not perf:
         return {"graph_cases": records}
 
     timings = {}
+    inclusive_timings = {}
     for pos, length, base in (
         (0, 1, 0),
         (0, max_tokens, 0),
@@ -140,6 +164,8 @@ def _graph_case(args, device, perf=False):
         pristine_device = {name: tensor.to(device) for name, tensor in pristine.items()}
         for name in pristine:
             gpu[name].copy_(pristine_device[name])
+        if args.variant == 21:
+            pack_metadata_(gpu, gpu["packed_metadata"])
         graph.replay()
         torch.npu.synchronize()
         samples = []
@@ -155,16 +181,39 @@ def _graph_case(args, device, perf=False):
             samples.append(start.elapsed_time(end) * 1000)
         check_result(clone_case(gpu), recurrent_golden(pristine))
         ordered = sorted(samples)
-        timings[f"pos{pos}_length{length}"] = {
+        key = f"pos{pos}_length{length}"
+        timings[key] = {
             "p50": statistics.median(samples),
             "p90": ordered[int(0.9 * (len(ordered) - 1))],
             "min": ordered[0],
             "iterations": len(samples),
             "reset_in_timed_region": False,
         }
+        if combined_graph is not None:
+            combined_samples = []
+            for _ in range(args.iterations):
+                for name in (*CACHE_NAMES, "out", "status"):
+                    gpu[name].copy_(pristine_device[name])
+                start = torch.npu.Event(enable_timing=True)
+                end = torch.npu.Event(enable_timing=True)
+                start.record()
+                combined_graph.replay()
+                end.record()
+                end.synchronize()
+                combined_samples.append(start.elapsed_time(end) * 1000)
+            check_result(clone_case(gpu), recurrent_golden(pristine))
+            ordered_combined = sorted(combined_samples)
+            inclusive_timings[key] = {
+                "p50": statistics.median(combined_samples),
+                "p90": ordered_combined[int(0.9 * (len(ordered_combined) - 1))],
+                "min": ordered_combined[0],
+                "iterations": len(combined_samples),
+                "includes": "five-column device pack plus one verify",
+            }
     return {
         "graph_cases": records,
         "graph_replay_us": timings,
+        "graph_pack_plus_verify_us": inclusive_timings,
     }
 
 
@@ -173,7 +222,9 @@ def main() -> None:
     if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2)):
         raise SystemExit("27b requires TP4/TP8; 9b requires TP1/TP2")
     if args.variant >= 15 and (args.backend != "framework" or args.tile_v != 128):
-        raise SystemExit("Variants 15-19 require --backend framework --tile-v 128")
+        raise SystemExit("Variants 15-22 require --backend framework --tile-v 128")
+    if args.variant == 22 and (args.geometry, args.tp) != ("27b", 4):
+        raise SystemExit("Variant 22 requires 27b TP4 geometry")
     value_heads = (48 if args.geometry == "27b" else 32) // args.tp
     report = {
         "stage": args.stage,
@@ -184,7 +235,10 @@ def main() -> None:
         "cores": args.cores,
         "variant": args.variant,
         "effective_cores": min(
-            args.cores, args.batch * value_heads * (1 if args.variant >= 3 else (128 // args.tile_v))
+            args.cores,
+            args.batch
+            * (16 // args.tp if args.variant == 22 else value_heads)
+            * (1 if args.variant >= 3 else (128 // args.tile_v)),
         ),
         "geometry": args.geometry,
         "mtp_size": args.mtp_size,
