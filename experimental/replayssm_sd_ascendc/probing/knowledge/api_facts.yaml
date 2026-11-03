@@ -1,0 +1,22 @@
+# No measured API latency is available from this design delivery.
+schema_version: 1
+platform: Ascend910B4
+cann: 9.2.0
+facts:
+  - id: v20_checkpoint
+    evidence: source_observed
+    source_commit: 5b0a2b0
+    operation: Load_DataCopyPad_queue_Cast_barrier
+    input_dtype: bf16
+    output_dtype: fp32
+    logical_input_bytes_per_task: 32768
+    chunks: 4
+    measured_latency_us: null
+    reason: pending_U1_board_measurement
+  - id: v20_history_correction
+    evidence: source_observed
+    operation: Broadcast_Mul_tree_Add
+    padded_shape: [16, 128]
+    calls_per_task_when_pos_positive_T4: 8
+    measured_latency_us: null
+    reason: pending_U2_board_measurement
