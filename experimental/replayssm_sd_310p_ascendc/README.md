@@ -1,0 +1,14 @@
+# ReplaySSM SD 310P operator pilot
+
+This is an isolated Ascend310P3 pilot. It does not enable ReplaySSM in `vllm serve`.
+The three in-place Torch operators are registered under `replayssm_sd_310p`:
+`verify_`, `compact_`, and `cursor_`. Verify dispatches a separate AscendC
+instantiation for four (MTP3) or six (MTP5) physical candidate tokens.
+
+Inputs and checkpoints are FP16, `g` and the gate ring are FP32, and the
+`d`/`k` rings are FP16. The logical history is 16 and the physical ring is 32.
+The output of verify is FP16. The implementation keeps the validated 910B
+ReplaySSM SD recurrence, but uses the 310P native recurrent kernel as the
+reference for supported AscendC APIs and for operator-only timing.
+
+Build and on-device validation commands are in `LEVEL310P_OPERATORS.md`.
