@@ -1,0 +1,6 @@
+{
+  "source_commit": "d3895ecfcdfd1f23cefde2a9fe2ca94d848372f6",
+  "kernel_origin_commit": "5b0a2b0",
+  "source": "csrc/kernels/replayssm_sd_verify.cpp",
+  "sha256": "7d87db2b9baaf7de7aeefc7ece7c7120e0e9b5e86f368063afd066c5748236c9"
+}

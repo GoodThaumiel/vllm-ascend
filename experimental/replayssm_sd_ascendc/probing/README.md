@@ -1,10 +1,14 @@
-# ReplaySSM verify probing（设计阶段）
+# ReplaySSM verify probing
+
+P1/P2实验已实现，入口 `run.py`，独立CMake构建，不修改生产.so。
+执行与结果口径以[本轮清单](../../../docs/replayssm/checklists/LEVEL3_SD_VERIFY_P1_P2.md)为准。
+冻结源身份见snapshot.json；experiments/verify_snapshot.h包含显式实验改动，并非原文件逐字副本。
 
 [方案](../../../docs/replayssm/VERIFY_PROBING_DESIGN.md) ·
 [源码地图](../../../docs/replayssm_verify_probe_map.md) ·
 [可执行 P0 清单](../../../docs/replayssm/checklists/LEVEL3_SD_VERIFY_PROBING.md)
 
-当前只交付设计和基线复测协议，没有A1/A2、局部采样或新热点API实验二进制。
+P0设计已推进为独立实验代码；设备编译和验证待上机。
 P0复用已提交脚本。不要把结果的存在当作完整TODO已完成。
 
 后续实现runner时约定命令接口（**设计接口，现在不可运行**）：

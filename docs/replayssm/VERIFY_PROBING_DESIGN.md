@@ -1,6 +1,6 @@
 # SD verify 性能 probing：第一轮设计
 
-状态：设计交付；Phase 0 可用现有脚本执行，A1/A2、局部采样和热点 API 新探针尚未实现。
+状态：P0已回传；P1/P2实验实现与执行清单见 [本轮清单](checklists/LEVEL3_SD_VERIFY_P1_P2.md)。以下保留原设计和阶段门槛；实际sink采用匹配的GM原数据写回，U1包含共同MatVec消费者，差异以新清单为准。
 源码锚点：`5b0a2b0`；任务来源：workspace 的 `ReplaySSM_Verify_Performance_Probing_TODO.md`。
 本提交不修改 kernel、binding、服务默认值或精度，不把设计完成当作 TODO 中实机实验的 DoD 完成。
 执行入口：[上机清单](checklists/LEVEL3_SD_VERIFY_PROBING.md)。
