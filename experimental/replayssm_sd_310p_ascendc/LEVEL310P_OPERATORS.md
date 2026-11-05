@@ -36,11 +36,20 @@ FP16 容差或修改 recurrence。
 
 ## 2. 精度与状态生命周期
 
-先运行单算子写回探针，再运行小 batch，确认 eager 与图模式均通过。
+先运行原子化 I/O 探针，再运行单算子写回探针和小 batch。
 `run.py` 的输出 JSON 即回传件：
 
 ```bash
 mkdir -p /tmp/replayssm-310p-l1
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 3 --stage io_probe --device 0 \
+  --output /tmp/replayssm-310p-l1/io-probe.json
+```
+
+这一轮先回传 `io-probe.json`，不要在探针失败后继续运行三个正式算子。
+五项均通过时再执行：
+
+```bash
 for mtp in 3 5; do
   python3 experimental/replayssm_sd_310p_ascendc/run.py \
     --mtp "$mtp" --batch 1 --stage cursor_probe --device 0 \
@@ -56,6 +65,20 @@ for mtp in 3 5; do
     --output "/tmp/replayssm-310p-l1/mtp${mtp}-graph.json"
 done
 ```
+
+`io_probe` 会依次执行 5 个独立 case，**即使一个失败也会记录其余结果**：
+
+| case | 单独检验 | 预期 |
+|---|---|---|
+| `aligned_copy` | 原生 V310 使用的 `DataCopyParams{1,1,0,0}`，32B GM→UB→GM | 8 个输入值原样写回 |
+| `scalar_aligned` | `SetValue` 8 个 int32 + 对齐 `DataCopy` | 8 个 0x1234 |
+| `pad_read` | 4B `DataCopyPad` 读取 + 对齐写回 | 8 个值均为输入首项 |
+| `pad_write` | 4B `DataCopyPad` 写回 | 仅首项为 0x1234 |
+| `block_num` | `GetBlockNum` + 对齐写回 | 8 个 1 |
+
+先只回传 `io-probe.json` 与首次编译错误；如果 aligned 两项未过，不跑后续
+Replay 精度。若 aligned 两项通过而 pad 项失败，下一轮按仓内 V310 的
+`DataCopyPadCustom`/`DataCopyCustom` 改造小块元数据 I/O，暂不更改 recurrence。
 
 `smoke` 覆盖 history 0/7/12/16、ring 跨尾、checkpoint 与请求 ring 槽号分离、混合 flush、padding、
 verify→compact→cursor；`sequence` 覆盖 24 轮接受、折叠和 ring 周转；

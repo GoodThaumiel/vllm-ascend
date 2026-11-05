@@ -5,6 +5,7 @@
 #include <c10/util/Optional.h>
 
 namespace replayssm_sd_310p {
+void io_probe(const at::Tensor& input, const at::Tensor& output, int64_t mode);
 void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& g, const at::Tensor& beta,
             const at::Tensor& checkpoint, const at::Tensor& d_cache,

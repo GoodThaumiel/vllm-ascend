@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--library", type=Path, default=Path(__file__).parent / "build/libreplayssm_sd_310p_torch.so")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
-        "--stage", choices=("cursor_probe", "smoke", "sequence", "graph", "perf", "all"), default="smoke"
+        "--stage", choices=("io_probe", "cursor_probe", "smoke", "sequence", "graph", "perf", "all"), default="smoke"
     )
     parser.add_argument("--mtp", type=int, choices=(3, 5), required=True)
     parser.add_argument("--batch", type=int, default=2)
@@ -140,6 +140,37 @@ def cursor(case: dict[str, torch.Tensor], mtp: int) -> None:
         mtp,
         RING,
     )
+
+
+def io_probe(device: torch.device) -> list[dict]:
+    """Compare aligned copies and scalar writes with 310P nonaligned copies."""
+    values = [17, 23, 31, 41, 47, 59, 67, 73]
+    expected = {
+        0: values,
+        1: [0x1234] * 8,
+        2: [values[0]] * 8,
+        3: [0x1234] + [-1] * 7,
+        4: [1] * 8,
+    }
+    records = []
+    source = torch.tensor(values, dtype=torch.int32, device=device)
+    for mode, name in enumerate(("aligned_copy", "scalar_aligned", "pad_read", "pad_write", "block_num")):
+        output = torch.full((8,), -1, dtype=torch.int32, device=device)
+        try:
+            torch.ops.replayssm_sd_310p.io_probe(source, output, mode)
+            torch.npu.synchronize()
+            actual = output.cpu().tolist()
+            records.append(
+                {
+                    "probe": name,
+                    "status": "PASSED" if actual == expected[mode] else "FAILED",
+                    "actual": actual,
+                    "expected": expected[mode],
+                }
+            )
+        except Exception as error:
+            records.append({"probe": name, "status": "ERROR", "error": str(error)})
+    return records
 
 
 def cursor_probe(args: argparse.Namespace, device: torch.device) -> dict:
@@ -559,6 +590,10 @@ def main() -> None:
                 report[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 report[package] = "not installed"
+        if args.stage == "io_probe":
+            report["io_probe"] = io_probe(device)
+            if any(case["status"] != "PASSED" for case in report["io_probe"]):
+                raise AssertionError("At least one atomic 310P I/O probe failed")
         if args.stage == "cursor_probe":
             report["cursor_probe"] = cursor_probe(args, device)
         if args.stage in ("smoke", "all"):

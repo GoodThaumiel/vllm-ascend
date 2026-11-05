@@ -30,7 +30,8 @@ ascendc_library(replayssm_sd_310p_kernel SHARED
     kernels/verify4.cpp
     kernels/verify6.cpp
     kernels/compact.cpp
-    kernels/cursor.cpp)
+    kernels/cursor.cpp
+    kernels/io_probe.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(
@@ -45,7 +46,7 @@ find_library(TORCH_NPU_LIB torch_npu PATHS "${torch_npu_root}/lib" NO_DEFAULT_PA
 find_library(ASCENDCL_LIB ascendcl PATHS "${ASCEND_CANN_PACKAGE_PATH}/lib64" NO_DEFAULT_PATH REQUIRED)
 
 add_library(replayssm_sd_310p_torch SHARED
-    csrc/binding.cpp csrc/verify.cpp csrc/compact.cpp csrc/cursor.cpp)
+    csrc/binding.cpp csrc/verify.cpp csrc/compact.cpp csrc/cursor.cpp csrc/probe.cpp)
 add_dependencies(replayssm_sd_310p_torch replayssm_sd_310p_kernel)
 target_include_directories(replayssm_sd_310p_torch PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
