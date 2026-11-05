@@ -12,3 +12,5 @@ ReplaySSM SD recurrence, but uses the 310P native recurrent kernel as the
 reference for supported AscendC APIs and for operator-only timing.
 
 Build and on-device validation commands are in `LEVEL310P_OPERATORS.md`.
+The 310P baseline is CANN 9.2.1 with torch_npu 2.10.0.post7. A complete,
+zero-exit CMake build is required before a device result is considered valid.

@@ -31,7 +31,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path, default=Path(__file__).parent / "build/libreplayssm_sd_310p_torch.so")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--stage", choices=("smoke", "sequence", "graph", "perf", "all"), default="smoke")
+    parser.add_argument(
+        "--stage", choices=("cursor_probe", "smoke", "sequence", "graph", "perf", "all"), default="smoke"
+    )
     parser.add_argument("--mtp", type=int, choices=(3, 5), required=True)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(32, 64), default=32)
@@ -138,6 +140,33 @@ def cursor(case: dict[str, torch.Tensor], mtp: int) -> None:
         mtp,
         RING,
     )
+
+
+def cursor_probe(args: argparse.Namespace, device: torch.device) -> dict:
+    """Minimal device writeback gate, independent of verify and compact."""
+    case = make_case(mtp=args.mtp, batch=1, pos=0)
+    cpu = cursor_case(case, args.mtp)
+    cpu["write_pos"][1] = 12
+    cpu["cache_base"][1] = 31
+    cpu["is_flush"][1] = 1
+    gpu = clone(cpu, device)
+    expected = cursor_reference(
+        cpu["write_pos"],
+        cpu["cache_base"],
+        cpu["is_flush"],
+        cpu["accepted"],
+        cpu["slots"],
+        cpu["do_reset"],
+        args.mtp,
+    )
+    cursor(gpu, args.mtp)
+    torch.npu.synchronize()
+    fields = ("write_pos", "cache_base", "is_flush", "status")
+    actual = {name: gpu[name].cpu().tolist() for name in fields}
+    wanted = {name: value.tolist() for name, value in zip(fields, expected)}
+    if actual != wanted:
+        raise AssertionError(f"cursor device writeback failed: actual={actual}, expected={wanted}")
+    return {"actual": actual, "expected": wanted}
 
 
 def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
@@ -373,8 +402,6 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
     gpu = clone(cpu, device)
     cur = clone(cursor_case(cpu, args.mtp), device)
     cur_before = {name: cur[name].clone() for name in ("write_pos", "cache_base", "is_flush", "status")}
-    native_in = native_inputs(cpu, device)
-    native_before = native_in["state"].clone()
     replay_before = {name: gpu[name].clone() for name in CACHE}
 
     verify_graph = graph_of(lambda: verify(gpu, args.tile_v, args.cores))
@@ -383,7 +410,6 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
     combined_graph = graph_of(
         lambda: (verify(gpu, args.tile_v, args.cores), compact(gpu, args.cores), cursor(cur, args.mtp))
     )
-    native_graph = graph_of(lambda: native(native_in))
 
     # The same captured graph must consume new device metadata and cache
     # contents. Rebuilding a graph per position would not test this ABI.
@@ -441,9 +467,6 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
         gpu["verify_status"].fill_(-1)
         gpu["compact_status"].fill_(-1)
 
-    def reset_native() -> None:
-        native_in["state"].copy_(native_before)
-
     def reset_cursor() -> None:
         for name, value in cur_before.items():
             cur[name].copy_(value)
@@ -457,18 +480,6 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
     torch.npu.synchronize()
     expected = verify_reference(cpu)
     result = compare_verify(gpu, expected)
-    reset_native()
-    native_out = native(native_in).reshape_as(gpu["out"])
-    torch.npu.synchronize()
-    # Native consumes one FP16 checkpoint materialized from the history.
-    # Replay consumes the FP16 ring and accumulates the history in FP32;
-    # report this extra rounding separately for nonzero history.
-    try:
-        result["native_vs_dense_out"] = fp16_error(native_out.cpu(), expected["out"])
-    except AssertionError as error:
-        if pos == 0:
-            raise
-        result["native_vs_dense_out"] = {"status": "DIFFERENT_ROUNDING", "detail": str(error)}
 
     record = {
         "pos": pos,
@@ -480,6 +491,24 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
         "dynamic_cursor": dynamic_cursor,
     }
     if perf:
+        native_in = native_inputs(cpu, device)
+        native_before = native_in["state"].clone()
+        native_graph = graph_of(lambda: native(native_in))
+
+        def reset_native() -> None:
+            native_in["state"].copy_(native_before)
+
+        reset_native()
+        native_out = native(native_in).reshape_as(gpu["out"])
+        torch.npu.synchronize()
+        # The native path starts from a materialized FP16 history state.
+        # Report its additional rounding separately from graph timing.
+        try:
+            result["native_vs_dense_out"] = fp16_error(native_out.cpu(), expected["out"])
+        except AssertionError as error:
+            if pos == 0:
+                raise
+            result["native_vs_dense_out"] = {"status": "DIFFERENT_ROUNDING", "detail": str(error)}
         record["graph_replay_us"] = {
             "verify": time_graph(verify_graph, reset_replay, warmup=args.warmup, iterations=args.iterations),
             "compact": time_graph(compact_graph, reset_replay, warmup=args.warmup, iterations=args.iterations),
@@ -491,10 +520,11 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
 
 
 def graph_and_perf(args: argparse.Namespace, device: torch.device, perf: bool) -> list[dict]:
-    from vllm_ascend.utils import enable_custom_op
+    if perf:
+        from vllm_ascend.utils import enable_custom_op
 
-    if not enable_custom_op():
-        raise RuntimeError("vllm_ascend native custom operators are unavailable")
+        if not enable_custom_op():
+            raise RuntimeError("vllm_ascend native custom operators are unavailable")
 
     return [
         _graph_case(args, device, pos, base, flush, perf)
@@ -529,6 +559,8 @@ def main() -> None:
                 report[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 report[package] = "not installed"
+        if args.stage == "cursor_probe":
+            report["cursor_probe"] = cursor_probe(args, device)
         if args.stage in ("smoke", "all"):
             report["smoke"] = smoke(args, device)
         if args.stage in ("sequence", "all"):

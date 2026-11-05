@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(replayssm_sd_310p_ascendc LANGUAGES C CXX)
 
 set(SOC_VERSION "Ascend310P3" CACHE STRING "AscendC compiler SoC")
-set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/cann-9.2.0" CACHE PATH "CANN root")
+set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/cann-9.2.1" CACHE PATH "CANN root")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

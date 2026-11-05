@@ -31,7 +31,8 @@ TORCH_LIBRARY_IMPL(replayssm_sd_310p, Meta, m) {
                         double, int64_t, int64_t, c10::optional<at::Tensor>) {});
   m.impl("compact_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                          const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                         const at::Tensor&, const at::Tensor&, int64_t, int64_t,
+                         const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                         int64_t, int64_t,
                          c10::optional<at::Tensor>) {});
   m.impl("cursor_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&,

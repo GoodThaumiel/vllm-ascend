@@ -1,7 +1,7 @@
 # L310P.1 ReplaySSM SD 独立算子上机清单
 
-目标：Ascend310P3 × 2（每次先在其中一张卡做隔离测试），CANN 9.2.0、
-torch_npu 2.10.0.post4、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
+目标：Ascend310P3 × 2（每次先在其中一张空闲卡做隔离测试），CANN 9.2.1、
+torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
 ## 1. 环境、构建、加载
@@ -16,24 +16,35 @@ python3 -c 'import torch, torch_npu; print(torch.__version__, torch_npu.__versio
 python3 -m unittest experimental.replayssm_sd_310p_ascendc.tests.test_reference
 cmake -S experimental/replayssm_sd_310p_ascendc -B experimental/replayssm_sd_310p_ascendc/build \
   -DSOC_VERSION=Ascend310P3 \
-  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.0 \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
   -DPython3_EXECUTABLE="$(command -v python3)"
 cmake --build experimental/replayssm_sd_310p_ascendc/build -j 8
 readelf -d experimental/replayssm_sd_310p_ascendc/build/libreplayssm_sd_310p_torch.so | grep -E 'RPATH|RUNPATH'
 python3 -c 'import torch, torch_npu; torch.ops.load_library("experimental/replayssm_sd_310p_ascendc/build/libreplayssm_sd_310p_torch.so"); print(torch.ops.replayssm_sd_310p.verify_._schemas, torch.ops.replayssm_sd_310p.compact_._schemas, torch.ops.replayssm_sd_310p.cursor_._schemas)'
 ```
 
-如果编译失败，立即停止，不运行旧 `.so`。回传第一条 CCE 错误、完整编译日志、
+**构建命令必须以退出码 0 完成**。`merge_m200_obj_text` 即使在 `.so` 出现后失败，
+也视为构建失败；符号、RPATH 和加载成功均不能证明设备代码实际执行。不要手工重链
+或运行该次产物。回传第一条错误、完整编译日志、
 `CMakeCache.txt` 中的 SoC/CANN/Python 配置，以及构建目录下的文件清单。
-优先区分编译器 API 不支持、UB 预算、link/RPATH、运行时设备错误。
+优先区分编译器 API 不支持、M200 合并失败、UB 预算、link/RPATH、运行时设备错误。
+
+上轮 `1a789b1` 的 MTP3/MTP5 verify 误差与**全零输出**的 CPU 结果逐位一致，
+且三个算子的状态均保持初值。若完整构建通过但仍复现，请先以空闲卡运行 cursor 的
+独立测试，并回传该次 `msprof` 的任务名、task duration 和首个设备错误；暂不调
+FP16 容差或修改 recurrence。
 
 ## 2. 精度与状态生命周期
 
-先运行小 batch，确认 eager 与图模式均通过。`run.py` 的输出 JSON 即回传件：
+先运行单算子写回探针，再运行小 batch，确认 eager 与图模式均通过。
+`run.py` 的输出 JSON 即回传件：
 
 ```bash
 mkdir -p /tmp/replayssm-310p-l1
 for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 1 --stage cursor_probe --device 0 \
+    --output "/tmp/replayssm-310p-l1/mtp${mtp}-cursor-probe.json"
   python3 experimental/replayssm_sd_310p_ascendc/run.py \
     --mtp "$mtp" --batch 2 --stage smoke --device 0 \
     --output "/tmp/replayssm-310p-l1/mtp${mtp}-smoke.json"
@@ -48,7 +59,8 @@ done
 
 `smoke` 覆盖 history 0/7/12/16、ring 跨尾、checkpoint 与请求 ring 槽号分离、混合 flush、padding、
 verify→compact→cursor；`sequence` 覆盖 24 轮接受、折叠和 ring 周转；
-`graph` 在捕获后更改设备元数据并重放。逐元素 int32 状态码必须精确一致；
+`graph` 只检查 Replay 三算子，捕获后更改设备元数据并重放，不依赖 native aclnn。
+逐元素 int32 状态码必须精确一致；
 FP16 输出和 checkpoint 使用 atol=rtol=2^-9、匹配率至少 99%、
 最大绝对误差不超过 0.1 的混合容差，并记录实际最大误差。
 
@@ -57,6 +69,19 @@ FP16 输出和 checkpoint 使用 atol=rtol=2^-9、匹配率至少 99%、
 只有第 2 节全过后才运行性能矩阵。脚本直接调用
 `torch.ops._C_ascend.npu_recurrent_gated_delta_rule_310`，与 Replay 使用相同
 Q/K/V/g/beta；native 的初始 state 先从同一份 checkpoint 和 history 重建。
+该算子是 vllm-ascend 源码中 `csrc/attention/recurrent_gated_delta_rule_v310`
+定义的**自定义 ACLNN**，不能只在 CANN 内置 `libopapi.so` 查找。先确认
+`vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_api/lib/libcust_opapi.so`
+存在且导出 `aclnnRecurrentGatedDeltaRuleV310`，再运行性能矩阵：
+
+```bash
+find vllm_ascend/_cann_ops_custom -name 'libcust_opapi.so' -print
+find vllm_ascend/_cann_ops_custom -name 'libcust_opapi.so' \
+  -exec sh -c 'nm -D "$1" | grep RecurrentGatedDeltaRuleV310' _ {} \;
+```
+
+若缺少自定义库/符号，需检查本机 vllm-ascend 的 `build_aclnn` 产物及
+`ASCEND_CUSTOM_OPP_PATH`；此时仍可完成 Replay 的 graph 验证，但暂不做 native 对比。
 计时区不含输入准备和状态重置，预热 20 次、图重放 100 次：
 
 ```bash
