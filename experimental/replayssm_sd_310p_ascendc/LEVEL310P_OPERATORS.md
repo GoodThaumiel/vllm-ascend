@@ -4,7 +4,50 @@
 torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
-## V8 增量：M200 输出 Cast 修复与精度验证（当前清单）
+## V9 增量：区分 verify 舍入差与 compact 写坏 cache（当前清单）
+
+V8 的 MTP3/5 smoke 都先通过 `compare_verify`，随后在 `compare_compact` 的
+ring cache 逐位比较处失败：分别是 2/196608 与 1/196608 个元素，
+最大绝对差 1.91e-6 与 9.54e-7。`compact_reference` 不修改 d/k/g ring；
+此前的比较却把 GPU verify 写出的 ring 与独立 CPU verify 的 ring 强制逐位
+一致，因而会把上一步的 FP16 舍入差误报成 compact 失败。
+
+本版将检查拆成两层：**compact 前后的 d/k/g ring 必须逐元素完全不变**；
+之后 d/k 与 CPU 参考使用 verify 已有的 `fp16_error` 判定，记录最大误差和
+逐位不一致元素数，
+g 仍逐位一致。checkpoint 的原有 FP16 比对、status 的精确比对不变。
+这不会放过 compact 写坏 ring 的错误；若 V8 的差异并非来自 verify，
+新的前后比对仍会失败。
+
+本次只改 Python 验证脚本，沿用上一轮 `dbf4c4afe` 成功构建的 `.so` 即可；
+请确认拉取后的 `git rev-parse HEAD`，再按顺序运行。任一 smoke 失败即停，
+回传对应 JSON 与首个错误；不需要重复 V8 已通过的 Cast/对齐探针。
+
+```bash
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage smoke --tile-v 32 --device 0 \
+    --output "/tmp/replayssm-310p-v9-mtp${mtp}-smoke.json"
+done
+```
+
+两组 smoke 全过后，再验证多轮状态与图重放：
+
+```bash
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 1 --stage sequence --device 0 \
+    --output "/tmp/replayssm-310p-v9-mtp${mtp}-sequence.json"
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage graph --device 0 \
+    --output "/tmp/replayssm-310p-v9-mtp${mtp}-graph.json"
+done
+```
+
+回传四组 JSON、每个 case 的 `verify`/`compact` 误差、设备错误和首个失败
+栈。当前 verify/compact 仍以单核保证 32B 块归属，本轮不做性能验收。
+
+## V8 增量：M200 输出 Cast 修复与精度验证（历史清单）
 
 V7 在 count=16/32/64 上确认：对齐 FP16/FP32 搬运与 `CAST_NONE` 双向转换
 全部逐位通过，`CAST_RINT` 单向和 round-trip 全部失败。仓内原生

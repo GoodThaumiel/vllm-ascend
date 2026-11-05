@@ -110,11 +110,34 @@ def compare_verify(actual: dict[str, torch.Tensor], expected: dict[str, torch.Te
     return result
 
 
-def compare_compact(actual: dict[str, torch.Tensor], expected: dict[str, torch.Tensor]) -> dict:
+def compare_compact(
+    actual: dict[str, torch.Tensor],
+    expected: dict[str, torch.Tensor],
+    cache_before: dict[str, torch.Tensor],
+) -> dict:
     torch.testing.assert_close(actual["compact_status"].cpu(), expected["compact_status"], atol=0, rtol=0)
     result = {"checkpoint": fp16_error(actual["checkpoint"].cpu(), expected["checkpoint"])}
     for name in ("d_cache", "k_cache", "g_cache"):
-        torch.testing.assert_close(actual[name].cpu(), expected[name], atol=0, rtol=0, equal_nan=True)
+        after = actual[name].cpu()
+        # Compact only folds the checkpoint. The ring must remain exactly as
+        # verify produced it, including any FP16 rounding difference from the
+        # independent CPU verify reference.
+        bit_dtype = torch.int16 if after.dtype == torch.float16 else torch.int32
+        changed = after.view(bit_dtype) != cache_before[name].view(bit_dtype)
+        if bool(changed.any()):
+            first = tuple(torch.nonzero(changed, as_tuple=False)[0].tolist())
+            raise AssertionError(f"compact changed {name}: count={int(changed.sum())}, first={first}")
+        if name == "g_cache":
+            torch.testing.assert_close(after, expected[name], atol=0, rtol=0, equal_nan=True)
+            result[name] = {"max_abs": 0.0, "unchanged": True}
+        else:
+            result[name] = {
+                **fp16_error(after, expected[name]),
+                "exact_mismatch_count": int(
+                    (~torch.isclose(after, expected[name], atol=0, rtol=0, equal_nan=True)).sum().item()
+                ),
+                "unchanged": True,
+            }
     return result
 
 
@@ -344,9 +367,10 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
         torch.npu.synchronize()
         verify_errors = compare_verify(gpu, expected)
         compact_expected = compact_reference(expected)
+        cache_before = {name: gpu[name].cpu().clone() for name in ("d_cache", "k_cache", "g_cache")}
         compact(gpu, args.cores)
         torch.npu.synchronize()
-        compact_errors = compare_compact(gpu, compact_expected)
+        compact_errors = compare_compact(gpu, compact_expected, cache_before)
         cursor_cpu = cursor_case(cpu, args.mtp)
         cursor_gpu = clone(cursor_cpu, device)
         wp, base_expected, fl, status = cursor_reference(
@@ -437,9 +461,10 @@ def sequence(args: argparse.Namespace, device: torch.device) -> list[dict]:
         torch.npu.synchronize()
         verify_errors = compare_verify(gpu, expected_verify)
         expected_compact = compact_reference(expected_verify)
+        cache_before = {name: gpu[name].cpu().clone() for name in ("d_cache", "k_cache", "g_cache")}
         compact(gpu, args.cores)
         torch.npu.synchronize()
-        compact_errors = compare_compact(gpu, expected_compact)
+        compact_errors = compare_compact(gpu, expected_compact, cache_before)
         cpu = expected_compact
 
         accepted = accepted_pattern[step % len(accepted_pattern)]
@@ -575,9 +600,10 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
     dynamic_verify = compare_verify(gpu, verify_reference(alternate))
     for name in alternate:
         gpu[name].copy_(alternate[name].to(device))
+    cache_before = {name: gpu[name].cpu().clone() for name in ("d_cache", "k_cache", "g_cache")}
     compact_graph.replay()
     torch.npu.synchronize()
-    dynamic_compact = compare_compact(gpu, compact_reference(alternate))
+    dynamic_compact = compare_compact(gpu, compact_reference(alternate), cache_before)
     for name in cpu:
         gpu[name].copy_(cpu[name].to(device))
     for name, value in cur_before.items():
