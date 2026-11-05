@@ -96,6 +96,47 @@ class ReferenceTests(unittest.TestCase):
         self.assertTrue(torch.equal(result["out"][1], torch.zeros_like(result["out"][1])))
         self.assertTrue(torch.equal(result["verify_status"], torch.zeros_like(result["verify_status"])))
 
+    def test_compact_metadata_errors_preserve_state(self):
+        changes = (
+            ("slots", -1, 1),
+            ("slots", 0, 4),
+            ("ring_slots", -1, 6),
+            ("positions", HISTORY + 1, 2),
+            ("bases", RING, 3),
+            ("flush", 2, 5),
+        )
+        for field, value, error in changes:
+            with self.subTest(field=field, value=value):
+                case = make_case(mtp=3, pos=0)
+                if field == "slots":
+                    case["flush"][0] = 1 if value == 0 else 0
+                elif field == "ring_slots":
+                    case["flush"][0] = 1
+                case[field][0] = value
+                result = compact_reference(case)
+                self.assertTrue(torch.all(result["compact_status"] == error))
+                for name in ("checkpoint", "d_cache", "k_cache", "g_cache"):
+                    torch.testing.assert_close(result[name], case[name], atol=0, rtol=0, equal_nan=True)
+
+    def test_verify_metadata_errors_preserve_cache(self):
+        changes = (
+            ("slots", -1, 1),
+            ("slots", 0, 4),
+            ("ring_slots", -1, 5),
+            ("positions", HISTORY + 1, 2),
+            ("bases", RING, 3),
+            ("lengths", 0, 2),
+        )
+        for field, value, error in changes:
+            with self.subTest(field=field, value=value):
+                case = make_case(mtp=3, pos=0)
+                case[field][0] = value
+                result = verify_reference(case)
+                self.assertTrue(torch.all(result["verify_status"] == error))
+                self.assertTrue(torch.all(result["out"] == 0))
+                for name in ("checkpoint", "d_cache", "k_cache", "g_cache"):
+                    torch.testing.assert_close(result[name], case[name], atol=0, rtol=0, equal_nan=True)
+
     def test_invalid_geometry(self):
         for kwargs in ({"mtp": 4}, {"pos": 17}, {"base": 32}, {"tile_v": 128}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):

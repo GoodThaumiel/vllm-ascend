@@ -4,7 +4,49 @@
 torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
-## V9 增量：区分 verify 舍入差与 compact 写坏 cache（当前清单）
+## V10 增量：compact 保留槽状态码（当前清单）
+
+V9 的前四组 MTP3/5 smoke 均通过。最后一组把 padding 行的 `slot=0`
+与 `flush=1` 组合在一起，kernel 按 Validate 返回状态码 4，而 CPU 参考
+没有执行 Validate，导致 status 比对失败。本版按 kernel 优先级补齐
+`compact_reference` 的状态码 1/2/3/4/5/6；正常 padding 行明确设
+`flush=0`，并另加非法 `slot=0, flush=1` 的设备负例，必须返回 4、
+且 checkpoint 与 d/k/g ring 保持不变。`verify_reference` 同步补齐仓内
+verify kernel 已有的元数据状态码，避免后续非法输入被参考实现误判为成功。
+verify/compact/cursor 设备代码不变。
+
+本次只有 Python 测试代码变化，沿用 V8 已构建的 `.so` 即可。确认拉取的
+commit 后，在仓库根目录运行；任一 smoke 失败即停并回传完整 JSON/首个错误：
+
+```bash
+git rev-parse HEAD
+git status --short
+python3 -m unittest experimental.replayssm_sd_310p_ascendc.tests.test_reference
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage smoke --tile-v 32 --device 0 \
+    --output "/tmp/replayssm-310p-v10-mtp${mtp}-smoke.json"
+done
+```
+
+两组 smoke 均通过后，再运行多轮状态与图重放：
+
+```bash
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 1 --stage sequence --device 0 \
+    --output "/tmp/replayssm-310p-v10-mtp${mtp}-sequence.json"
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage graph --device 0 \
+    --output "/tmp/replayssm-310p-v10-mtp${mtp}-graph.json"
+done
+```
+
+回传四组 JSON、每组 `verify`/`compact` 最大误差与 `exact_mismatch_count`、
+非法 padding case 的 status、首个失败栈和设备错误。当前单核路径只验证
+正确性；尚未恢复 32B 块的多核归属，不测性能。
+
+## V9 增量：区分 verify 舍入差与 compact 写坏 cache（历史清单）
 
 V8 的 MTP3/5 smoke 都先通过 `compare_verify`，随后在 `compare_compact` 的
 ring cache 逐位比较处失败：分别是 2/196608 与 1/196608 个元素，

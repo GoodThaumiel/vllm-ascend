@@ -77,12 +77,34 @@ def verify_reference(case: dict[str, torch.Tensor], scale: float = DIM**-0.5) ->
     result = clone(case)
     result["out"].zero_()
     result["verify_status"].zero_()
+    row_tasks = result["verify_status"].numel() // case["slots"].numel()
+    max_tokens = case["q"].shape[1]
     for row in range(case["slots"].numel()):
         slot = int(case["slots"][row])
-        if slot == 0:
-            continue
         ring_slot = int(case["ring_slots"][row])
         pos, base, length = (int(case[name][row]) for name in ("positions", "bases", "lengths"))
+        if slot < 0 or slot >= case["checkpoint"].shape[0]:
+            error = 1
+        elif slot == 0:
+            error = 4 if pos != 0 or base != 0 or length != 0 else 0
+        elif ring_slot < 0 or ring_slot >= case["d_cache"].shape[0]:
+            error = 5
+        elif (
+            pos < 0
+            or pos > HISTORY
+            or length < 1
+            or length > max_tokens
+            or pos + length > HISTORY + max_tokens
+            or pos + length > RING
+        ):
+            error = 2
+        elif base < 0 or base >= RING:
+            error = 3
+        else:
+            error = 0
+        result["verify_status"][row * row_tasks : (row + 1) * row_tasks] = error
+        if error or slot == 0:
+            continue
         for head in range(VALUE_HEADS):
             key_head = head // (VALUE_HEADS // KEY_HEADS)
             state = case["checkpoint"][slot, head].double()
@@ -112,12 +134,27 @@ def verify_reference(case: dict[str, torch.Tensor], scale: float = DIM**-0.5) ->
 def compact_reference(case: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     result = clone(case)
     result["compact_status"].zero_()
+    row_tasks = result["compact_status"].numel() // case["slots"].numel()
     for row in range(case["slots"].numel()):
         slot = int(case["slots"][row])
-        if slot == 0 or not int(case["flush"][row]):
-            continue
         ring_slot = int(case["ring_slots"][row])
         pos, base = int(case["positions"][row]), int(case["bases"][row])
+        flush = int(case["flush"][row])
+        if slot < 0 or slot >= case["checkpoint"].shape[0]:
+            error = 1
+        elif slot == 0:
+            error = 4 if pos != 0 or base != 0 or flush != 0 else 0
+        elif flush != 0 and (ring_slot < 0 or ring_slot >= case["d_cache"].shape[0]):
+            error = 6
+        elif pos < 0 or pos > HISTORY:
+            error = 2
+        elif base < 0 or base >= RING:
+            error = 3
+        else:
+            error = 5 if flush not in (0, 1) else 0
+        result["compact_status"][row * row_tasks : (row + 1) * row_tasks] = error
+        if error or slot == 0 or flush == 0 or pos == 0:
+            continue
         for head in range(VALUE_HEADS):
             key_head = head // (VALUE_HEADS // KEY_HEADS)
             state = case["checkpoint"][slot, head].float()

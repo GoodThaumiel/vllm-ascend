@@ -353,6 +353,7 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
         cpu["flush"].fill_(flush)
         if args.batch > 1:
             cpu["flush"][0] = 1 - flush  # mixed flush rows
+        cpu["flush"][cpu["slots"] == 0] = 0  # reserved padding slot has no pending state
         detached_ring = args.batch > 1 and pos == 12
         if detached_ring:
             # Keep checkpoint ids unchanged while exchanging request-owned ring
@@ -401,6 +402,26 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
                 "verify": verify_errors,
                 "compact": compact_errors,
                 "cursor": "PASSED",
+            }
+        )
+    if args.batch > 1:
+        # Keep the normal padding case valid, then test the reserved-slot
+        # error explicitly rather than silently accepting malformed metadata.
+        invalid = make_case(mtp=args.mtp, batch=args.batch, pos=0, padding=True)
+        invalid["flush"][-1] = 1
+        invalid_gpu = clone(invalid, device)
+        invalid_expected = compact_reference(invalid)
+        cache_before = {name: invalid_gpu[name].cpu().clone() for name in ("d_cache", "k_cache", "g_cache")}
+        compact(invalid_gpu, args.cores)
+        torch.npu.synchronize()
+        invalid_errors = compare_compact(invalid_gpu, invalid_expected, cache_before)
+        status_rows = invalid_gpu["compact_status"].cpu().reshape(args.batch, -1)
+        records.append(
+            {
+                "invalid_padding_flush": {
+                    "status_by_row": [int(row[0]) for row in status_rows],
+                    "compact": invalid_errors,
+                }
             }
         )
     records.append({"invalid_bindings": invalid_bindings(args, device)})
