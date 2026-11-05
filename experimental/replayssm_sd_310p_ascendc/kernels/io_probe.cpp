@@ -14,9 +14,54 @@ extern "C" __global__ __aicore__ void replayssm_sd_310p_io_probe(
   TPipe pipe;
   TQue<QuePosition::VECIN, 1> inputQueue;
   TQue<QuePosition::VECOUT, 1> outputQueue;
+  TBuf<QuePosition::VECCALC> calcBuffer;
   pipe.InitBuffer(inputQueue, 1, 32);
   pipe.InitBuffer(outputQueue, 1, 32);
+  pipe.InitBuffer(calcBuffer, 64);
   DataCopyParams aligned{1, 1, 0, 0};  // one 32-byte block, as in native V310
+
+  if (mode == 6) {
+    // One 32-byte block holds 16 FP16 values, but only 8 FP32 values.
+    GlobalTensor<half> sourceHalf, destinationHalf;
+    sourceHalf.SetGlobalBuffer((__gm__ half*)input);
+    destinationHalf.SetGlobalBuffer((__gm__ half*)output);
+    auto packed = inputQueue.AllocTensor<half>();
+    DataCopy(packed, sourceHalf, aligned);
+    inputQueue.EnQue(packed);
+    packed = inputQueue.DeQue<half>();
+    auto expanded = calcBuffer.Get<float>();
+    Cast(expanded, packed, RoundMode::CAST_NONE, 16);
+    PipeBarrier<PIPE_V>();
+    auto result = outputQueue.AllocTensor<half>();
+    Cast(result, expanded, RoundMode::CAST_RINT, 16);
+    outputQueue.EnQue(result);
+    result = outputQueue.DeQue<half>();
+    DataCopy(destinationHalf, result, aligned);
+    outputQueue.FreeTensor(result);
+    inputQueue.FreeTensor(packed);
+    return;
+  }
+
+  if (mode == 7) {
+    GlobalTensor<float> sourceFloat, destinationFloat;
+    sourceFloat.SetGlobalBuffer((__gm__ float*)input);
+    destinationFloat.SetGlobalBuffer((__gm__ float*)output);
+    auto packed = inputQueue.AllocTensor<float>();
+    DataCopy(packed, sourceFloat, aligned);
+    inputQueue.EnQue(packed);
+    packed = inputQueue.DeQue<float>();
+    auto copied = calcBuffer.Get<float>();
+    Adds(copied, packed, 0.0f, 8);
+    PipeBarrier<PIPE_V>();
+    auto result = outputQueue.AllocTensor<float>();
+    Adds(result, copied, 1.0f, 8);
+    outputQueue.EnQue(result);
+    result = outputQueue.DeQue<float>();
+    DataCopy(destinationFloat, result, aligned);
+    outputQueue.FreeTensor(result);
+    inputQueue.FreeTensor(packed);
+    return;
+  }
 
   if (mode == 0 || mode == 2) {
     auto local = inputQueue.AllocTensor<int32_t>();

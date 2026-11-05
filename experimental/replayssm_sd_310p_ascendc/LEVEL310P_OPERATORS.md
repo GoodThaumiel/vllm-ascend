@@ -4,6 +4,34 @@
 torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
+## V6 增量：区分 FP16/FP32 块宽并检查 UB 内复制
+
+V5 的 status 写回通过，但 verify 在 `pos=0` 仍出现大量 NaN。此时没有有效
+history 行被读取，因此不能仅凭 V5 报告把故障归因于读取了邻近 NaN ring 槽。
+本轮把 verify/compact 中 UB 内 FP32 `DataCopy` 改为原生 V310 使用的
+`Adds(x, 0)` 复制方式；compact 逐项读取 FP32 gate 时先向下对齐地址，再取块内
+目标元素。另增加两个原子探针：FP16 的 32B 块有 **16** 个元素，
+FP32 的 32B 块有 **8** 个元素。读写的块数均按 `ceil(元素数×sizeof(T)/32)`
+计算；仅对有效位置参与计算，不清零测试数据中的未使用 NaN 槽。
+
+完成第 1 节的全新构建后，先运行已知支持的对齐探针，再运行 MTP3/5 smoke：
+
+```bash
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 3 --stage aligned_probe --device 0 \
+  --output /tmp/replayssm-310p-v6-aligned.json
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage smoke --tile-v 32 --device 0 \
+    --output "/tmp/replayssm-310p-v6-mtp${mtp}-smoke.json"
+done
+```
+
+`aligned_probe` 应包含原有 4 项及 `fp16_block_cast`、`fp32_block_copy`，
+全部通过后再跑 smoke。任一 smoke 失败即停止，回传首个失败 case 的 JSON、
+完整报错、`out` 的 NaN 数量和前 16 个输出值。两组 smoke 均通过后再跑
+第 2 节的 `sequence` 和 `graph`；本轮仍为单核，不做性能比较。
+
 ## V5 增量：验证 verify/compact 对齐搬运
 
 V3 已证实 4B `DataCopyPad` 读写失败；V4 的 `aligned_probe` 和 MTP3/5

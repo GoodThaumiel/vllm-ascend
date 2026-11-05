@@ -172,8 +172,14 @@ def cursor_reference(
 def fp16_error(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     actual, expected = actual.float(), expected.float()
     finite = torch.isfinite(expected)
-    if not torch.equal(torch.isfinite(actual), finite):
-        raise AssertionError("Finite mask mismatch")
+    actual_finite = torch.isfinite(actual)
+    if not torch.equal(actual_finite, finite):
+        first = tuple(torch.nonzero(actual_finite != finite, as_tuple=False)[0].tolist())
+        raise AssertionError(
+            f"Finite mask mismatch: actual_nonfinite={(~actual_finite).sum().item()}, "
+            f"expected_nonfinite={(~finite).sum().item()}, first={first}, "
+            f"actual={actual[first].item()}, expected={expected[first].item()}"
+        )
     diff = (actual[finite] - expected[finite]).abs()
     matched = diff <= (2**-9 + 2**-9 * expected[finite].abs())
     ratio = float(matched.float().mean()) if diff.numel() else 1.0

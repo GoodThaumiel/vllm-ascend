@@ -226,7 +226,7 @@ class ReplaySDVerify {
         SyncVectorToScalar();
         Load(g_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateLogGate_,
              MAX_TOKENS * valueHeads_);
-        DataCopy(candidateGate_, candidateLogGate_, MAX_TOKENS * valueHeads_);
+        Adds(candidateGate_, candidateLogGate_, 0.0f, MAX_TOKENS * valueHeads_);
         PipeBarrier<PIPE_V>();
         Exp(candidateGate_, candidateGate_, MAX_TOKENS * valueHeads_);
         PipeBarrier<PIPE_V>();
@@ -314,8 +314,8 @@ class ReplaySDVerify {
         Add(result_, prevQ_, term_, tileV_);
         PipeBarrier<PIPE_V>();
         Store(out_, vOffset, result_, tileV_);
-        DataCopy(specD_[s * tileV_], delta_, tileV_);
-        DataCopy(specK_[s * K_DIM], kLocal_, K_DIM);
+        Adds(specD_[s * tileV_], delta_, 0.0f, tileV_);
+        Adds(specK_[s * K_DIM], kLocal_, 0.0f, K_DIM);
         PipeBarrier<PIPE_V>();
         const uint32_t phys = Physical(base, pos + s);
         Store(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart, delta_, tileV_);
@@ -406,7 +406,7 @@ class ReplaySDVerify {
       PipeBarrier<PIPE_V>();
       Load(g_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateLogGate_,
            MAX_TOKENS * valueHeads_);
-      DataCopy(candidateGate_, candidateLogGate_, MAX_TOKENS * valueHeads_);
+      Adds(candidateGate_, candidateLogGate_, 0.0f, MAX_TOKENS * valueHeads_);
       PipeBarrier<PIPE_V>();
       Exp(candidateGate_, candidateGate_, MAX_TOKENS * valueHeads_);
       PipeBarrier<PIPE_V>();
@@ -689,7 +689,7 @@ class ReplaySDVerify {
           Add(result_, prevQ_, term_, tileV_);
           PipeBarrier<PIPE_V>();
           Store(out_, vOffset, result_, tileV_);
-          DataCopy(specD_[s * tileV_], delta_, tileV_);
+          Adds(specD_[s * tileV_], delta_, 0.0f, tileV_);
           PipeBarrier<PIPE_V>();
           const uint32_t phys = Physical(base, pos + s);
           Store(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart, delta_, tileV_);
@@ -812,7 +812,7 @@ class ReplaySDVerify {
         PipeBarrier<PIPE_V>();
         Load(g_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateLogGate_,
              MAX_TOKENS * valueHeads_);
-        DataCopy(candidateGate_, candidateLogGate_, MAX_TOKENS * valueHeads_);
+        Adds(candidateGate_, candidateLogGate_, 0.0f, MAX_TOKENS * valueHeads_);
         PipeBarrier<PIPE_V>();
         Exp(candidateGate_, candidateGate_, MAX_TOKENS * valueHeads_);
         PipeBarrier<PIPE_V>();
@@ -1096,7 +1096,7 @@ class ReplaySDVerify {
             Add(result_, prevQ_, term_, tileV_);
             PipeBarrier<PIPE_V>();
             Store(out_, vOffset, result_, tileV_);
-            DataCopy(specD_[s * tileV_], delta_, tileV_);
+            Adds(specD_[s * tileV_], delta_, 0.0f, tileV_);
             PipeBarrier<PIPE_V>();
             const uint32_t phys = Physical(base, pos + s);
             Store(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart, delta_, tileV_);
@@ -1205,7 +1205,7 @@ class ReplaySDVerify {
   __aicore__ inline void SpecCurrentTerm(LocalTensor<float> delta, LocalTensor<float> dots, uint32_t token) {
     Duplicate(historyCoeff_, 0.0f, MAX_HISTORY);
     PipeBarrier<PIPE_V>();
-    DataCopy(historyCoeff_, dots, SPEC_ROWS);
+    Adds(historyCoeff_, dots, 0.0f, SPEC_ROWS);
     PipeBarrier<PIPE_V>();
     uint32_t dstShape[2] = {MAX_HISTORY, tileV_};
     uint32_t srcShape[2] = {MAX_HISTORY, 1};
@@ -1280,7 +1280,7 @@ class ReplaySDVerify {
     in_.EnQue(input);
     input = in_.DeQue<T>();
     if constexpr (sizeof(T) == sizeof(float)) {
-      DataCopy(dest, input[start], (count + FP32_BLOCK - 1) / FP32_BLOCK * FP32_BLOCK);
+      Adds(dest, input[start], 0.0f, count);
     } else {
       Cast(dest, input[start], RoundMode::CAST_NONE, count);
     }

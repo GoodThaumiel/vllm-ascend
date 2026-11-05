@@ -158,21 +158,47 @@ def io_probe(device: torch.device, *, aligned_only: bool = False) -> list[dict]:
     records = []
     source = torch.tensor(values, dtype=torch.int32, device=device)
     for mode, name in enumerate(
-        ("aligned_copy", "scalar_aligned", "pad_read", "pad_write", "block_num", "aligned_rmw")
+        (
+            "aligned_copy",
+            "scalar_aligned",
+            "pad_read",
+            "pad_write",
+            "block_num",
+            "aligned_rmw",
+            "fp16_block_cast",
+            "fp32_block_copy",
+        )
     ):
         if aligned_only and mode in (2, 3):
             continue
+        if mode == 6:
+            fp_input = torch.arange(16, dtype=torch.float16).div_(4)
+            probe_source = fp_input.view(torch.int32).to(device)
+            wanted = fp_input.tolist()
+        elif mode == 7:
+            fp_input = torch.arange(8, dtype=torch.float32).add_(0.25)
+            probe_source = fp_input.view(torch.int32).to(device)
+            wanted = fp_input.add(1).tolist()
+        else:
+            probe_source = source
+            wanted = expected[mode]
         output = torch.full((8,), -1, dtype=torch.int32, device=device)
         try:
-            torch.ops.replayssm_sd_310p.io_probe(source, output, mode)
+            torch.ops.replayssm_sd_310p.io_probe(probe_source, output, mode)
             torch.npu.synchronize()
-            actual = output.cpu().tolist()
+            actual_output = output.cpu()
+            if mode == 6:
+                actual = actual_output.view(torch.float16).tolist()
+            elif mode == 7:
+                actual = actual_output.view(torch.float32).tolist()
+            else:
+                actual = actual_output.tolist()
             records.append(
                 {
                     "probe": name,
-                    "status": "PASSED" if actual == expected[mode] else "FAILED",
+                    "status": "PASSED" if actual == wanted else "FAILED",
                     "actual": actual,
-                    "expected": expected[mode],
+                    "expected": wanted,
                 }
             )
         except Exception as error:

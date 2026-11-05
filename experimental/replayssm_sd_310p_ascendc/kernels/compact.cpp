@@ -294,14 +294,17 @@ class ReplaySDCompact {
     auto input = in_.AllocTensor<T>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
     DataCopyPadExtParams<T> pad{false, 0, 0, 0};
-    DataCopyParams aligned{1, static_cast<uint16_t>((count * sizeof(T) + 31) / 32), 0, 0};
-    DataCopy(input, source[offset], aligned);
+    const uint32_t elementsPerBlock = 32 / sizeof(T);
+    const uint32_t start = offset % elementsPerBlock;
+    DataCopyParams aligned{1, static_cast<uint16_t>((start + count + elementsPerBlock - 1) /
+                                                  elementsPerBlock), 0, 0};
+    DataCopy(input, source[offset - start], aligned);
     in_.EnQue(input);
     input = in_.DeQue<T>();
     if constexpr (sizeof(T) == sizeof(float)) {
-      DataCopy(dest, input, (count + FP32_BLOCK - 1) / FP32_BLOCK * FP32_BLOCK);
+      Adds(dest, input[start], 0.0f, count);
     } else {
-      Cast(dest, input, RoundMode::CAST_NONE, count);
+      Cast(dest, input[start], RoundMode::CAST_NONE, count);
     }
     PipeBarrier<PIPE_V>();
     in_.FreeTensor(input);
