@@ -4,6 +4,56 @@
 torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
+## V8 增量：M200 输出 Cast 修复与精度验证（当前清单）
+
+V7 在 count=16/32/64 上确认：对齐 FP16/FP32 搬运与 `CAST_NONE` 双向转换
+全部逐位通过，`CAST_RINT` 单向和 round-trip 全部失败。仓内原生
+`recurrent_gated_delta_rule_v310.h` 在 `__CCE_AICORE__ == 200` 的输出路径
+明确使用 `CAST_NONE`。本版仅把 310P Replay verify、compact 的 FP32→FP16
+写回，以及旧 round-trip 探针，改为 `CAST_NONE`；独立 RINT 探针仍保留。
+不修改递推、参考值或精度容差。V7 数据定位到 Cast 模式差异，无法仅凭输出
+推断 CANN 内部究竟少处理了多少元素。
+
+在仓库根目录按第 1 节命令对 CANN 9.2.1 **全新构建**。构建必须退出码 0，
+加载新 `.so` 后依次运行；任一必需步骤失败即停并回传 JSON 与首个错误：
+
+```bash
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 3 --stage cast_probe --device 0 \
+  --output /tmp/replayssm-310p-v8-cast.json
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 3 --stage aligned_probe --device 0 \
+  --output /tmp/replayssm-310p-v8-aligned.json
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage smoke --tile-v 32 --device 0 \
+    --output "/tmp/replayssm-310p-v8-mtp${mtp}-smoke.json"
+done
+```
+
+`cast_probe` 的 **mode 0/1/2/3/5 和 legacy queue round-trip 必须通过**。
+mode 4/6 的 `CAST_RINT` 失败会列在 `known_rint_failures`，保留作诊断，
+不阻挡本版精度验证。`aligned_probe` 的六项都应通过。
+`smoke` 先看 pos0，再看 history 7/12/16、跨 ring 尾、mixed flush 和 padding；
+每个 case 都记录实际 FP16 最大绝对误差、NaN 数量及 status。
+若 MTP3/5 smoke 全过，再运行：
+
+```bash
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 1 --stage sequence --device 0 \
+    --output "/tmp/replayssm-310p-v8-mtp${mtp}-sequence.json"
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage graph --device 0 \
+    --output "/tmp/replayssm-310p-v8-mtp${mtp}-graph.json"
+done
+```
+
+当前 verify/compact 的 32B 块仍限单核归属，**本轮不测性能**。
+`CAST_NONE` 对非精确可表示值的舍入误差由 smoke/sequence 实测，
+不能仅用 V7 的 0.25 步长精确值推断；若超差，保留原容差并回传首个
+失败 case。通过精度和图重放后再恢复多核、建立性能基线。
+
 ## V7 增量：Cast 原子化定位（本轮唯一上机步骤）
 
 V6 的 `fp16_block_cast` 是 FP16→FP32→FP16 的复合路径；其失败尚不能

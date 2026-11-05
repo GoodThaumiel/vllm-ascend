@@ -1524,7 +1524,8 @@ class ReplaySDVerify {
   template <typename T>
   __aicore__ inline void Store(GlobalTensor<T>& dest, uint64_t offset, LocalTensor<float> source, uint32_t count) {
     auto output = outQueue_.AllocTensor<T>();
-    Cast(output, source, RoundMode::CAST_RINT, count);
+    // Match recurrent_gated_delta_rule_v310's M200 output conversion.
+    Cast(output, source, RoundMode::CAST_NONE, count);
     outQueue_.EnQue(output);
     output = outQueue_.DeQue<T>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};

@@ -390,7 +390,8 @@ class ReplaySDCompact {
   __aicore__ inline void Store(GlobalTensor<half>& dest, uint64_t offset,
                                LocalTensor<float> source, uint32_t count) {
     auto output = out_.AllocTensor<half>();
-    Cast(output, source, RoundMode::CAST_RINT, count);
+    // Match recurrent_gated_delta_rule_v310's M200 output conversion.
+    Cast(output, source, RoundMode::CAST_NONE, count);
     out_.EnQue(output);
     output = out_.DeQue<half>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(half)), 0, 0, 0};

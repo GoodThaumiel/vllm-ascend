@@ -33,7 +33,7 @@ extern "C" __global__ __aicore__ void replayssm_sd_310p_io_probe(
     Cast(expanded, packed, RoundMode::CAST_NONE, 16);
     PipeBarrier<PIPE_V>();
     auto result = outputQueue.AllocTensor<half>();
-    Cast(result, expanded, RoundMode::CAST_RINT, 16);
+    Cast(result, expanded, RoundMode::CAST_NONE, 16);
     outputQueue.EnQue(result);
     result = outputQueue.DeQue<half>();
     DataCopy(destinationHalf, result, aligned);
