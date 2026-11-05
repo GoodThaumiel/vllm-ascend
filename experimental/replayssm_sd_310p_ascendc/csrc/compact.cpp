@@ -88,9 +88,8 @@ void compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
 
   const c10_npu::OptionalNPUGuard guard(checkpoint.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const int64_t active_tasks = batch * value_heads;
   const auto result = aclrtlaunch_replayssm_sd_310p_compact(
-      static_cast<uint32_t>(std::min(cores, active_tasks)), stream, checkpoint.data_ptr(),
+      1u, stream, checkpoint.data_ptr(),
       d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(), slots.data_ptr(), ring_ids.data_ptr(),
       positions.data_ptr(), bases.data_ptr(), flush.data_ptr(), status.data_ptr(),
       static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots), static_cast<uint32_t>(num_ring_slots),

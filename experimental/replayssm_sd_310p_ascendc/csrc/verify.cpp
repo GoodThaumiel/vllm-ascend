@@ -87,7 +87,9 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
 
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const auto block_dim = static_cast<uint32_t>(std::min(cores, batch * value_heads));
+  // Scalar status/gate updates use 32-byte read-modify-write on M200. Keep
+  // one AIV until ownership is partitioned by aligned block.
+  const auto block_dim = 1u;
 #define REPLAY_310P_ARGS \
   block_dim, stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), \
       beta.data_ptr(), checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), \

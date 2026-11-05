@@ -264,7 +264,8 @@ class ReplaySDCompact {
     out_.EnQue(output);
     output = out_.DeQue<int32_t>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
-    DataCopyPad(status_[offset], output, cp);
+    DataCopyParams aligned{1, static_cast<uint16_t>(count * sizeof(int32_t) / 32), 0, 0};
+    DataCopy(status_[offset], output, aligned);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     out_.FreeTensor(output);
@@ -280,7 +281,8 @@ class ReplaySDCompact {
     statusOut_.EnQue(output);
     output = statusOut_.DeQue<int32_t>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
-    DataCopyPad(status_[offset], output, cp);
+    DataCopyParams aligned{1, static_cast<uint16_t>(count * sizeof(int32_t) / 32), 0, 0};
+    DataCopy(status_[offset], output, aligned);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     statusOut_.FreeTensor(output);
@@ -292,7 +294,8 @@ class ReplaySDCompact {
     auto input = in_.AllocTensor<T>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
     DataCopyPadExtParams<T> pad{false, 0, 0, 0};
-    DataCopyPad(input, source[offset], cp, pad);
+    DataCopyParams aligned{1, static_cast<uint16_t>((count * sizeof(T) + 31) / 32), 0, 0};
+    DataCopy(input, source[offset], aligned);
     in_.EnQue(input);
     input = in_.DeQue<T>();
     if constexpr (sizeof(T) == sizeof(float)) {
@@ -312,12 +315,14 @@ class ReplaySDCompact {
     auto input = in_.AllocTensor<int32_t>();
     DataCopyExtParams cp{1, sizeof(int32_t), 0, 0, 0};
     DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-    DataCopyPad(input, source[offset], cp, pad);
+    const uint32_t index = offset & 7;
+    DataCopyParams aligned{1, 1, 0, 0};
+    DataCopy(input, source[offset - index], aligned);
     in_.EnQue(input);
     input = in_.DeQue<int32_t>();
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    const int32_t value = input.GetValue(0);
+    const int32_t value = input.GetValue(index);
     SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
     in_.FreeTensor(input);
@@ -328,12 +333,14 @@ class ReplaySDCompact {
     auto input = metaIn_.AllocTensor<int32_t>();
     DataCopyExtParams cp{1, sizeof(int32_t), 0, 0, 0};
     DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-    DataCopyPad(input, source[offset], cp, pad);
+    const uint32_t index = offset & 7;
+    DataCopyParams aligned{1, 1, 0, 0};
+    DataCopy(input, source[offset - index], aligned);
     metaIn_.EnQue(input);
     input = metaIn_.DeQue<int32_t>();
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    const int32_t value = input.GetValue(0);
+    const int32_t value = input.GetValue(index);
     SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
     metaIn_.FreeTensor(input);
@@ -344,12 +351,15 @@ class ReplaySDCompact {
     auto input = metaIn_.AllocTensor<int32_t>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(4 * sizeof(int32_t)), 0, 0, 0};
     DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-    DataCopyPad(input, slots_[row * 4], cp, pad);
+    DataCopyParams aligned{1, 1, 0, 0};
+    DataCopy(input, slots_[row * 4 - (row * 4) % 8], aligned);
     metaIn_.EnQue(input);
     input = metaIn_.DeQue<int32_t>();
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    Metadata md{input.GetValue(0), 0, input.GetValue(1), input.GetValue(2), input.GetValue(3)};
+    const uint32_t start = (row * 4) % 8;
+    Metadata md{input.GetValue(start), 0, input.GetValue(start + 1),
+                input.GetValue(start + 2), input.GetValue(start + 3)};
     SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
     metaIn_.FreeTensor(input);
@@ -381,21 +391,36 @@ class ReplaySDCompact {
     out_.EnQue(output);
     output = out_.DeQue<half>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(half)), 0, 0, 0};
-    DataCopyPad(dest[offset], output, cp);
+    DataCopyParams aligned{1, static_cast<uint16_t>(count * sizeof(half) / 32), 0, 0};
+    DataCopy(dest[offset], output, aligned);
     out_.FreeTensor(output);
   }
 
   __aicore__ inline void WriteStatus(uint32_t task, int32_t error) {
+    const uint32_t index = task & 7;
+    DataCopyParams aligned{1, 1, 0, 0};
+    auto before = in_.AllocTensor<int32_t>();
+    DataCopy(before, status_[task - index], aligned);
+    in_.EnQue(before);
+    before = in_.DeQue<int32_t>();
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     auto output = out_.AllocTensor<int32_t>();
-    output.SetValue(0, error);
+    for (uint32_t i = 0; i < 8; ++i) {
+      output.SetValue(i, i == index ? error : before.GetValue(i));
+    }
+    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    in_.FreeTensor(before);
     SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
     out_.EnQue(output);
     output = out_.DeQue<int32_t>();
-    DataCopyExtParams cp{1, sizeof(int32_t), 0, 0, 0};
-    DataCopyPad(status_[task], output, cp);
+    DataCopy(status_[task - index], output, aligned);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     out_.FreeTensor(output);
   }
 

@@ -1162,7 +1162,8 @@ class ReplaySDVerify {
     outQueue_.EnQue(output);
     output = outQueue_.DeQue<int32_t>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
-    DataCopyPad(compactStatus_[row * count], output, cp);
+    DataCopyParams aligned{1, static_cast<uint16_t>(count * sizeof(int32_t) / 32), 0, 0};
+    DataCopy(compactStatus_[row * count], output, aligned);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     outQueue_.FreeTensor(output);
@@ -1238,24 +1239,8 @@ class ReplaySDVerify {
 
   __aicore__ inline void WriteGateBatch(uint64_t offset, int32_t base, int32_t pos,
                                         int32_t length, const float* values) {
-    const uint32_t start = Physical(base, pos);
-    const uint32_t first = (static_cast<uint32_t>(length) < ringLen_ - start)
-                               ? static_cast<uint32_t>(length) : ringLen_ - start;
-    for (uint32_t segment = 0; segment < 2; ++segment) {
-      const uint32_t count = segment == 0 ? first : static_cast<uint32_t>(length) - first;
-      if (count == 0) continue;
-      const uint32_t inputStart = segment == 0 ? 0 : first;
-      auto output = outQueue_.AllocTensor<float>();
-      for (uint32_t i = 0; i < count; ++i) output.SetValue(i, values[inputStart + i]);
-      SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
-      WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-      outQueue_.EnQue(output);
-      output = outQueue_.DeQue<float>();
-      DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(float)), 0, 0, 0};
-      DataCopyPad(gCache_[offset + (segment == 0 ? start : 0)], output, cp);
-      SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-      WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-      outQueue_.FreeTensor(output);
+    for (int32_t i = 0; i < length; ++i) {
+      WriteGate(offset + Physical(base, pos + i), values[i]);
     }
   }
 
@@ -1263,7 +1248,8 @@ class ReplaySDVerify {
     auto input = statePrefetchQueue_.AllocTensor<half>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(tileV_ * K_DIM * sizeof(half)), 0, 0, 0};
     DataCopyPadExtParams<half> pad{false, 0, 0, 0};
-    DataCopyPad(input, checkpoint_[offset], cp, pad);
+    DataCopyParams aligned{1, static_cast<uint16_t>(tileV_ * K_DIM * sizeof(half) / 32), 0, 0};
+    DataCopy(input, checkpoint_[offset], aligned);
     statePrefetchQueue_.EnQue(input);
   }
 
@@ -1287,13 +1273,16 @@ class ReplaySDVerify {
     auto input = in_.AllocTensor<T>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
     DataCopyPadExtParams<T> pad{false, 0, 0, 0};
-    DataCopyPad(input, source[offset], cp, pad);
+    const uint32_t perBlock = 32 / sizeof(T);
+    const uint32_t start = offset % perBlock;
+    DataCopyParams aligned{1, static_cast<uint16_t>((start + count + perBlock - 1) / perBlock), 0, 0};
+    DataCopy(input, source[offset - start], aligned);
     in_.EnQue(input);
     input = in_.DeQue<T>();
     if constexpr (sizeof(T) == sizeof(float)) {
-      DataCopy(dest, input, (count + FP32_BLOCK - 1) / FP32_BLOCK * FP32_BLOCK);
+      DataCopy(dest, input[start], (count + FP32_BLOCK - 1) / FP32_BLOCK * FP32_BLOCK);
     } else {
-      Cast(dest, input, RoundMode::CAST_NONE, count);
+      Cast(dest, input[start], RoundMode::CAST_NONE, count);
     }
     PipeBarrier<PIPE_V>();
     in_.FreeTensor(input);
@@ -1307,7 +1296,10 @@ class ReplaySDVerify {
                          static_cast<uint32_t>(tileV_ * sizeof(half)),
                          static_cast<uint32_t>((V_DIM - tileV_) * sizeof(half)), 0, 0};
     DataCopyPadExtParams<half> pad{false, 0, 0, 0};
-    DataCopyPad(input, dCache_[offset], cp, pad);
+    for (uint32_t row = 0; row < rows; ++row) {
+      DataCopyParams aligned{1, static_cast<uint16_t>(tileV_ * sizeof(half) / 32), 0, 0};
+      DataCopy(input[row * tileV_], dCache_[offset + row * V_DIM], aligned);
+    }
     in_.EnQue(input);
     input = in_.DeQue<half>();
     Cast(dest, input, RoundMode::CAST_NONE, rows * tileV_);
@@ -1324,7 +1316,10 @@ class ReplaySDVerify {
                          static_cast<uint32_t>(rowWidth * sizeof(half)),
                          static_cast<uint32_t>((rowPitch - rowWidth) * sizeof(half)), 0, 0};
     DataCopyPadExtParams<half> pad{false, 0, 0, 0};
-    DataCopyPad(input, source[offset], cp, pad);
+    for (uint32_t row = 0; row < rows; ++row) {
+      DataCopyParams aligned{1, static_cast<uint16_t>(rowWidth * sizeof(half) / 32), 0, 0};
+      DataCopy(input[row * rowWidth], source[offset + row * rowPitch], aligned);
+    }
     in_.EnQue(input);
     input = in_.DeQue<half>();
     Cast(dest, input, RoundMode::CAST_NONE, rows * rowWidth);
@@ -1337,7 +1332,8 @@ class ReplaySDVerify {
     auto input = in_.AllocTensor<int32_t>();
     DataCopyExtParams cp{1, 8 * sizeof(int32_t), 0, 0, 0};
     DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-    DataCopyPad(input, slots_[static_cast<uint64_t>(row) * 8], cp, pad);
+    DataCopyParams aligned{1, 1, 0, 0};
+    DataCopy(input, slots_[static_cast<uint64_t>(row) * 8], aligned);
     in_.EnQue(input);
     input = in_.DeQue<int32_t>();
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
@@ -1356,12 +1352,14 @@ class ReplaySDVerify {
     auto input = in_.AllocTensor<int32_t>();
     DataCopyExtParams cp{1, sizeof(int32_t), 0, 0, 0};
     DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-    DataCopyPad(input, source[offset], cp, pad);
+    const uint32_t index = offset & 7;
+    DataCopyParams aligned{1, 1, 0, 0};
+    DataCopy(input, source[offset - index], aligned);
     in_.EnQue(input);
     input = in_.DeQue<int32_t>();
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    int32_t value = input.GetValue(0);
+    int32_t value = input.GetValue(index);
     SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
     in_.FreeTensor(input);
@@ -1530,35 +1528,45 @@ class ReplaySDVerify {
     outQueue_.EnQue(output);
     output = outQueue_.DeQue<T>();
     DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
-    DataCopyPad(dest[offset], output, cp);
+    DataCopyParams aligned{1, static_cast<uint16_t>(count * sizeof(T) / 32), 0, 0};
+    DataCopy(dest[offset], output, aligned);
     outQueue_.FreeTensor(output);
   }
 
   __aicore__ inline void WriteGate(uint64_t offset, float gate) {
-    auto output = outQueue_.AllocTensor<float>();
-    output.SetValue(0, gate);
-    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
-    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-    outQueue_.EnQue(output);
-    output = outQueue_.DeQue<float>();
-    DataCopyExtParams cp{1, sizeof(float), 0, 0, 0};
-    DataCopyPad(gCache_[offset], output, cp);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    outQueue_.FreeTensor(output);
+    WriteScalar(gCache_, offset, gate);
   }
 
   __aicore__ inline void WriteStatus(uint32_t task, int32_t error) {
-    auto output = outQueue_.AllocTensor<int32_t>();
-    output.SetValue(0, error);
+    WriteScalar(status_, task, error);
+  }
+
+  template <typename T>
+  __aicore__ inline void WriteScalar(GlobalTensor<T>& destination, uint64_t offset, T value) {
+    const uint32_t index = offset & 7;
+    DataCopyParams aligned{1, 1, 0, 0};
+    auto before = in_.AllocTensor<T>();
+    DataCopy(before, destination[offset - index], aligned);
+    in_.EnQue(before);
+    before = in_.DeQue<T>();
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    auto output = outQueue_.AllocTensor<T>();
+    for (uint32_t i = 0; i < 8; ++i) {
+      output.SetValue(i, i == index ? value : before.GetValue(i));
+    }
+    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    in_.FreeTensor(before);
     SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
     outQueue_.EnQue(output);
-    output = outQueue_.DeQue<int32_t>();
-    DataCopyExtParams cp{1, sizeof(int32_t), 0, 0, 0};
-    DataCopyPad(status_[task], output, cp);
+    output = outQueue_.DeQue<T>();
+    DataCopy(destination[offset - index], output, aligned);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     outQueue_.FreeTensor(output);
   }
 
