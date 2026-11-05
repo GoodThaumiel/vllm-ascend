@@ -339,9 +339,14 @@ class ReplaySDVerify {
 
  private:
   __aicore__ inline void ProcessSharedHeads() {
-    // One task owns all V tiles of a (request, value head). The K-side
-    // dot table is invariant across V tiles, so build it once per task.
-    for (uint32_t task = GetBlockIdx(); task < batch_ * valueHeads_; task += GetBlockNum()) {
+    // One core owns every status word in a 32-byte block. Each head still
+    // processes all its V tiles; adjacent heads in that block run serially
+    // on the same core so their 32-byte scalar RMW writes cannot race.
+    const uint32_t headsPerStatusBlock = 8 / tiles_;
+    const uint32_t totalGroups = batch_ * valueHeads_ / headsPerStatusBlock;
+    for (uint32_t group = GetBlockIdx(); group < totalGroups; group += GetBlockNum()) {
+      for (uint32_t localHead = 0; localHead < headsPerStatusBlock; ++localHead) {
+      const uint32_t task = group * headsPerStatusBlock + localHead;
       const uint32_t row = task / valueHeads_;
       const uint32_t head = task % valueHeads_;
       const uint32_t keyHead = head / (valueHeads_ / heads_);
@@ -729,6 +734,7 @@ class ReplaySDVerify {
         if (head == 0) {
           WriteCompactStatus(row, compactError);
         }
+      }
       }
     }
   }

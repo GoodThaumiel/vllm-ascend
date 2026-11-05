@@ -88,8 +88,13 @@ void compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
 
   const c10_npu::OptionalNPUGuard guard(checkpoint.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
+  // Group neighboring value heads so all 8 status words in one 32-byte
+  // block have a single core owner, including mixed flush batches.
+  const int64_t heads_per_status_block = 8 / (128 / tile_v);
+  const auto block_dim = static_cast<uint32_t>(std::min<int64_t>(
+      cores, batch * value_heads / heads_per_status_block));
   const auto result = aclrtlaunch_replayssm_sd_310p_compact(
-      1u, stream, checkpoint.data_ptr(),
+      block_dim, stream, checkpoint.data_ptr(),
       d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(), slots.data_ptr(), ring_ids.data_ptr(),
       positions.data_ptr(), bases.data_ptr(), flush.data_ptr(), status.data_ptr(),
       static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots), static_cast<uint32_t>(num_ring_slots),

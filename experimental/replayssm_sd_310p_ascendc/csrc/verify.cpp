@@ -82,14 +82,18 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(status.dim() == 1 && status.numel() == batch * value_heads * (128 / tile_v) &&
                   status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
+  const int64_t heads_per_status_block = 8 / (128 / tile_v);
+  TORCH_CHECK(value_heads % heads_per_status_block == 0,
+              "value heads must align to a 32-byte status block");
   TORCH_CHECK(cores >= 1 && cores <= 7, "310P pilot cores must be in [1,7]");
   TORCH_CHECK(std::isfinite(scale) && scale > 0, "scale must be finite and positive");
 
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  // Scalar status/gate updates use 32-byte read-modify-write on M200. Keep
-  // one AIV until ownership is partitioned by aligned block.
-  const auto block_dim = 1u;
+  // A status block is owned by one core; the device task loop groups all
+  // heads sharing that block before distributing groups across cores.
+  const auto block_dim = static_cast<uint32_t>(std::min<int64_t>(
+      cores, batch * value_heads / heads_per_status_block));
 #define REPLAY_310P_ARGS \
   block_dim, stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), \
       beta.data_ptr(), checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), \

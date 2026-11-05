@@ -4,7 +4,130 @@
 torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
-## V10 增量：compact 保留槽状态码（当前清单）
+## V11 增量：32B 块单核归属、多核精度和性能基线（当前清单）
+
+V10 已在单 AIV 上通过 MTP3/5 的 smoke、24 轮 sequence 和 NPUGraph。
+V11 的 verify v9 仍按 `(request, value head)` 计算，每个 head 处理其所有
+V tile；但把共享一个 **32B status 块**的相邻 head 放到同一 AIV。
+tile32 时一个块覆盖 2 个 head，tile64 时覆盖 4 个 head。
+compact v1 的 tile32 路径同样按每 2 个 head 分组。其余输出：
+out/d/checkpoint 每 head 或 V tile 独占连续对齐区域，k 仅由对应 key head
+的首个 value head 写，g ring 每 head 有 128B 独立段。
+blockDim = `min(cores, batch × value_heads ÷ heads_per_status_block)`，
+`cores` 仍限 1..7；设备端每 AIV 以组为步长遍历。非 flush 行只由 head0
+写整行 status，flush 行由各组写其独占块。这是为了避免 310P 的 32B
+读改写跨 AIV 竞争，并不改变递推或缓存布局。
+
+### 310P 原生 baseline 的调用口径
+
+实际 310P MTP GDN 在 `vllm_ascend/_310p/ops/fla/gdn_310.py` 中，
+先做 Q/K `l2norm_310p`、FP16/FP32 转换、state index 展平及 accepted-token
+元数据，再调用仓内自定义 ACLNN
+`torch.ops._C_ascend.npu_recurrent_gated_delta_rule_310`；普通 decode
+也走 V310，prefill 则走 `chunk_gated_delta_rule_310`。910B 的
+`vllm_ascend/ops/gdn.py` 使用 `recurrent_gated_delta_rule` 路径，
+不能拿它作 310P 的原生算子基线。310P V310 的 tiling 按
+`min(可用 AIV, batch×value_heads)` 选择 blockDim。
+
+当前 `--stage perf` **直接计时 V310 底层算子**，与 Replay 的 verify、
+compact、cursor 各自和三者组合的 graph replay p50/p90 对比。双方收到
+相同的 FP16 Q/K/V/beta、FP32 g；Q/K 归一化、转换、state index 准备、
+native 初始 state 重建及 cache reset 都在计时区外。native 的
+`num_accepted_tokens` 固定为 1，报告 JSON 明记这一口径。
+这是一组算子成本对比，后续服务集成仍须单独测完整 GDN 前处理、
+多层 forward 和端到端 ITL。
+
+### A. 全新构建与多核精度门槛
+
+本版改了设备代码，必须用 CANN 9.2.1 全新构建；若编译失败，不运行旧 `.so`。
+在仓库根目录执行：
+
+```bash
+git rev-parse HEAD
+git status --short
+python3 -m unittest experimental.replayssm_sd_310p_ascendc.tests.test_reference
+cmake -S experimental/replayssm_sd_310p_ascendc -B experimental/replayssm_sd_310p_ascendc/build \
+  -DSOC_VERSION=Ascend310P3 \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build experimental/replayssm_sd_310p_ascendc/build --clean-first -j 8
+readelf -d experimental/replayssm_sd_310p_ascendc/build/libreplayssm_sd_310p_torch.so | grep RUNPATH
+```
+
+先用 B2、tile32 对比单核与 2/4/7 核，再测较大的混合 flush batch。
+每个 JSON 的 `status`、verify/compact 误差、ring 不变性和 padding 负例
+都必须通过；任一失败即停，回传第一条 CCE/NPU 错误及 JSON。
+
+```bash
+for mtp in 3 5; do
+  for cores in 1 2 4 7; do
+    python3 experimental/replayssm_sd_310p_ascendc/run.py \
+      --mtp "$mtp" --batch 2 --stage smoke --tile-v 32 --cores "$cores" --device 0 \
+      --output "/tmp/replayssm-310p-v11-mtp${mtp}-b2-c${cores}-smoke.json"
+  done
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 16 --stage smoke --tile-v 32 --cores 7 --device 0 \
+    --output "/tmp/replayssm-310p-v11-mtp${mtp}-b16-c7-smoke.json"
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage graph --tile-v 32 --cores 7 --device 0 \
+    --output "/tmp/replayssm-310p-v11-mtp${mtp}-b2-c7-graph.json"
+done
+```
+
+以上全过后补 tile64 的 verify 多核覆盖，以及多轮状态：
+
+```bash
+for mtp in 3 5; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage smoke --tile-v 64 --cores 7 --device 0 \
+    --output "/tmp/replayssm-310p-v11-mtp${mtp}-t64-smoke.json"
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 2 --stage graph --tile-v 64 --cores 7 --device 0 \
+    --output "/tmp/replayssm-310p-v11-mtp${mtp}-t64-graph.json"
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp "$mtp" --batch 1 --stage sequence --tile-v 32 --cores 7 --device 0 \
+    --output "/tmp/replayssm-310p-v11-mtp${mtp}-c7-sequence.json"
+done
+```
+
+### B. 原生 V310 算子性能基线（仅 A 全过后）
+
+确认自定义库中有 `aclnnRecurrentGatedDeltaRuleV310`（第 3 节列出检查
+命令）。每组预热 20 次、graph replay 100 次；cache reset 不计时。
+先测 B1/B16，再扩 B32/B64，均包含 pos0、pos12/no-flush、
+pos12/flush、pos16/flush 四种场景：
+
+```bash
+for mtp in 3 5; do
+  for batch in 1 16 32 64; do
+    python3 experimental/replayssm_sd_310p_ascendc/run.py \
+      --mtp "$mtp" --batch "$batch" --stage perf --tile-v 32 --cores 7 \
+      --warmup 20 --iterations 100 --device 0 \
+      --output "/tmp/replayssm-310p-v11-mtp${mtp}-b${batch}-c7-perf.json"
+  done
+done
+```
+
+再在 B32 比较 `cores=1/2/4/7`，观察多核伸缩；同一 workload 的
+native p50 应作为固定参照：
+
+```bash
+for cores in 1 2 4 7; do
+  python3 experimental/replayssm_sd_310p_ascendc/run.py \
+    --mtp 3 --batch 32 --stage perf --tile-v 32 --cores "$cores" \
+    --warmup 20 --iterations 100 --device 0 \
+    --output "/tmp/replayssm-310p-v11-mtp3-b32-c${cores}-perf.json"
+done
+```
+
+回传每组 verify、compact、cursor、combined、native 的 p50/p90/min，
+以及 `native_vs_dense_out`、`native_baseline` 字段。
+以 `combined/native` 比值评价三算子成本；不要将各单算子 p50 简单相加
+代替组合图的实测时延。另请回传设备型号、构建退出码和首个异常。
+若 perf 阶段出现精度或图捕获失败，
+保留失败 JSON，不用后续性能值作结论。
+
+## V10 增量：compact 保留槽状态码（历史清单）
 
 V9 的前四组 MTP3/5 smoke 均通过。最后一组把 padding 行的 `slot=0`
 与 `flush=1` 组合在一起，kernel 按 Validate 返回状态码 4，而 CPU 参考

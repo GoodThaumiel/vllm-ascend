@@ -131,26 +131,33 @@ class ReplaySDCompact {
   // four-byte status transfers; no host readback of the device flush flag.
   __aicore__ inline void ProcessGrouped() {
     const uint32_t rowTasks = valueHeads_ * tiles_;
-    for (uint32_t group = GetBlockIdx(); group < batch_ * valueHeads_; group += GetBlockNum()) {
-      const uint32_t row = group / valueHeads_;
-      const uint32_t head = group % valueHeads_;
-      const int32_t flush = ReadInt(flush_, row);
-      if (flush == 0 && head != 0) {
-        continue;
-      }
-      const int32_t slot = ReadInt(slots_, row);
-      const int32_t pos = ReadInt(positions_, row);
-      const int32_t base = ReadInt(bases_, row);
-      const int32_t ringSlot = flush == 0 ? 0 : ReadInt(ringSlots_, row);
-      const int32_t error = Validate(slot, ringSlot, pos, base, flush);
-      if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
-        if (head == 0) {
-          WriteStatusSpan(row * rowTasks, rowTasks, error);
+    // Two heads own one 32-byte status block at tileV=32. Keep both heads
+    // on the same core because Fold writes each status word via aligned RMW.
+    const uint32_t headsPerStatusBlock = 8 / tiles_;
+    const uint32_t totalGroups = batch_ * valueHeads_ / headsPerStatusBlock;
+    for (uint32_t statusGroup = GetBlockIdx(); statusGroup < totalGroups; statusGroup += GetBlockNum()) {
+      for (uint32_t localHead = 0; localHead < headsPerStatusBlock; ++localHead) {
+        const uint32_t group = statusGroup * headsPerStatusBlock + localHead;
+        const uint32_t row = group / valueHeads_;
+        const uint32_t head = group % valueHeads_;
+        const int32_t flush = ReadInt(flush_, row);
+        if (flush == 0 && head != 0) {
+          continue;
         }
-        continue;
-      }
-      for (uint32_t tile = 0; tile < tiles_; ++tile) {
-        Fold(group * tiles_ + tile, slot, ringSlot, pos, base);
+        const int32_t slot = ReadInt(slots_, row);
+        const int32_t pos = ReadInt(positions_, row);
+        const int32_t base = ReadInt(bases_, row);
+        const int32_t ringSlot = flush == 0 ? 0 : ReadInt(ringSlots_, row);
+        const int32_t error = Validate(slot, ringSlot, pos, base, flush);
+        if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
+          if (head == 0) {
+            WriteStatusSpan(row * rowTasks, rowTasks, error);
+          }
+          continue;
+        }
+        for (uint32_t tile = 0; tile < tiles_; ++tile) {
+          Fold(group * tiles_ + tile, slot, ringSlot, pos, base);
+        }
       }
     }
   }

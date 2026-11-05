@@ -718,6 +718,8 @@ def graph_and_perf(args: argparse.Namespace, device: torch.device, perf: bool) -
 
         if not enable_custom_op():
             raise RuntimeError("vllm_ascend native custom operators are unavailable")
+        if not hasattr(torch.ops._C_ascend, "npu_recurrent_gated_delta_rule_310"):
+            raise RuntimeError("310P native npu_recurrent_gated_delta_rule_310 is unavailable")
 
     return [
         _graph_case(args, device, pos, base, flush, perf)
@@ -736,6 +738,22 @@ def main() -> None:
         "device": args.device,
         "stage": args.stage,
     }
+    if args.stage in ("perf", "all"):
+        report["native_baseline"] = {
+            "operator": "torch.ops._C_ascend.npu_recurrent_gated_delta_rule_310",
+            "service_path": "vllm_ascend._310p.ops.fla.gdn_310.npu_recurrent_gated_delta_rule_310",
+            "scope": "direct 310P ACLNN kernel on preprocessed Q/K/V/g/beta",
+            "excluded_from_timing": [
+                "Q/K l2norm_310p",
+                "FP16/FP32 conversion and contiguous copies",
+                "flattening state indices and preparing accepted-token metadata",
+                "native initial-state reconstruction",
+                "Replay and native cache reset",
+            ],
+            "num_accepted_tokens": 1,
+            "state_dtype": "FP16",
+            "heads_per_rank": {"key": 8, "value": 16},
+        }
     try:
         torch.ops.load_library(str(args.library.resolve()))
         torch.npu.set_device(args.device)
