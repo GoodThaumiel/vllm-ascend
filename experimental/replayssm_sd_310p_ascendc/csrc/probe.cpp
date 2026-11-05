@@ -15,7 +15,7 @@ void io_probe(const at::Tensor& input, const at::Tensor& output, int64_t mode) {
                   input.scalar_type() == at::kInt && output.scalar_type() == at::kInt &&
                   input.is_contiguous() && output.is_contiguous(),
               "io_probe requires contiguous int32[8] tensors");
-  TORCH_CHECK(mode >= 0 && mode <= 4, "io_probe mode must be in [0,4]");
+  TORCH_CHECK(mode >= 0 && mode <= 5, "io_probe mode must be in [0,5]");
   const c10_npu::OptionalNPUGuard guard(input.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
   const aclError result = aclrtlaunch_replayssm_sd_310p_io_probe(

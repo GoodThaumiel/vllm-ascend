@@ -4,6 +4,30 @@
 torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
+## V4 增量：先验证对齐读改写与 cursor
+
+V3 已证实 4B `DataCopyPad` 读写失败。本次只把 **cursor** 的小块 I/O
+改为 32B 对齐读、在 UB 中替换目标元素、再写回整块；verify/compact
+尚未修改，暂时不要重跑它们的精度测试。完成第 1 节的**全新构建**后运行：
+
+```bash
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 3 --stage aligned_probe --device 0 \
+  --output /tmp/replayssm-310p-aligned-probe.json
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 3 --stage cursor_probe --device 0 \
+  --output /tmp/replayssm-310p-cursor3.json
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 5 --stage cursor_probe --device 0 \
+  --output /tmp/replayssm-310p-cursor5.json
+```
+
+`aligned_probe` 跳过已知失败的 `DataCopyPad` 两项，新增
+`aligned_rmw`，须得到 `[4660,-1,-1,-1,-1,-1,-1,-1]`。
+任一项失败即停止，回传 JSON、第一条 CCE 错误或运行日志。
+本次 cursor 使用单核，32B 读改写不会与其他 core 写同一状态块。
+下一轮据此改 verify/compact 的写回与多核归属。
+
 ## 1. 环境、构建、加载
 
 在仓库根目录执行，先确认所见设备确为 `Ascend310P3`：
@@ -66,7 +90,7 @@ for mtp in 3 5; do
 done
 ```
 
-`io_probe` 会依次执行 5 个独立 case，**即使一个失败也会记录其余结果**：
+`io_probe` 会依次执行 6 个独立 case，**即使一个失败也会记录其余结果**：
 
 | case | 单独检验 | 预期 |
 |---|---|---|
@@ -75,6 +99,7 @@ done
 | `pad_read` | 4B `DataCopyPad` 读取 + 对齐写回 | 8 个值均为输入首项 |
 | `pad_write` | 4B `DataCopyPad` 写回 | 仅首项为 0x1234 |
 | `block_num` | `GetBlockNum` + 对齐写回 | 8 个 1 |
+| `aligned_rmw` | 对齐读旧值、修改首元素、对齐写回 | `[4660,-1×7]` |
 
 先只回传 `io-probe.json` 与首次编译错误；如果 aligned 两项未过，不跑后续
 Replay 精度。若 aligned 两项通过而 pad 项失败，下一轮按仓内 V310 的

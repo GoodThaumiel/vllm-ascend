@@ -89,15 +89,16 @@ class ReplaySDCursor {
  private:
   template <typename T>
   __aicore__ inline T Read(GlobalTensor<T>& source, uint32_t offset) {
+    constexpr uint32_t blockElems = 32 / sizeof(T);
+    const uint32_t aligned = offset / blockElems * blockElems;
     auto local = in_.AllocTensor<T>();
-    DataCopyExtParams cp{1, static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
-    DataCopyPadExtParams<T> pad{false, 0, 0, 0};
-    DataCopyPad(local, source[offset], cp, pad);
+    DataCopyParams cp{1, 1, 0, 0};
+    DataCopy(local, source[aligned], cp);
     in_.EnQue(local);
     local = in_.DeQue<T>();
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    T value = local.GetValue(0);
+    T value = local.GetValue(offset - aligned);
     SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
     in_.FreeTensor(local);
@@ -106,14 +107,29 @@ class ReplaySDCursor {
 
   template <typename T>
   __aicore__ inline void Write(GlobalTensor<T>& dest, uint32_t offset, T value) {
+    constexpr uint32_t blockElems = 32 / sizeof(T);
+    const uint32_t aligned = offset / blockElems * blockElems;
+    DataCopyParams cp{1, 1, 0, 0};
+    // M200 has no DataCopyPad. Preserve the other fields in this 32-byte
+    // block; cursor uses one core, so no other block can race this RMW.
+    auto before = in_.AllocTensor<T>();
+    DataCopy(before, dest[aligned], cp);
+    in_.EnQue(before);
+    before = in_.DeQue<T>();
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     auto local = out_.AllocTensor<T>();
-    local.SetValue(0, value);
+    for (uint32_t i = 0; i < blockElems; ++i) {
+      local.SetValue(i, i == offset - aligned ? value : before.GetValue(i));
+    }
+    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    in_.FreeTensor(before);
     SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
     out_.EnQue(local);
     local = out_.DeQue<T>();
-    DataCopyExtParams cp{1, static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
-    DataCopyPad(dest[offset], local, cp);
+    DataCopy(dest[aligned], local, cp);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     out_.FreeTensor(local);
