@@ -31,7 +31,8 @@ ascendc_library(replayssm_sd_310p_kernel SHARED
     kernels/verify6.cpp
     kernels/compact.cpp
     kernels/cursor.cpp
-    kernels/io_probe.cpp)
+    kernels/io_probe.cpp
+    kernels/cast_probe.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(

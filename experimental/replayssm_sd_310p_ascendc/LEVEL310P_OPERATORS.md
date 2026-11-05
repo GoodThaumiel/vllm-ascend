@@ -4,6 +4,52 @@
 torch_npu 2.10.0.post7、vLLM 0.30.0+empty、vllm-ascend v0.30.0 源码。
 本级仅验证三个算子；不启用 `vllm serve` 的 ReplaySSM 分派。
 
+## V7 增量：Cast 原子化定位（本轮唯一上机步骤）
+
+V6 的 `fp16_block_cast` 是 FP16→FP32→FP16 的复合路径；其失败尚不能
+定位到某一条 Cast 指令。V7 增加独立 `cast_probe` 算子，使用仓内
+`recurrent_gated_delta_rule_v310/op_kernel/recurrent_gated_delta_rule_v310.h`
+的对齐 `DataCopy` 块宽、`MTE2_V`/`V_MTE3` 同步和 `Cast` 写法。
+每个方向单独输出到 GM，另保留原 `io_probe` queue round-trip 作对照。
+V7 **不修改 verify/compact 的递推和精度标准**，不执行性能测试。
+
+在仓库根目录全新构建，确认编译退出码为 0、加载成功，然后只运行 Cast 探针：
+
+```bash
+git rev-parse HEAD
+git status --short
+cmake -S experimental/replayssm_sd_310p_ascendc -B experimental/replayssm_sd_310p_ascendc/build \
+  -DSOC_VERSION=Ascend310P3 \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build experimental/replayssm_sd_310p_ascendc/build -j 8
+python3 experimental/replayssm_sd_310p_ascendc/run.py \
+  --mtp 3 --stage cast_probe --device 0 \
+  --output /tmp/replayssm-310p-v7-cast-probe.json
+```
+
+脚本对 count=16/32/64 分别运行以下路径；即使数值失败，仍记录其他 case。
+JSON 含输入、预期、实际的数值与 uint16/uint32 十六进制位模式，以及首个错误
+索引、GM 地址对 32B 的余数。以 **逐位一致** 为本轮验收标准，测试数据延续
+V6 的 `0, 0.25, …`，不放宽容差。
+
+| mode | 独立路径 | 可定位的阶段 |
+|---:|---|---|
+| 0 | FP16 对齐 GM→UB→GM | FP16 读入/写回及位宽 |
+| 1 | FP32 对齐 GM→UB→GM | FP32 读入/写回及位宽 |
+| 2 | FP16→FP32 (`CAST_NONE`)，直接写 FP32 | 上行 Cast |
+| 3 | FP32→FP16 (`CAST_NONE`)，直接写 FP16 | 下行 Cast |
+| 4 | FP32→FP16 (`CAST_RINT`)，直接写 FP16 | V6 的下行模式 |
+| 5 | FP16→FP32→FP16 (`NONE/NONE`) | 两条 Cast 串联与同步 |
+| 6 | FP16→FP32→FP16 (`NONE/RINT`) | V6 模式在独立 UB 布局下的结果 |
+
+`legacy_queue_roundtrip` 则运行 V6 原始的 VECIN→VECCALC→VECOUT 路径。
+若 0/1 已失败，先排查对齐搬运；若 0/1 通过而 2 或 3/4 首次失败，
+再分别检查 Cast 方向与舍入模式；若独立 2–6 通过而旧路径失败，重点检查
+queue、UB 偏移和同步。**在拿到该结果之前不修改正式 verify**。
+请回传完整 JSON、第一条 CCE 编译错误或设备错误、构建日志和设备型号；
+本轮不运行 V6 下方的 smoke、sequence、graph 或 perf 步骤。
+
 ## V6 增量：区分 FP16/FP32 块宽并检查 UB 内复制
 
 V5 的 status 写回通过，但 verify 在 `pos=0` 仍出现大量 NaN。此时没有有效

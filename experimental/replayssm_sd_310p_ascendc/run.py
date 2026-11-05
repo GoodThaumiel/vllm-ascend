@@ -33,7 +33,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--stage",
-        choices=("io_probe", "aligned_probe", "cursor_probe", "smoke", "sequence", "graph", "perf", "all"),
+        choices=(
+            "io_probe",
+            "aligned_probe",
+            "cast_probe",
+            "cursor_probe",
+            "smoke",
+            "sequence",
+            "graph",
+            "perf",
+            "all",
+        ),
         default="smoke",
     )
     parser.add_argument("--mtp", type=int, choices=(3, 5), required=True)
@@ -193,16 +203,88 @@ def io_probe(device: torch.device, *, aligned_only: bool = False) -> list[dict]:
                 actual = actual_output.view(torch.float32).tolist()
             else:
                 actual = actual_output.tolist()
-            records.append(
-                {
-                    "probe": name,
-                    "status": "PASSED" if actual == wanted else "FAILED",
-                    "actual": actual,
-                    "expected": wanted,
-                }
-            )
+            record = {
+                "probe": name,
+                "status": "PASSED" if actual == wanted else "FAILED",
+                "actual": actual,
+                "expected": wanted,
+            }
+            if mode == 6:
+                record["input_bits"] = _cast_bits(fp_input)
+                record["actual_bits"] = _cast_bits(actual_output.view(torch.float16))
+                record["expected_bits"] = _cast_bits(fp_input)
+            records.append(record)
         except Exception as error:
             records.append({"probe": name, "status": "ERROR", "error": str(error)})
+    return records
+
+
+CAST_PROBE_MODES = (
+    "fp16_raw_copy",
+    "fp32_raw_copy",
+    "fp16_to_fp32_none",
+    "fp32_to_fp16_none",
+    "fp32_to_fp16_rint",
+    "fp16_roundtrip_none",
+    "fp16_roundtrip_rint",
+)
+
+
+def _cast_bits(tensor: torch.Tensor) -> list[str]:
+    """Return bit patterns without using a floating-point conversion."""
+    if tensor.dtype == torch.float16:
+        return [f"0x{value & 0xFFFF:04x}" for value in tensor.view(torch.int16).tolist()]
+    if tensor.dtype == torch.float32:
+        return [f"0x{value & 0xFFFFFFFF:08x}" for value in tensor.view(torch.int32).tolist()]
+    raise TypeError(f"unsupported cast probe dtype: {tensor.dtype}")
+
+
+def cast_probe(device: torch.device) -> list[dict]:
+    """Isolate aligned I/O, each Cast direction, and round-trip for 310P."""
+    records = []
+    for count in (16, 32, 64):
+        values = torch.arange(count, dtype=torch.float32) / 4
+        for mode, name in enumerate(CAST_PROBE_MODES):
+            input_dtype = torch.float32 if mode in (1, 3, 4) else torch.float16
+            output_dtype = torch.float32 if mode in (1, 2) else torch.float16
+            source_cpu = values.to(input_dtype)
+            expected = source_cpu.to(output_dtype)
+            source = source_cpu.to(device)
+            output = torch.full((count,), float("nan"), dtype=output_dtype, device=device)
+            record = {
+                "probe": name,
+                "count": count,
+                "mode": mode,
+                "input_dtype": str(input_dtype),
+                "output_dtype": str(output_dtype),
+                "input_values": source_cpu.tolist(),
+                "input_bits": _cast_bits(source_cpu),
+                "expected_values": expected.tolist(),
+                "expected_bits": _cast_bits(expected),
+                "input_address_mod_32": source.data_ptr() % 32,
+                "output_address_mod_32": output.data_ptr() % 32,
+            }
+            try:
+                torch.ops.replayssm_sd_310p.cast_probe(source, output, mode, count)
+                torch.npu.synchronize()
+                actual = output.cpu()
+                record["actual_values"] = actual.tolist()
+                record["actual_bits"] = _cast_bits(actual)
+                record["first_mismatch"] = next(
+                    (
+                        index
+                        for index, (actual_bit, expected_bit) in enumerate(
+                            zip(record["actual_bits"], record["expected_bits"])
+                        )
+                        if actual_bit != expected_bit
+                    ),
+                    None,
+                )
+                record["status"] = "PASSED" if record["first_mismatch"] is None else "FAILED"
+            except Exception:
+                record["status"] = "ERROR"
+                record["error"] = traceback.format_exc()
+            records.append(record)
     return records
 
 
@@ -627,6 +709,15 @@ def main() -> None:
             report["io_probe"] = io_probe(device, aligned_only=args.stage == "aligned_probe")
             if any(case["status"] != "PASSED" for case in report["io_probe"]):
                 raise AssertionError("At least one atomic 310P I/O probe failed")
+        if args.stage == "cast_probe":
+            report["cast_probe"] = cast_probe(device)
+            report["legacy_queue_roundtrip"] = next(
+                case for case in io_probe(device, aligned_only=True) if case["probe"] == "fp16_block_cast"
+            )
+            if any(case["status"] != "PASSED" for case in report["cast_probe"]):
+                raise AssertionError("At least one isolated 310P Cast probe failed")
+            if report["legacy_queue_roundtrip"]["status"] != "PASSED":
+                raise AssertionError("Legacy queue-based FP16 round-trip still fails")
         if args.stage == "cursor_probe":
             report["cursor_probe"] = cursor_probe(args, device)
         if args.stage in ("smoke", "all"):

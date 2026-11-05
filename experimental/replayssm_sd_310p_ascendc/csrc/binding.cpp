@@ -5,6 +5,7 @@
 
 TORCH_LIBRARY(replayssm_sd_310p, m) {
   m.def("io_probe(Tensor input, Tensor(a!) output, int mode) -> ()");
+  m.def("cast_probe(Tensor input, Tensor(a!) output, int mode, int count) -> ()");
   m.def("verify_(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor checkpoint, "
         "Tensor(a!) d_cache, Tensor(b!) k_cache, Tensor(c!) g_cache, Tensor slots, "
         "Tensor positions, Tensor bases, Tensor lengths, Tensor(d!) out, Tensor(e!) status, "
@@ -19,6 +20,7 @@ TORCH_LIBRARY(replayssm_sd_310p, m) {
 
 TORCH_LIBRARY_IMPL(replayssm_sd_310p, PrivateUse1, m) {
   m.impl("io_probe", &replayssm_sd_310p::io_probe);
+  m.impl("cast_probe", &replayssm_sd_310p::cast_probe);
   m.impl("verify_", &replayssm_sd_310p::verify);
   m.impl("compact_", &replayssm_sd_310p::compact);
   m.impl("cursor_", &replayssm_sd_310p::cursor);
@@ -26,6 +28,7 @@ TORCH_LIBRARY_IMPL(replayssm_sd_310p, PrivateUse1, m) {
 
 TORCH_LIBRARY_IMPL(replayssm_sd_310p, Meta, m) {
   m.impl("io_probe", [](const at::Tensor&, const at::Tensor&, int64_t) {});
+  m.impl("cast_probe", [](const at::Tensor&, const at::Tensor&, int64_t, int64_t) {});
   m.impl("verify_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&,
