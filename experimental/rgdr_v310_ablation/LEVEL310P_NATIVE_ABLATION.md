@@ -17,7 +17,8 @@ cmake -S . -B build \
   -DPython3_EXECUTABLE="$(command -v python3)"
 cmake --build build --target rgdr_v310_vec_torch -j 8
 readelf -d build/librgdr_v310_vec_torch.so | grep -E 'RUNPATH|RPATH'
-python3 -m unittest tests.test_task_mapping
+PYTHONPATH="$(git rev-parse --show-toplevel)" \
+  python3 -m unittest experimental.rgdr_v310_ablation.tests.test_task_mapping
 ```
 
 The vector binding must load and compile first. If it fails, send the first
