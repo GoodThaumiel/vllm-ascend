@@ -22,7 +22,7 @@ constexpr uint32_t MAX_VALUE_HEADS = 32;
 // correction solve is evaluated in token order with the earlier corrections
 // held in UB; this is algebraically the same unit-triangular solve as Eq. 10
 // of the paper, but is not yet the final performance tiling.
-template <int VARIANT>
+template <int VARIANT, bool BLOCK_STATUS = false>
 class ReplaySDVerify {
  public:
   __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
@@ -345,6 +345,7 @@ class ReplaySDVerify {
     const uint32_t headsPerStatusBlock = 8 / tiles_;
     const uint32_t totalGroups = batch_ * valueHeads_ / headsPerStatusBlock;
     for (uint32_t group = GetBlockIdx(); group < totalGroups; group += GetBlockNum()) {
+      int32_t groupError = 0;
       for (uint32_t localHead = 0; localHead < headsPerStatusBlock; ++localHead) {
       const uint32_t task = group * headsPerStatusBlock + localHead;
       const uint32_t row = task / valueHeads_;
@@ -380,6 +381,7 @@ class ReplaySDVerify {
       } else if (base < 0 || base >= static_cast<int32_t>(ringLen_)) {
         error = 3;
       }
+      groupError = error;
       if (error != 0 || slot == 0) {
         Duplicate(result_, 0.0f, tileV_);
         PipeBarrier<PIPE_V>();
@@ -387,7 +389,9 @@ class ReplaySDVerify {
           for (uint32_t s = 0; s < MAX_TOKENS; ++s) {
             Store(out_, OutputOffset(row, s, head, tile * tileV_), result_, tileV_);
           }
-          WriteStatus(task * tiles_ + tile, error);
+          if constexpr (!BLOCK_STATUS) {
+            WriteStatus(task * tiles_ + tile, error);
+          }
         }
         if constexpr (VARIANT == 14) {
           if (head == 0) {
@@ -719,7 +723,9 @@ class ReplaySDVerify {
         for (int32_t s = length; s < static_cast<int32_t>(MAX_TOKENS); ++s) {
           Store(out_, OutputOffset(row, s, head, vStart), result_, tileV_);
         }
-        WriteStatus(task * tiles_ + tile, 0);
+        if constexpr (!BLOCK_STATUS) {
+          WriteStatus(task * tiles_ + tile, 0);
+        }
       }
       if constexpr (VARIANT == 14) {
         const int32_t compactError = CompactError(slot, ringSlot, pos, base, flush);
@@ -735,6 +741,9 @@ class ReplaySDVerify {
           WriteCompactStatus(row, compactError);
         }
       }
+      }
+      if constexpr (BLOCK_STATUS) {
+        WriteStatusBlock(group, groupError);
       }
     }
   }
@@ -1546,6 +1555,24 @@ class ReplaySDVerify {
 
   __aicore__ inline void WriteStatus(uint32_t task, int32_t error) {
     WriteScalar(status_, task, error);
+  }
+
+  __aicore__ inline void WriteStatusBlock(uint32_t group, int32_t error) {
+    // Exactly eight int32 status words share one aligned 32-byte GM block.
+    // All heads in the group use the same row metadata and thus the same code.
+    DataCopyParams aligned{1, 1, 0, 0};
+    auto output = outQueue_.AllocTensor<int32_t>();
+    for (uint32_t i = 0; i < 8; ++i) {
+      output.SetValue(i, error);
+    }
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    outQueue_.EnQue(output);
+    output = outQueue_.DeQue<int32_t>();
+    DataCopy(status_[static_cast<uint64_t>(group) * 8], output, aligned);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    outQueue_.FreeTensor(output);
   }
 
   template <typename T>

@@ -9,7 +9,9 @@
 #include <cmath>
 
 #include "aclrtlaunch_replayssm_sd_310p_verify4.h"
+#include "aclrtlaunch_replayssm_sd_310p_verify4_block_status.h"
 #include "aclrtlaunch_replayssm_sd_310p_verify6.h"
+#include "aclrtlaunch_replayssm_sd_310p_verify6_block_status.h"
 
 namespace replayssm_sd_310p {
 void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -19,7 +21,8 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& slots, const at::Tensor& positions,
             const at::Tensor& bases, const at::Tensor& lengths,
             const at::Tensor& out, const at::Tensor& status, double scale,
-            int64_t tile_v, int64_t cores, c10::optional<at::Tensor> ring_slots) {
+            int64_t tile_v, int64_t cores, c10::optional<at::Tensor> ring_slots,
+            int64_t status_variant) {
   const at::Tensor& ring_ids = ring_slots.has_value() ? *ring_slots : slots;
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& t : {k, v, g, beta, checkpoint, d_cache, k_cache, g_cache,
@@ -86,6 +89,8 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(value_heads % heads_per_status_block == 0,
               "value heads must align to a 32-byte status block");
   TORCH_CHECK(cores >= 1 && cores <= 7, "310P pilot cores must be in [1,7]");
+  TORCH_CHECK(status_variant == 0 || status_variant == 1,
+              "status_variant must be 0 (V11) or 1 (aligned 32B block)");
   TORCH_CHECK(std::isfinite(scale) && scale > 0, "scale must be finite and positive");
 
   const c10_npu::OptionalNPUGuard guard(q.device());
@@ -105,9 +110,11 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       static_cast<uint64_t>(checkpoint.stride(0)), static_cast<uint64_t>(d_cache.stride(0)), \
       static_cast<uint64_t>(k_cache.stride(0)), static_cast<uint64_t>(g_cache.stride(0)), \
       static_cast<uint32_t>(tile_v), static_cast<float>(scale)
-  const aclError result = tokens == 4
-      ? aclrtlaunch_replayssm_sd_310p_verify4(REPLAY_310P_ARGS)
-      : aclrtlaunch_replayssm_sd_310p_verify6(REPLAY_310P_ARGS);
+  const aclError result = status_variant == 0
+      ? (tokens == 4 ? aclrtlaunch_replayssm_sd_310p_verify4(REPLAY_310P_ARGS)
+                     : aclrtlaunch_replayssm_sd_310p_verify6(REPLAY_310P_ARGS))
+      : (tokens == 4 ? aclrtlaunch_replayssm_sd_310p_verify4_block_status(REPLAY_310P_ARGS)
+                     : aclrtlaunch_replayssm_sd_310p_verify6_block_status(REPLAY_310P_ARGS));
 #undef REPLAY_310P_ARGS
   TORCH_CHECK(result == ACL_SUCCESS, "ReplaySSM SD 310P verify launch failed: ", result);
 }

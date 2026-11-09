@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import statistics
 import subprocess
+import time
 import traceback
 from pathlib import Path
 
@@ -50,13 +51,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
+    parser.add_argument("--status-variant", type=int, choices=(0, 1), default=0)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
-def verify(case: dict[str, torch.Tensor], tile_v: int, cores: int) -> None:
+def verify(case: dict[str, torch.Tensor], tile_v: int, cores: int, status_variant: int = 0) -> None:
     torch.ops.replayssm_sd_310p.verify_(
         case["q"],
         case["k"],
@@ -77,6 +79,7 @@ def verify(case: dict[str, torch.Tensor], tile_v: int, cores: int) -> None:
         tile_v,
         cores,
         case["ring_slots"],
+        status_variant,
     )
 
 
@@ -364,7 +367,7 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
             cpu["ring_slots"][:2] = torch.tensor([2, 1], dtype=torch.int32)
         gpu = clone(cpu, device)
         expected = verify_reference(cpu)
-        verify(gpu, args.tile_v, args.cores)
+        verify(gpu, args.tile_v, args.cores, args.status_variant)
         torch.npu.synchronize()
         verify_errors = compare_verify(gpu, expected)
         compact_expected = compact_reference(expected)
@@ -439,11 +442,17 @@ def invalid_bindings(args: argparse.Namespace, device: torch.device) -> list[str
         broken = dict(case)
         broken.update(change)
         try:
-            verify(broken, args.tile_v, args.cores)
+            verify(broken, args.tile_v, args.cores, args.status_variant)
         except RuntimeError:
             checks.append(label)
         else:
             raise AssertionError(f"{label} unexpectedly accepted")
+    try:
+        verify(case, args.tile_v, args.cores, 2)
+    except RuntimeError:
+        checks.append("verify_status_variant")
+    else:
+        raise AssertionError("verify_status_variant unexpectedly accepted")
     broken = dict(case)
     broken["checkpoint"] = case["checkpoint"].float()
     try:
@@ -478,7 +487,7 @@ def sequence(args: argparse.Namespace, device: torch.device) -> list[dict]:
         for name in ("positions", "bases", "flush"):
             gpu[name].copy_(cpu[name].to(device))
         expected_verify = verify_reference(cpu)
-        verify(gpu, args.tile_v, args.cores)
+        verify(gpu, args.tile_v, args.cores, args.status_variant)
         torch.npu.synchronize()
         verify_errors = compare_verify(gpu, expected_verify)
         expected_compact = compact_reference(expected_verify)
@@ -571,20 +580,42 @@ def time_graph(graph, reset, *, warmup: int, iterations: int) -> dict[str, float
         graph.replay()
     torch.npu.synchronize()
     samples = []
+    timing_source = "npu_event"
+    try:
+        probe_start = torch.npu.Event(enable_timing=True)
+        probe_end = torch.npu.Event(enable_timing=True)
+        probe_start.record()
+        probe_end.record()
+        probe_end.synchronize()
+        probe_start.elapsed_time(probe_end)
+    except RuntimeError as error:
+        # Some 310P driver/CANN combinations report 107006 for every event
+        # pair, including a trivial x+1 probe. Keep the fallback explicit.
+        if "107006" not in str(error) and "timestamp invalid" not in str(error):
+            raise
+        timing_source = "wall_clock"
     for _ in range(iterations):
         reset()
-        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000)
+        if timing_source == "npu_event":
+            start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) * 1000)
+        else:
+            torch.npu.synchronize()
+            start_ns = time.perf_counter_ns()
+            graph.replay()
+            torch.npu.synchronize()
+            samples.append((time.perf_counter_ns() - start_ns) / 1000)
     ordered = sorted(samples)
     return {
         "p50_us": statistics.median(samples),
         "p90_us": ordered[int(0.9 * (len(ordered) - 1))],
         "min_us": ordered[0],
         "iterations": len(samples),
+        "timing_source": timing_source,
     }
 
 
@@ -596,11 +627,15 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
     cur_before = {name: cur[name].clone() for name in ("write_pos", "cache_base", "is_flush", "status")}
     replay_before = {name: gpu[name].clone() for name in CACHE}
 
-    verify_graph = graph_of(lambda: verify(gpu, args.tile_v, args.cores))
+    verify_graph = graph_of(lambda: verify(gpu, args.tile_v, args.cores, args.status_variant))
     compact_graph = graph_of(lambda: compact(gpu, args.cores))
     cursor_graph = graph_of(lambda: cursor(cur, args.mtp))
     combined_graph = graph_of(
-        lambda: (verify(gpu, args.tile_v, args.cores), compact(gpu, args.cores), cursor(cur, args.mtp))
+        lambda: (
+            verify(gpu, args.tile_v, args.cores, args.status_variant),
+            compact(gpu, args.cores),
+            cursor(cur, args.mtp),
+        )
     )
 
     # The same captured graph must consume new device metadata and cache
@@ -737,6 +772,7 @@ def main() -> None:
         "cores": args.cores,
         "device": args.device,
         "stage": args.stage,
+        "status_variant": args.status_variant,
     }
     if args.stage in ("perf", "all"):
         report["native_baseline"] = {

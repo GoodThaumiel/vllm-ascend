@@ -14,7 +14,8 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& slots, const at::Tensor& positions,
             const at::Tensor& bases, const at::Tensor& lengths,
             const at::Tensor& out, const at::Tensor& status, double scale,
-            int64_t tile_v, int64_t cores, c10::optional<at::Tensor> ring_slots);
+            int64_t tile_v, int64_t cores, c10::optional<at::Tensor> ring_slots,
+            int64_t status_variant);
 
 void compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
              const at::Tensor& k_cache, const at::Tensor& g_cache,

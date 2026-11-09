@@ -9,7 +9,7 @@ TORCH_LIBRARY(replayssm_sd_310p, m) {
   m.def("verify_(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor checkpoint, "
         "Tensor(a!) d_cache, Tensor(b!) k_cache, Tensor(c!) g_cache, Tensor slots, "
         "Tensor positions, Tensor bases, Tensor lengths, Tensor(d!) out, Tensor(e!) status, "
-        "float scale, int tile_v=32, int cores=7, Tensor? ring_slots=None) -> ()");
+        "float scale, int tile_v=32, int cores=7, Tensor? ring_slots=None, int status_variant=0) -> ()");
   m.def("compact_(Tensor(a!) checkpoint, Tensor d_cache, Tensor k_cache, Tensor g_cache, "
         "Tensor slots, Tensor positions, Tensor bases, Tensor flush, Tensor(b!) status, "
         "int tile_v=32, int cores=7, Tensor? ring_slots=None) -> ()");
@@ -34,7 +34,7 @@ TORCH_LIBRARY_IMPL(replayssm_sd_310p, Meta, m) {
                         const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                        double, int64_t, int64_t, c10::optional<at::Tensor>) {});
+                        double, int64_t, int64_t, c10::optional<at::Tensor>, int64_t) {});
   m.impl("compact_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                          const at::Tensor&, const at::Tensor&, const at::Tensor&,
                          const at::Tensor&, const at::Tensor&, const at::Tensor&,

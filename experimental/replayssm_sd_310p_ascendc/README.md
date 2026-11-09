@@ -14,3 +14,8 @@ reference for supported AscendC APIs and for operator-only timing.
 Build and on-device validation commands are in `LEVEL310P_OPERATORS.md`.
 The 310P baseline is CANN 9.2.1 with torch_npu 2.10.0.post7. A complete,
 zero-exit CMake build is required before a device result is considered valid.
+
+V12 adds an isolated 32-byte status-write ablation and a request-owned ring
+allocation demo. See `LEVEL310P_V12.md` for the new device checklist. The
+demo reports projected FP16 SSM payload savings; it does not change the live
+vLLM Mamba cache allocation or enable `vllm serve` dispatch.
