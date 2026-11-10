@@ -992,6 +992,7 @@ class NPUModelRunner(GPUModelRunner):
             self._replayssm_sd_ring_slots.release(scheduler_output.preempted_req_ids or ())
             scheduled = scheduler_output.num_scheduled_tokens.keys()
             resumed = req_data.resumed_req_ids
+            self._replayssm_sd_ring_slots.release(resumed)
             unscheduled = self.input_batch.req_id_to_index.keys() - (scheduled - resumed)
             unscheduled -= scheduler_output.finished_req_ids
             preempted = (scheduler_output.preempted_req_ids or set()) | resumed
@@ -1082,6 +1083,16 @@ class NPUModelRunner(GPUModelRunner):
     def _get_ascend_mamba_state_copy_funcs(self):
         """Bridge the copy-func tuple-to-mapping contract from vLLM #53896."""
         return self._get_mamba_state_copy_funcs()
+
+    def _restore_replayssm_sd_deferred_state(self) -> None:
+        if self._replayssm_sd_deferred_state:
+            for req_id, (decode_base, accepted) in list(self._replayssm_sd_deferred_state.items()):
+                row = self.input_batch.req_id_to_index.get(req_id)
+                if row is None:
+                    continue
+                self.input_batch.replayssm_decode_base[row] = decode_base
+                self.num_accepted_tokens.gpu[row].copy_(accepted)
+                del self._replayssm_sd_deferred_state[req_id]
 
     def _sync_num_accepted_tokens(self, num_reqs: int, has_prev_mapping: bool) -> None:
         """Publish accepted counts in current request order after the D2H event."""
@@ -1546,14 +1557,7 @@ class NPUModelRunner(GPUModelRunner):
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
 
-        if self._replayssm_sd_deferred_state:
-            for req_id, (decode_base, accepted) in list(self._replayssm_sd_deferred_state.items()):
-                row = self.input_batch.req_id_to_index.get(req_id)
-                if row is None:
-                    continue
-                self.input_batch.replayssm_decode_base[row] = decode_base
-                self.num_accepted_tokens.gpu[row].copy_(accepted)
-                del self._replayssm_sd_deferred_state[req_id]
+        self._restore_replayssm_sd_deferred_state()
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel

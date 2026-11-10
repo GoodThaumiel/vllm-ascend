@@ -43,8 +43,9 @@ void cursor(const at::Tensor& write_pos, const at::Tensor& cache_base,
   for (const auto& tensor : {cache_base, is_flush, accepted, slots, do_reset, status}) {
     TORCH_CHECK(tensor.device() == write_pos.device(), "All tensors must be on one NPU");
   }
-  TORCH_CHECK(logical_limit == 16 && max_spec_len > 0 &&
-                  (max_spec_len == 3 || max_spec_len == 5) && max_spec_len <= logical_limit &&
+  // The isolated benchmark passes draft width; serve passes the whole window,
+  // since vLLM's accepted count includes the anchor token.
+  TORCH_CHECK(logical_limit == 16 && max_spec_len >= 3 && max_spec_len <= 6 &&
                   ring_len == 32,
               "Invalid logical_limit/max_spec_len/ring_len");
   TORCH_CHECK(batch <= std::numeric_limits<uint32_t>::max() &&

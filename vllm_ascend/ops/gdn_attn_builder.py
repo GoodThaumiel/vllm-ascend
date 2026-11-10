@@ -410,7 +410,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.sd_write_pos = None
             self.sd_cache_base = None
             self.sd_is_flush = None
-            self.sd_positions = torch.empty(sequence_index_capacity, dtype=torch.int32, device=device)
+            self.sd_positions = self._allocate_replayssm_sd_rows(sequence_index_capacity, device)
             # Physical checkpoint blocks and request-owned ring slots have
             # separate address spaces, but share the same padded row order.
             self.sd_slots = torch.empty_like(self.sd_positions)
@@ -466,6 +466,32 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.replayssm_is_flush[:output_rows],
         )
 
+    def _allocate_replayssm_sd_rows(self, capacity: int, device: torch.device) -> torch.Tensor:
+        return torch.empty(capacity, dtype=torch.int32, device=device)
+
+    def _allocate_replayssm_sd_cursor_state(self, device: torch.device) -> None:
+        self.sd_write_pos = torch.zeros(self.sd_ring_capacity + 1, dtype=torch.int32, device=device)
+        self.sd_cache_base = torch.zeros_like(self.sd_write_pos)
+        self.sd_is_flush = torch.zeros(self.sd_ring_capacity + 1, dtype=torch.int8, device=device)
+
+    def _advance_replayssm_sd_cursor(self, rows, accepted, reset) -> None:
+        replayssm_sd_cursor(
+            self.sd_write_pos,
+            self.sd_cache_base,
+            self.sd_is_flush,
+            accepted[:rows].to(torch.int32).contiguous(),
+            self.sd_ring_slots[:rows],
+            reset.contiguous(),
+            self.sd_cursor_status[:rows],
+            self.sd_logical_limit,
+            self.num_spec + 1,
+            self.sd_ring_len,
+        )
+
+    def _stage_replayssm_sd_pack(self, pack, rows, attn_metadata) -> None:
+        self.sd_pack_indices[: pack.numel()].copy_(pack, non_blocking=True)
+        attn_metadata.replayssm_sd_pack_indices = self.sd_pack_indices[: pack.numel()]
+
     def _attach_replayssm_sd_metadata(
         self,
         m: CommonAttentionMetadata,
@@ -484,10 +510,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if not self.vllm_config.cache_config.num_gpu_blocks:
             raise ValueError("ReplaySSM SD requires num_gpu_blocks before GDN metadata build")
         if self.sd_write_pos is None:
-            device = state_indices.device
-            self.sd_write_pos = torch.zeros(self.sd_ring_capacity + 1, dtype=torch.int32, device=device)
-            self.sd_cache_base = torch.zeros_like(self.sd_write_pos)
-            self.sd_is_flush = torch.zeros(self.sd_ring_capacity + 1, dtype=torch.int8, device=device)
+            self._allocate_replayssm_sd_cursor_state(state_indices.device)
         self.sd_slots[:rows].copy_(state_indices[:, 0])
         ring_slots_cpu = m.replayssm_sd_ring_slots_cpu
         if ring_slots_cpu is None:
@@ -509,29 +532,17 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         reset = first_decode.index_select(0, spec_sequence_indices)
         if rows > reset.numel():
             reset = torch.cat((reset, reset.new_zeros(rows - reset.numel())))
-        cursor_status = self.sd_cursor_status[:rows]
-        replayssm_sd_cursor(
-            self.sd_write_pos,
-            self.sd_cache_base,
-            self.sd_is_flush,
-            accepted[:rows].to(torch.int32).contiguous(),
-            self.sd_ring_slots[:rows],
-            reset.contiguous(),
-            cursor_status,
-            self.sd_logical_limit,
-            self.num_spec + 1,
-            self.sd_ring_len,
-        )
+        self.sd_lengths[:rows].copy_(query_start_loc[1 : rows + 1] - query_start_loc[:rows])
+        self._advance_replayssm_sd_cursor(rows, accepted, reset)
         self.sd_positions[:rows].copy_(self.sd_write_pos.index_select(0, self.sd_ring_slots[:rows]))
         self.sd_bases[:rows].copy_(self.sd_cache_base.index_select(0, self.sd_ring_slots[:rows]))
         self.sd_flush[:rows].copy_(self.sd_is_flush.index_select(0, self.sd_ring_slots[:rows]).to(torch.int32))
-        self.sd_lengths[:rows].copy_(query_start_loc[1 : rows + 1] - query_start_loc[:rows])
 
         query_lens_cpu = torch.diff(m.query_start_loc_cpu)[spec_sequence_masks_cpu]
         pack = replayssm_sd_pack_indices(query_lens_cpu, self.num_spec + 1, REPLAYSSM_SD_MAX_TOKENS)
         if pack.numel() != attn_metadata.num_spec_decode_tokens:
             raise ValueError("ReplaySSM SD token pack does not match speculative token count")
-        self.sd_pack_indices[: pack.numel()].copy_(pack, non_blocking=True)
+        self._stage_replayssm_sd_pack(pack, rows, attn_metadata)
         attn_metadata.replayssm_sd_slots = self.sd_slots[:rows]
         attn_metadata.replayssm_sd_block_slots = self.sd_slots[:rows]
         attn_metadata.replayssm_sd_ring_slots = self.sd_ring_slots[:rows]
@@ -539,8 +550,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata.replayssm_sd_bases = self.sd_bases[:rows]
         attn_metadata.replayssm_sd_flush = self.sd_flush[:rows]
         attn_metadata.replayssm_sd_lengths = self.sd_lengths[:rows]
-        attn_metadata.replayssm_sd_pack_indices = self.sd_pack_indices[: pack.numel()]
-        attn_metadata.replayssm_sd_cursor_status = cursor_status
+        attn_metadata.replayssm_sd_cursor_status = self.sd_cursor_status[:rows]
 
     def _init_reorder_batch_threshold(
         self,
@@ -856,7 +866,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 num_accepted_tokens = num_accepted_tokens[:num_actual_reqs]
             if num_decode_draft_tokens_cpu is not None:
                 num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu[:num_actual_reqs]
-        m = _treat_single_token_prefills_with_state_as_decodes(m)
+        if self._USE_COMMON_KERNEL_METADATA or not self.use_replayssm_sd:
+            m = _treat_single_token_prefills_with_state_as_decodes(m)
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu

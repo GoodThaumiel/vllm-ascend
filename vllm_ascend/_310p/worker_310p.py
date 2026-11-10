@@ -27,6 +27,7 @@ from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
 from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.utils import is_rc_device
 from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
 
@@ -103,6 +104,8 @@ class NPUWorker310(NPUWorker):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            if replayssm_sd_enabled(self.vllm_config):
+                self.model_runner.initialize_replayssm_sd_ring()
             self.model_runner.profile_run()
             free_memory, total_memory = torch.npu.mem_get_info()
             # The host memory or device memory for RC devices refers to the available portion of memory

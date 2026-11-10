@@ -1,6 +1,7 @@
 # ReplaySSM SD 310P operator pilot
 
-This is an isolated Ascend310P3 pilot. It does not enable ReplaySSM in `vllm serve`.
+This directory builds the Ascend310P3 ReplaySSM operators. The separate
+[serve pilot](LEVEL310P_SERVE.md) documents how to opt in to the live path.
 The three in-place Torch operators are registered under `replayssm_sd_310p`:
 `verify_`, `compact_`, and `cursor_`. Verify dispatches a separate AscendC
 instantiation for four (MTP3) or six (MTP5) physical candidate tokens.

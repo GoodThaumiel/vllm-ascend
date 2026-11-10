@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_310
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
+from vllm_ascend._310p.ops.replayssm_sd import replayssm_sd_310p_decode
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
@@ -339,19 +340,30 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
             # 2.1: Process the multi-query part
             if spec_sequence_masks is not None:
-                num_spec = attn_metadata.num_spec_decodes
-                core_attn_out_spec = npu_recurrent_gated_delta_rule_310(
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
-                    g=g_spec,
-                    beta=beta_spec,
-                    state=ssm_state,
-                    cu_seqlens=spec_query_start_loc[: num_spec + 1],
-                    ssm_state_indices=spec_state_indices_tensor[:num_spec],
-                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens[:num_spec],
-                    use_qk_l2norm_in_kernel=True,
-                )
+                if getattr(self, "use_replayssm_sd", False):
+                    core_attn_out_spec = replayssm_sd_310p_decode(
+                        self,
+                        l2norm_310p(query_spec),
+                        l2norm_310p(key_spec),
+                        value_spec,
+                        g_spec,
+                        beta_spec,
+                        attn_metadata,
+                    )
+                else:
+                    num_spec = attn_metadata.num_spec_decodes
+                    core_attn_out_spec = npu_recurrent_gated_delta_rule_310(
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        g=g_spec,
+                        beta=beta_spec,
+                        state=ssm_state,
+                        cu_seqlens=spec_query_start_loc[: num_spec + 1],
+                        ssm_state_indices=spec_state_indices_tensor[:num_spec],
+                        num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens[:num_spec],
+                        use_qk_l2norm_in_kernel=True,
+                    )
             else:
                 core_attn_out_spec = None
 

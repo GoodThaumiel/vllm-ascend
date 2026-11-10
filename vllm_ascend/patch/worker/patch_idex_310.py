@@ -1,3 +1,6 @@
+from dataclasses import replace
+from functools import wraps
+
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.third_party.flash_linear_attention.ops import index as fla_index
 
@@ -6,7 +9,9 @@ from vllm_ascend._310p.ops.fla.idex import (
     prepare_chunk_indices_310,
     prepare_chunk_offsets_310,
 )
+from vllm_ascend._310p.ops.replayssm_sd import initialize_replayssm_sd_310p
 from vllm_ascend._310p.spec_decode.llm_base_proposer_310 import AscendSpecDecodeBaseProposer310
+from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 from vllm_ascend.utils import is_rc_device
 
@@ -29,6 +34,29 @@ AscendSpecDecodeBaseProposer._run_merged_draft = (  # type: ignore[method-assign
 QwenGatedDeltaNetAttention._warmup_prefill_kernels = lambda self, qkv_or_qkvz, v_dim: None  # type: ignore[method-assign]
 QwenGatedDeltaNetAttention._forward_core = AscendGatedDeltaNetAttention310._forward_core
 QwenGatedDeltaNetAttention.get_state_dtype = AscendGatedDeltaNetAttention310.get_state_dtype
+
+_original_gdn_init = QwenGatedDeltaNetAttention.__init__
+_original_gdn_get_kv_cache_spec = QwenGatedDeltaNetAttention.get_kv_cache_spec
+
+
+@wraps(_original_gdn_init)
+def _gdn_init_with_replayssm_sd(self, config, vllm_config, *args, **kwargs):
+    _original_gdn_init(self, config, vllm_config, *args, **kwargs)
+    initialize_replayssm_sd_310p(self, vllm_config)
+
+
+@wraps(_original_gdn_get_kv_cache_spec)
+def _gdn_get_kv_cache_spec_with_replayssm_sd(self, vllm_config):
+    spec = _original_gdn_get_kv_cache_spec(self, vllm_config)
+    if spec is not None and replayssm_sd_enabled(vllm_config):
+        # The convolution still keeps its candidate history inside the block.
+        # Only the per-candidate SSM checkpoints are replaced by the ring.
+        spec = replace(spec, num_speculative_blocks=0)
+    return spec
+
+
+QwenGatedDeltaNetAttention.__init__ = _gdn_init_with_replayssm_sd
+QwenGatedDeltaNetAttention.get_kv_cache_spec = _gdn_get_kv_cache_spec_with_replayssm_sd
 
 # 310P: make Qwen GDN use the 310P attention backend, including the
 # MTP ACL graph padding replay fixes provided by gdn_attn_builder_310.py.

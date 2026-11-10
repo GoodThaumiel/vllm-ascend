@@ -463,7 +463,7 @@ def invalid_bindings(args: argparse.Namespace, device: torch.device) -> list[str
         raise AssertionError("compact_dtype unexpectedly accepted")
     cur = clone(cursor_case(case, args.mtp), device)
     try:
-        cursor(cur, 4)
+        cursor(cur, 7)
     except RuntimeError:
         checks.append("cursor_spec_len")
     else:
@@ -478,7 +478,9 @@ def sequence(args: argparse.Namespace, device: torch.device) -> list[dict]:
     cur_cpu = cursor_case(cpu, args.mtp)
     cur_gpu = clone(cur_cpu, device)
     records = []
-    accepted_pattern = (1, args.mtp, 2, args.mtp - 1)
+    # vLLM counts the anchor plus accepted drafts, including a full window.
+    width = args.mtp + 1
+    accepted_pattern = (1, width, 2, width - 1)
     for step in range(24):
         fresh = make_case(mtp=args.mtp, batch=1, pos=0, base=0, tile_v=args.tile_v, seed=1000 + step)
         for name in ("q", "k", "v", "g", "beta"):
@@ -507,9 +509,9 @@ def sequence(args: argparse.Namespace, device: torch.device) -> list[dict]:
             cur_cpu["accepted"],
             cur_cpu["slots"],
             cur_cpu["do_reset"],
-            args.mtp,
+            width,
         )
-        cursor(cur_gpu, args.mtp)
+        cursor(cur_gpu, width)
         torch.npu.synchronize()
         for name, expected_tensor in (("write_pos", wp), ("cache_base", base), ("is_flush", flush), ("status", status)):
             torch.testing.assert_close(cur_gpu[name].cpu(), expected_tensor, atol=0, rtol=0)

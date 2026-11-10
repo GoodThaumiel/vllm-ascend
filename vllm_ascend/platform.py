@@ -505,8 +505,23 @@ class NPUPlatform(Platform):
 
         if replayssm_sd_enabled(vllm_config):
             spec = vllm_config.speculative_config
+            is_310p = get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY)
             if spec is None:
-                raise ValueError("additional_config.replayssm_sd requires MTP1/2/3 speculative decoding")
+                raise ValueError("additional_config.replayssm_sd requires MTP speculative decoding")
+            if is_310p:
+                if spec.num_speculative_tokens != 3 or vllm_config.parallel_config.tensor_parallel_size != 2:
+                    raise ValueError("310P ReplaySSM SD pilot requires TP2 and MTP3")
+                if vllm_config.model_config.architecture not in (
+                    "Qwen3_5MoeForCausalLM",
+                    "Qwen3_5MoeForConditionalGeneration",
+                ):
+                    raise ValueError("310P ReplaySSM SD pilot requires Qwen3.5 MoE")
+                if vllm_config.scheduler_config.async_scheduling is not False:
+                    raise ValueError("310P ReplaySSM SD pilot requires --no-async-scheduling")
+                if vllm_config.cache_config.enable_prefix_caching:
+                    raise ValueError("310P ReplaySSM SD pilot requires --no-enable-prefix-caching")
+                if enable_sp(vllm_config):
+                    raise ValueError("310P ReplaySSM SD pilot requires sequence parallelism disabled")
             replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
             replayssm_sd_ring_capacity(vllm_config)
             if getattr(spec, "method", None) != "mtp":
@@ -519,13 +534,14 @@ class NPUPlatform(Platform):
                 "Qwen3_5MoeForConditionalGeneration",
             ):
                 raise ValueError("Ascend ReplaySSM SD currently supports Qwen GDN models only")
-            if vllm_config.model_config.dtype != torch.bfloat16:
-                raise ValueError("Ascend ReplaySSM SD requires BF16 model dtype")
+            dtype_name = "float16" if is_310p else "bfloat16"
+            if vllm_config.model_config.dtype != getattr(torch, dtype_name):
+                raise ValueError(f"Ascend ReplaySSM SD requires {dtype_name} model dtype")
             if (
-                vllm_config.cache_config.mamba_cache_dtype != "bfloat16"
-                or vllm_config.cache_config.mamba_ssm_cache_dtype != "bfloat16"
+                vllm_config.cache_config.mamba_cache_dtype != dtype_name
+                or vllm_config.cache_config.mamba_ssm_cache_dtype != dtype_name
             ):
-                raise ValueError("Ascend ReplaySSM SD requires BF16 mamba cache and SSM state")
+                raise ValueError(f"Ascend ReplaySSM SD requires {dtype_name} mamba cache and SSM state")
             if vllm_config.parallel_config.pipeline_parallel_size != 1:
                 raise ValueError("Ascend ReplaySSM SD currently requires PP=1")
             if vllm_config.use_v2_model_runner:
@@ -535,8 +551,9 @@ class NPUPlatform(Platform):
             if vllm_config.cache_config.mamba_cache_mode != "none":
                 raise ValueError("Ascend ReplaySSM SD currently requires --mamba-cache-mode none")
             logger.info(
-                "Enabled Ascend ReplaySSM SD for MTP%d with BF16 checkpoint and %d-entry ring",
+                "Enabled Ascend ReplaySSM SD for MTP%d with %s checkpoint and %d-entry ring",
                 spec.num_speculative_tokens,
+                dtype_name,
                 replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens),
             )
 

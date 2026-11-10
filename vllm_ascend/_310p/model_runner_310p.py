@@ -47,11 +47,18 @@ from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBloc
 from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
 from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
+from vllm_ascend._310p.ops.replayssm_sd import (
+    CORES,
+    STATUS_VARIANT,
+    VERIFY_TILE_V,
+    load_replayssm_sd_310p_ops,
+)
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.spec_decode.utils import (
     update_num_computed_tokens_for_batch_change,
 )
@@ -89,6 +96,14 @@ class NPUModelRunner310(NPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self._replayssm_sd_ring_slots is not None:
+            load_replayssm_sd_310p_ops()
+            logger.info(
+                "310P ReplaySSM SD V12 dispatch: verify tile=%d, status variant=%d, cores=%d",
+                VERIFY_TILE_V,
+                STATUS_VARIANT,
+                CORES,
+            )
         self.input_batch = NPUInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
@@ -105,7 +120,7 @@ class NPUModelRunner310(NPUModelRunner):
                 self.vllm_config.speculative_config.num_speculative_tokens if self.vllm_config.speculative_config else 0
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            use_replayssm=self.cache_config.use_replayssm,
+            use_replayssm=self.cache_config.use_replayssm or replayssm_sd_enabled(self.vllm_config),
         )
         self._acl_format = ACL_FORMAT_FRACTAL_NZ
         logger.info_once("Weight layout uses FRACTAL_NZ.")
@@ -165,14 +180,29 @@ class NPUModelRunner310(NPUModelRunner):
         is_prefilling = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] < self.input_batch.num_prompt_tokens[:num_reqs]
         )
+        if (
+            self.speculative_config is not None
+            and self._replayssm_sd_ring_slots is not None
+            and not force_uniform_decode
+        ):
+            is_prefilling |= (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                < self.input_batch.replayssm_decode_base[:num_reqs]
+            )
+            # The pilot captures only full-width batches with an exact graph
+            # shape. Padded/mixed batches use the variable-width eager path.
+            if np.any(is_prefilling) or num_tokens not in self.cudagraph_batch_sizes:
+                force_eager = True
         is_all_decode = not np.any(is_prefilling)
 
-        if self.attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit):
+        # Capture dispatch runs before the dummy attention metadata is built.
+        attn_state = AscendAttentionState.SpecDecoding if self._spec_dummy_capture else self.attn_state
+        if attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit):
             force_eager = True
 
         # Spec decoding graph replay is only valid for uniform spec-decode batches (q_len = 1 + K).
         if self.speculative_config is not None and (
-            self.attn_state != AscendAttentionState.SpecDecoding
+            attn_state != AscendAttentionState.SpecDecoding
             or max_num_scheduled_tokens != self.uniform_decode_query_len
             or num_tokens != max_num_scheduled_tokens * num_reqs
         ):
@@ -309,6 +339,8 @@ class NPUModelRunner310(NPUModelRunner):
             else:
                 self.num_accepted_tokens.np.fill(1)
                 self.num_accepted_tokens.gpu.fill_(1)
+
+        self._restore_replayssm_sd_deferred_state()
 
         need_async_num_computed_update = (
             self.use_async_spec_decode and self.valid_sampled_token_count_gpu is not None and prev_req_id_to_index
@@ -517,6 +549,8 @@ class NPUModelRunner310(NPUModelRunner):
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
+            if replayssm_sd_enabled(self.vllm_config):
+                self.num_decode_draft_tokens.np.fill(-1)
             spec_decode_metadata = None
             num_draft_tokens = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
@@ -1028,5 +1062,5 @@ class NPUModelRunner310(NPUModelRunner):
                 max_num_blocks_per_req=max_num_blocks,
                 kv_cache_groups=kv_cache_config.kv_cache_groups,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-                use_replayssm=self.cache_config.use_replayssm,
+                use_replayssm=self.cache_config.use_replayssm or replayssm_sd_enabled(self.vllm_config),
             )

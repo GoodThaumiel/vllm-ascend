@@ -124,6 +124,33 @@ def test_graph_dispatch_does_not_treat_later_prefill_chunk_as_decode() -> None:
     assert parent_dispatch.call_args.kwargs["force_uniform_decode"] is None
 
 
+def test_spec_dummy_dispatch_uses_capture_state_before_building_metadata() -> None:
+    runner = object.__new__(NPUModelRunner310)
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.zeros(2, dtype=np.int32),
+        num_prompt_tokens=np.zeros(2, dtype=np.int32),
+    )
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    runner.uniform_decode_query_len = 4
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner._spec_dummy_capture = True
+    runner._replayssm_sd_ring_slots = None
+
+    with patch(
+        "vllm_ascend.worker.model_runner_v1.NPUModelRunner._determine_batch_execution_and_padding",
+    ) as dispatch:
+        runner._determine_batch_execution_and_padding(
+            num_tokens=8,
+            num_reqs=2,
+            num_scheduled_tokens_np=np.full(2, 4, dtype=np.int32),
+            max_num_scheduled_tokens=4,
+            use_cascade_attn=False,
+            force_uniform_decode=True,
+        )
+
+    assert dispatch.call_args.kwargs["force_eager"] is False
+
+
 class TestNPUModelRunner310(TestBase):
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
