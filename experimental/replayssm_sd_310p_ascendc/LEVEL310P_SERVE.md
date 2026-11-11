@@ -148,3 +148,73 @@ MTP 接受数与草稿数增量，以及 KV block 容量。记录每个 rank 在
 `REPLAYSSM_MEMORY_JSON` 中的 checkpoint、ring 与 cache backing。
 每卡 64 槽的 ring 张量 payload 约 369.4 MiB，满载 MTP3 下仅 SSM 张量的
 投影净节省约 2.45 GiB/卡。实际可运行并发以 scheduler 指标为准。
+
+## 4. 2026-11-10 上机结果复测
+
+原报告记录两条 128-token Replay 请求首次分歧均在 idx 45，eager 与 graph
+重现一致。V12 的 3.2%–6.5% 是耗时下降，独立算子的数值检查通过。
+BS64 的 acceptance 和显存记录作为观测值保留。要判断是否有 state 污染，
+需先比对相同 MTP 窗口。显存记录说明分配和规划变化，容量收益还需以同预算下
+实际可运行的请求数为准。
+
+在报告使用的双卡和同一份 Qwen3.6-35B-A3B-W8A8 权重上，用第 2 节的
+eager 启动参数。此版本纳入了上机时手工加的 FP16 dtype 门控。Python 源码可
+复用报告中已重新构建的 V12 扩展。若需重建扩展，用新的 build 目录，沿用第
+1 节的普通构建命令。
+
+1. 先用无 trace 的 Replay 服务复跑原 prompt，确认启动及 idx 45 是否重现。
+2. 分别启动下方的 native 录制服务和四组 Replay 对照服务，每次只发送同一个
+   请求，使用报告原来的 prompt 文件。每组完成后停止当前服务。
+3. 比对两个 rank 的相同输入、相同 draft 窗口和相同已接受 token。Replay
+   继续计算自己的 logits 和 sampler 决策，之后按 Native 记录推进下一轮。
+   使用独立输出目录，保留充足空间供各层 state 快照写盘。
+
+```bash
+# 在定义了 run_serve 的同一个 bash 中执行。TRACE_ROOT 必须是全新目录。
+export TRACE_ROOT="$RESULTS/idx45-trace"
+mkdir -p "$TRACE_ROOT"
+export VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG="$TRACE_ROOT/config.json"
+
+printf '{"output":"%s/native"}\n' "$TRACE_ROOT" > "$VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG"
+run_serve native eager
+```
+
+在另一终端用以下命令提交一次。每轮设置对应的 `RUN` 值，native 为
+`native`，其余为 `t32-v0`、`t64-v0`、`t32-v1`、`t64-v1`。保留原
+`prompt.txt`，避免重新分词后换了复现输入。
+
+```bash
+python3 scripts/replayssm/validate_sd_serve.py \
+  --model replayssm-310p --prompt-file "$RESULTS/prompt.txt" \
+  --concurrency 1 --repetitions 1 --max-tokens 128 \
+  --output "$TRACE_ROOT/http-${RUN}.json"
+```
+
+Native 完成后，逐组在服务终端设置 `TILE`、`VARIANT` 并启动 Replay。
+每次服务日志可从第 2 节的日志路径归档到对应的输出目录。
+
+```bash
+TILE=32
+VARIANT=0
+RUN="t$TILE-v$VARIANT"
+printf '{"output":"%s/%s","reference":"%s/native","tile":%d,"status_variant":%d}\n' \
+  "$TRACE_ROOT" "$RUN" "$TRACE_ROOT" "$TILE" "$VARIANT" > "$VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG"
+run_serve replay eager
+```
+
+```bash
+for run in t32-v0 t64-v0 t32-v1 t64-v1; do
+  python3 scripts/replayssm/compare_310p_serve_trace.py \
+    "$TRACE_ROOT/native" "$TRACE_ROOT/$run" --output "$TRACE_ROOT/$run.json" || break
+done
+```
+
+回传四组对照 JSON、服务日志和对应的 HTTP JSON。重点看首个非零状态码、
+首个超容差的 GDN 输入/输出、实际 ring position/base/flush/reset、
+重建的候选 SSM state、完整 logits 误差及同一候选对的 margin。
+若 Native 上一轮接受数超过当前窗口长度，保留对应的 step 与 state slot。
+原生 V310 的选槽逻辑对这种组合有提前退出分支，需要由实际 trace 确认
+有没有命中。
+
+上面的强制对照用于定位发散。关闭 trace 后用同一 prompt 自由生成确认
+修复，再恢复 2k/400 压测。

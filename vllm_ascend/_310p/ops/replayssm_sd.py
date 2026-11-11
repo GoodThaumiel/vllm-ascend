@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from vllm_ascend._310p.ops.replayssm_sd_trace import active_trace
 from vllm_ascend.ops.replayssm.cache import REPLAYSSM_SD_MAX_TOKENS, replayssm_sd_enabled
 
 VERIFY_TILE_V = 64
@@ -48,7 +49,7 @@ def initialize_replayssm_sd_310p(layer, vllm_config) -> None:
         vllm_config.compilation_config.max_cudagraph_capture_size or 0,
     )
     for name, tile in (
-        ("_replayssm_sd_verify_status", VERIFY_TILE_V),
+        ("_replayssm_sd_verify_status", COMPACT_TILE_V),
         ("_replayssm_sd_compact_status", COMPACT_TILE_V),
     ):
         layer.register_buffer(
@@ -87,6 +88,33 @@ def replayssm_sd_310p_decode(layer, query, key, value, g, beta, metadata) -> tor
     rings = layer._replayssm_sd_d_ring, layer._replayssm_sd_k_ring, layer._replayssm_sd_g_ring
     tasks = rows * v.shape[2] * v.shape[3]
     ops = torch.ops.replayssm_sd_310p
+    trace = active_trace()
+    tile = VERIFY_TILE_V if trace is None else trace.tile
+    variant = STATUS_VARIANT if trace is None else trace.variant
+    if trace is not None:
+        slot = int(slots.cpu()[0])
+        ring_slot = int(ring_slots.cpu()[0])
+        length = trace.record["length"]
+        trace.layer(
+            layer.prefix,
+            q=q[0, :length],
+            k=k[0, :length],
+            v=v[0, :length],
+            g=gate[0, :length],
+            beta=rate[0, :length],
+            state_before=checkpoint[slot],
+            d_before=rings[0][ring_slot],
+            k_before=rings[1][ring_slot],
+            g_before=rings[2][ring_slot],
+            slots=slots,
+            ring_slots=ring_slots,
+            positions=positions,
+            bases=bases,
+            lengths=metadata.replayssm_sd_lengths,
+            flush=metadata.replayssm_sd_flush,
+            cursor_status=metadata.replayssm_sd_cursor_status,
+            reset=metadata.replayssm_sd_reset,
+        )
     ops.verify_(
         q,
         k,
@@ -100,12 +128,12 @@ def replayssm_sd_310p_decode(layer, query, key, value, g, beta, metadata) -> tor
         bases,
         metadata.replayssm_sd_lengths,
         output,
-        layer._replayssm_sd_verify_status[: tasks // VERIFY_TILE_V],
+        layer._replayssm_sd_verify_status[: tasks // tile],
         layer.head_k_dim**-0.5,
-        VERIFY_TILE_V,
+        tile,
         CORES,
         ring_slots,
-        STATUS_VARIANT,
+        variant,
     )
     ops.compact_(
         checkpoint,
@@ -119,7 +147,19 @@ def replayssm_sd_310p_decode(layer, query, key, value, g, beta, metadata) -> tor
         CORES,
         ring_slots,
     )
+    if trace is not None:
+        trace.layer(
+            layer.prefix,
+            state_after=checkpoint[slot],
+            d_after=rings[0][ring_slot],
+            k_after=rings[1][ring_slot],
+            g_after=rings[2][ring_slot],
+            verify_status=layer._replayssm_sd_verify_status[: tasks // tile],
+            compact_status=layer._replayssm_sd_compact_status[: tasks // COMPACT_TILE_V],
+        )
     output = output.flatten(0, 1)
     if not uniform:
         output = output.index_select(0, pack)
+    if trace is not None:
+        trace.layer(layer.prefix, gdn_out=output)
     return output.unsqueeze(0)

@@ -2,9 +2,11 @@
 """CPU checks for 310P request-owned ring capacity and lifecycle."""
 
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,6 +24,7 @@ def _load_cpu_modules():
     )
     modules = (
         ("vllm_ascend.ops.replayssm.cache", root / "ops/replayssm/cache.py"),
+        ("vllm_ascend._310p.ops.replayssm_sd_trace", root / "_310p/ops/replayssm_sd_trace.py"),
         ("vllm_ascend._310p.ops.replayssm_sd", root / "_310p/ops/replayssm_sd.py"),
         ("vllm_ascend._310p.ops.replayssm_sd_demo", root / "_310p/ops/replayssm_sd_demo.py"),
     )
@@ -46,7 +49,7 @@ def _load_cpu_modules():
                 sys.modules[name] = previous
 
 
-_cache, _serve, _demo = _load_cpu_modules()
+_cache, _trace, _serve, _demo = _load_cpu_modules()
 ReplaySSM310PGeometry = _demo.ReplaySSM310PGeometry
 ReplaySSM310PRingDemo = _demo.ReplaySSM310PRingDemo
 estimate_memory = _demo.estimate_memory
@@ -92,6 +95,28 @@ class TestReplaySSM310PDemo(unittest.TestCase):
 
 
 class TestReplaySSM310PServe(unittest.TestCase):
+    def test_trace_reuses_native_drafts_and_rejects_different_inputs(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.json"
+            config.write_text(json.dumps({"output": str(root / "native")}))
+            native = _trace.ReplaySSM310Trace(str(config), 0)
+            for drafts in ([], [5, 6, 7]):
+                native.begin("native", drafts, 0, 1)
+                with native.forward(torch.tensor([3])):
+                    self.assertIs(_trace.active_trace(), native)
+                native.finish(torch.zeros(1, 8), torch.tensor([[4]]), torch.tensor([[4]]))
+
+            config.write_text(json.dumps({"output": str(root / "replay"), "reference": str(root / "native")}))
+            replay = _trace.ReplaySSM310Trace(str(config), 0)
+            replay.begin("replay", [], 0, 1)
+            with self.assertRaisesRegex(ValueError, "input token mismatch"), replay.forward(torch.tensor([9])):
+                self.fail("A mismatched input must be rejected before model forward")
+            with replay.forward(torch.tensor([3])):
+                self.assertIs(_trace.active_trace(), replay)
+            replay.finish(torch.zeros(1, 8), replay.expected["sampled"], torch.tensor([[2]]))
+            self.assertEqual(replay.next_drafts(), [5, 6, 7])
+
     def test_metadata_backing_covers_last_m200_block(self):
         # A 64-request service uses physical slot 64 plus reserved slot 0.
         for dtype in (torch.int32, torch.int8):

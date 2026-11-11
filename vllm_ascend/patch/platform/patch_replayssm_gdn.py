@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 from vllm.config import ModelConfig
 
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.replayssm.cache import (
     append_gdn_replayssm_ar_dtypes,
     append_gdn_replayssm_ar_shapes,
@@ -64,7 +65,8 @@ def _patch_config_methods(model_cls: type) -> None:
             return base_dtypes
         reject_replayssm_ar_speculative_decode(vllm_config)
         if replayssm_sd_enabled(vllm_config):
-            append_gdn_replayssm_ar_dtypes(base_dtypes, vllm_config.model_config.dtype)
+            if not get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY):
+                append_gdn_replayssm_ar_dtypes(base_dtypes, vllm_config.model_config.dtype)
             return base_dtypes
         return append_gdn_replayssm_ar_dtypes(
             base_dtypes,

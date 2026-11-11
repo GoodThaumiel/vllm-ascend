@@ -79,6 +79,7 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
 
     def _stage_replayssm_sd_pack(self, pack, rows, attn_metadata):
         super()._stage_replayssm_sd_pack(pack, rows, attn_metadata)
+        attn_metadata.replayssm_sd_reset = self.sd_reset[:rows]
         if pack.numel() == rows * (self.num_spec + 1):
             return
         # Eager mixed and short decode windows use gather, avoiding 310P

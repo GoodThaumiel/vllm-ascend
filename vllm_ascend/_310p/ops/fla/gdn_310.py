@@ -28,6 +28,7 @@ from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_r
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 from vllm_ascend._310p.ops.replayssm_sd import replayssm_sd_310p_decode
+from vllm_ascend._310p.ops.replayssm_sd_trace import active_trace
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
@@ -113,6 +114,7 @@ def npu_recurrent_gated_delta_rule_310(
     ssm_state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    trace_layer: str | None = None,
 ) -> torch.Tensor:
     if use_qk_l2norm_in_kernel:
         q = l2norm_310p(q)
@@ -130,19 +132,39 @@ def npu_recurrent_gated_delta_rule_310(
             actual_seq_lengths,
         )
 
+    q = q.squeeze(0).to(torch.float16).contiguous()
+    k = k.squeeze(0).to(torch.float16).contiguous()
+    v = v.squeeze(0).to(torch.float16).contiguous()
+    g = None if g is None else g.squeeze(0).to(torch.float32).contiguous()
+    beta = beta.squeeze(0).to(torch.float16).contiguous()
+    trace = active_trace() if trace_layer is not None else None
+    if trace is not None:
+        indices = flat_state_indices.cpu().tolist()
+        accepted = 1 if accepted_tokens is None else int(accepted_tokens.cpu()[0])
+        fields = {"q": q, "k": k, "v": v, "beta": beta, "slots": flat_state_indices, "lengths": actual_seq_lengths}
+        if g is not None:
+            fields["g"] = g
+        # Native selects its input checkpoint using the previous acceptance.
+        if 0 < accepted <= len(indices):
+            fields["state_before"] = state[indices[accepted - 1]]
+        trace.layer(trace_layer, **fields)
+
     out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule_310(
-        query=q.squeeze(0).to(torch.float16).contiguous(),
-        key=k.squeeze(0).to(torch.float16).contiguous(),
-        value=v.squeeze(0).to(torch.float16).contiguous(),
-        g=None if g is None else g.squeeze(0).to(torch.float32).contiguous(),
+        query=q,
+        key=k,
+        value=v,
+        g=g,
         gk=None,
-        beta=beta.squeeze(0).to(torch.float16).contiguous(),
+        beta=beta,
         state=state,
         actual_seq_lengths=actual_seq_lengths,
         ssm_state_indices=flat_state_indices,
         num_accepted_tokens=accepted_tokens,
         scale_value=k.shape[-1] ** -0.5,
     ).unsqueeze(0)
+    if trace is not None:
+        states = torch.stack([state[index].cpu() for index in indices])
+        trace.layer(trace_layer, gdn_out=out.squeeze(0), state_after=states)
     return out
 
 
@@ -363,6 +385,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                         ssm_state_indices=spec_state_indices_tensor[:num_spec],
                         num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens[:num_spec],
                         use_qk_l2norm_in_kernel=True,
+                        trace_layer=self.prefix,
                     )
             else:
                 core_attn_out_spec = None
@@ -388,7 +411,11 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 )
 
                 # Init cache
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
+                checkpoint = last_recurrent_state.to(ssm_state.dtype)
+                ssm_state[non_spec_state_indices_tensor] = checkpoint
+                trace = active_trace()
+                if trace is not None:
+                    trace.layer(self.prefix, gdn_out=core_attn_out_non_spec.squeeze(0), state_after=checkpoint)
             elif attn_metadata.num_decodes > 0:
                 num_decodes = attn_metadata.num_decodes
                 core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
@@ -401,6 +428,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     cu_seqlens=non_spec_query_start_loc[: num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor[:num_decodes],
                     use_qk_l2norm_in_kernel=True,
+                    trace_layer=self.prefix,
                 )
             else:
                 core_attn_out_non_spec = None
@@ -417,6 +445,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 cu_seqlens=non_spec_query_start_loc[: num_decodes + 1],
                 ssm_state_indices=non_spec_state_indices_tensor[:num_decodes],
                 use_qk_l2norm_in_kernel=True,
+                trace_layer=self.prefix,
             )
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:

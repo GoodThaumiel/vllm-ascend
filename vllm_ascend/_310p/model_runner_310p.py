@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch_npu
 from vllm.config import CUDAGraphMode
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
@@ -41,8 +42,10 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
 from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
 from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
@@ -53,6 +56,7 @@ from vllm_ascend._310p.ops.replayssm_sd import (
     VERIFY_TILE_V,
     load_replayssm_sd_310p_ops,
 )
+from vllm_ascend._310p.ops.replayssm_sd_trace import ReplaySSM310Trace
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
@@ -104,6 +108,20 @@ class NPUModelRunner310(NPUModelRunner):
                 STATUS_VARIANT,
                 CORES,
             )
+        self._replayssm_trace = None
+        trace_config = ascend_envs.VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG
+        if trace_config:
+            if (
+                not self.model_config.enforce_eager
+                or self.use_async_scheduling
+                or self.speculative_config is None
+                or self.speculative_config.num_speculative_tokens != 3
+                or self.parallel_config.tensor_parallel_size != 2
+                or self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.data_parallel_size != 1
+            ):
+                raise ValueError("Replay trace requires eager, synchronous MTP3, TP2, PP1 and DP1")
+            self._replayssm_trace = ReplaySSM310Trace(trace_config, get_tensor_model_parallel_rank())
         self.input_batch = NPUInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
@@ -593,11 +611,48 @@ class NPUModelRunner310(NPUModelRunner):
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
+        trace = getattr(self, "_replayssm_trace", None)
+        if trace is not None:
+            if num_reqs != 1 or self.num_discarded_requests:
+                raise ValueError("Replay trace requires one request with an unchunked prompt")
+            request_id = self.input_batch.req_ids[0]
+            trace.begin(
+                request_id,
+                scheduler_output.scheduled_spec_decode_tokens.get(request_id, []),
+                self.input_batch.num_computed_tokens_cpu[0],
+                total_num_scheduled_tokens,
+            )
+            trace.record["previous_accepted"] = self.num_accepted_tokens.gpu[:1].cpu().item()
+
         return (
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
         )
+
+    def _sample(self, logits, spec_decode_metadata):
+        trace = getattr(self, "_replayssm_trace", None)
+        if trace is None or not trace.record:
+            return super()._sample(logits, spec_decode_metadata)
+        raw_logits = logits.detach().cpu().clone()
+        output = super()._sample(logits, spec_decode_metadata)
+        observed = output.sampled_token_ids.detach().cpu().clone()
+        if trace.expected is not None:
+            forced = trace.expected["sampled"]
+            if forced.shape != observed.shape:
+                raise ValueError(f"Replay trace sampler width mismatch at step {trace.step}")
+            output.sampled_token_ids.copy_(forced.to(output.sampled_token_ids.device))
+            output.logprobs_tensors = None
+        trace.finish(raw_logits, output.sampled_token_ids, observed)
+        return output
+
+    def take_draft_token_ids(self):
+        drafts = super().take_draft_token_ids()
+        trace = getattr(self, "_replayssm_trace", None)
+        if trace is None or trace.request_id is None:
+            return drafts
+        forced = trace.next_drafts()
+        return drafts if forced is None else DraftTokenIds([trace.request_id], [forced])
 
     @torch.inference_mode()
     def _dummy_run(
@@ -671,6 +726,12 @@ class NPUModelRunner310(NPUModelRunner):
             **model_kwargs,
         }
         run_model = partial(self.model, **model_inputs)
+        trace = getattr(self, "_replayssm_trace", None)
+        if trace is not None and trace.record:
+            if input_ids is None:
+                raise ValueError("Replay trace requires text token inputs")
+            with trace.forward(input_ids):
+                return run_model()
         update_before_replay = (
             self.speculative_config is not None
             and not self.enable_enpu
