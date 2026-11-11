@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         ),
         default="smoke",
     )
-    parser.add_argument("--mtp", type=int, choices=(3, 5), required=True)
+    parser.add_argument("--mtp", type=int, choices=(3, 5, 7), required=True)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
@@ -357,6 +357,8 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
         if args.batch > 1:
             cpu["flush"][0] = 1 - flush  # mixed flush rows
         cpu["flush"][cpu["slots"] == 0] = 0  # reserved padding slot has no pending state
+        if args.mtp == 7 and args.batch > 1 and pos == 7 and not padding:
+            cpu["lengths"][-1] = 1  # Short row alongside full 8-token windows.
         detached_ring = args.batch > 1 and pos == 12
         if detached_ring:
             # Keep checkpoint ids unchanged while exchanging request-owned ring
@@ -433,7 +435,7 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
 
 def invalid_bindings(args: argparse.Namespace, device: torch.device) -> list[str]:
     """Ensure malformed inputs fail on the host, before a device launch."""
-    case = clone(make_case(mtp=args.mtp, batch=1, pos=0), device)
+    case = clone(make_case(mtp=args.mtp, batch=1, pos=0, tile_v=args.tile_v), device)
     checks = []
     for label, change in (
         ("verify_width", {"q": case["q"][:, :3]}),
@@ -463,7 +465,7 @@ def invalid_bindings(args: argparse.Namespace, device: torch.device) -> list[str
         raise AssertionError("compact_dtype unexpectedly accepted")
     cur = clone(cursor_case(case, args.mtp), device)
     try:
-        cursor(cur, 7)
+        cursor(cur, 9)
     except RuntimeError:
         checks.append("cursor_spec_len")
     else:

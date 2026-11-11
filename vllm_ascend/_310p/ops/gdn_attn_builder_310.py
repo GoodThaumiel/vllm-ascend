@@ -47,7 +47,8 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
         rows = aligned_metadata_size(capacity, 1)
         self.sd_accepted = torch.zeros(rows, dtype=torch.int32, device=device)
         self.sd_reset = torch.zeros(rows, dtype=torch.int8, device=device)
-        self.sd_token_gather = torch.empty(rows * (self.num_spec + 1), dtype=torch.int64, device=device)
+        width = self._replayssm_sd_physical_tokens()
+        self.sd_token_gather = torch.empty(rows * width, dtype=torch.int64, device=device)
         return torch.zeros(rows, dtype=torch.int32, device=device)
 
     def _allocate_replayssm_sd_cursor_state(self, device):
@@ -77,14 +78,18 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
             self.sd_ring_len,
         )
 
+    def _replayssm_sd_physical_tokens(self) -> int:
+        return self.num_spec + 1
+
     def _stage_replayssm_sd_pack(self, pack, rows, attn_metadata):
         super()._stage_replayssm_sd_pack(pack, rows, attn_metadata)
         attn_metadata.replayssm_sd_reset = self.sd_reset[:rows]
-        if pack.numel() == rows * (self.num_spec + 1):
+        width = self._replayssm_sd_physical_tokens()
+        if pack.numel() == rows * width:
             return
         # Eager mixed and short decode windows use gather, avoiding 310P
         # index_copy_ / IndexPutV2 on the packed GDN tensors.
-        gather = replay_token_gather(pack, rows)
+        gather = replay_token_gather(pack, rows, width)
         self.sd_token_gather[: gather.numel()].copy_(gather, non_blocking=True)
         attn_metadata.replayssm_sd_token_gather = self.sd_token_gather[: gather.numel()]
 

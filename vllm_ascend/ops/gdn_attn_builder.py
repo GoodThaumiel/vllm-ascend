@@ -492,6 +492,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.sd_pack_indices[: pack.numel()].copy_(pack, non_blocking=True)
         attn_metadata.replayssm_sd_pack_indices = self.sd_pack_indices[: pack.numel()]
 
+    def _replayssm_sd_physical_tokens(self) -> int:
+        return REPLAYSSM_SD_MAX_TOKENS
+
     def _attach_replayssm_sd_metadata(
         self,
         m: CommonAttentionMetadata,
@@ -539,7 +542,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.sd_flush[:rows].copy_(self.sd_is_flush.index_select(0, self.sd_ring_slots[:rows]).to(torch.int32))
 
         query_lens_cpu = torch.diff(m.query_start_loc_cpu)[spec_sequence_masks_cpu]
-        pack = replayssm_sd_pack_indices(query_lens_cpu, self.num_spec + 1, REPLAYSSM_SD_MAX_TOKENS)
+        pack = replayssm_sd_pack_indices(query_lens_cpu, self.num_spec + 1, self._replayssm_sd_physical_tokens())
         if pack.numel() != attn_metadata.num_spec_decode_tokens:
             raise ValueError("ReplaySSM SD token pack does not match speculative token count")
         self._stage_replayssm_sd_pack(pack, rows, attn_metadata)

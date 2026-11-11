@@ -103,7 +103,8 @@ class NPUModelRunner310(NPUModelRunner):
         if self._replayssm_sd_ring_slots is not None:
             load_replayssm_sd_310p_ops()
             logger.info(
-                "310P ReplaySSM SD V12 dispatch: verify tile=%d, status variant=%d, cores=%d",
+                "310P ReplaySSM SD V12 dispatch: width=%d, verify tile=%d, status variant=%d, cores=%d",
+                self.num_spec_tokens + 1,
                 VERIFY_TILE_V,
                 STATUS_VARIANT,
                 CORES,
@@ -204,8 +205,7 @@ class NPUModelRunner310(NPUModelRunner):
             and not force_uniform_decode
         ):
             is_prefilling |= (
-                self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                < self.input_batch.replayssm_decode_base[:num_reqs]
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] < self.input_batch.replayssm_decode_base[:num_reqs]
             )
             # The pilot captures only full-width batches with an exact graph
             # shape. Padded/mixed batches use the variable-width eager path.

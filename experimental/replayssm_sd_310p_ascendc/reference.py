@@ -22,8 +22,8 @@ def make_case(
     seed: int = 42,
     padding: bool = False,
 ) -> dict[str, torch.Tensor]:
-    if mtp not in (3, 5) or batch < 1 or not 0 <= pos <= HISTORY:
-        raise ValueError("Expected MTP3/5, positive batch and history in [0,16]")
+    if mtp not in (3, 5, 7) or batch < 1 or not 0 <= pos <= HISTORY:
+        raise ValueError("Expected MTP3/5/7, positive batch and history in [0,16]")
     if not 0 <= base < RING or tile_v not in (32, 64):
         raise ValueError("Expected a 32-slot ring and tile_v=32/64")
     tokens = mtp + 1

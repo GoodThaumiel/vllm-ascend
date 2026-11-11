@@ -58,6 +58,7 @@ mkdir -p "$RESULTS"
 
 run_serve() {
   local variant="$1" execution="$2"
+  local mtp="${MTP:-3}" max_seqs="${MAX_SEQS:-64}" memory_util="${MEMORY_UTIL:-0.85}"
   shift 2
   local -a opts=()
   if [[ "$variant" == replay ]]; then
@@ -74,9 +75,9 @@ run_serve() {
     --dtype float16 --mamba-cache-dtype float16 --mamba-ssm-cache-dtype float16 \
     --mamba-cache-mode none --no-enable-prefix-caching --enable-chunked-prefill \
     --no-async-scheduling --language-model-only --seed 42 \
-    --max-model-len 4096 --max-num-seqs 64 --max-num-batched-tokens 4096 \
-    --gpu-memory-utilization 0.85 \
-    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3,"enforce_eager":true}' \
+    --max-model-len 4096 --max-num-seqs "$max_seqs" --max-num-batched-tokens 4096 \
+    --gpu-memory-utilization "$memory_util" \
+    --speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$mtp,\"enforce_eager\":true}" \
     "${opts[@]}" "$@" 2>&1 | tee "$RESULTS/$variant-$execution.log"
   return "${PIPESTATUS[0]}"
 }
@@ -285,3 +286,62 @@ run_serve replay eager --num-gpu-blocks-override "$BLOCKS"
 `torch_reserved_bytes`。用去重 backing 加独立 ring 对比物理缓存分配，再用
 同一阶段的 allocator 和设备读数对照整卡占用。`planned_device_backing_bytes`
 留作诊断 block planner。
+
+## 6. MTP7、96 并发容量对照
+
+使用 V12 上机报告的同一份 Qwen3.6-35B-A3B W8A8 权重、同一对 310P3 卡、
+CANN 9.2.1 和 FP16 state。Native 与 Replay 均使用 eager、TP2、MTP7、
+`max-num-seqs=96`、2k/400 和相同的显存利用率 0.85。Replay 的逻辑 history
+上限为 16，每个请求的物理 ring 长度固定为 32，槽池为 96 个请求槽加 slot 0。
+按已测模型几何预计 ring 约 551.3 MiB/卡。Cursor 沿用为两轮候选留空间的规则，
+在 MTP7 下首轮有接受结果后，后续有非空历史的轮次会触发 compact flush。
+
+先用第 1 节命令重建独立扩展并跑 CPU 单测。用下列命令验证 8-token 路径，
+包括 B96 状态块归属、混合 flush、物理 ring 跨尾及接受 8 token 后的状态推进。
+若有失败，回传首条报错与对应 JSON，再排查服务。
+
+```bash
+export RESULTS=/tmp/replayssm-310p-mtp7-capacity
+mkdir -p "$RESULTS"
+(
+  set -e
+  for test in smoke:2 sequence:1 smoke:96; do
+    stage="${test%:*}"
+    batch="${test#*:}"
+    python3 experimental/replayssm_sd_310p_ascendc/run.py \
+      --stage "$stage" --mtp 7 --batch "$batch" --tile-v 64 --cores 7 --status-variant 1 \
+      --output "$RESULTS/operator-$stage-b$batch.json"
+  done
+)
+```
+
+在定义了第 2 节 `run_serve` 的服务终端执行。Native 跑完后停止服务，等两卡
+释放后启动 Replay。每次先检查 `/health`，按第 3 节发送短请求。
+Replay 两个 rank 应报告 `MTP7`、`width=8`、`capacity=96` 和 `ring_len=32`。
+检查 Native GDN 的 `num_speculative_blocks=7`，Replay 为 0。发现请求失败、
+状态错误或明显异常输出时，保留日志并暂停容量测试。
+
+```bash
+unset VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG
+export RESULTS=/tmp/replayssm-310p-mtp7-capacity
+export MTP=7 MAX_SEQS=96 MEMORY_UTIL=0.85
+run_serve native eager
+# Native 结束后执行 run_serve replay eager
+```
+
+客户端复用第 3 节的 `run_bench` 定义，在同一 `RESULTS` 目录下执行。每轮
+192 个测量请求，客户端最多同时发 96 个。按当前服务设置 `VARIANT`。
+
+```bash
+VARIANT=native  # Replay 服务启动后改为 replay
+for round in 1 2; do
+  run_bench 96 "$RESULTS/mtp7-capacity-$VARIANT-r$round" || break
+done
+```
+
+按第 5 节口径回传稳定 decode 的 running 范围与中位数、waiting、KV usage、
+preemption，以及每 rank 的实际缓存 backing、ring 和 allocator 数据。若两边
+均达到 96 且 decode 无等待，记录双方实测上限均至少为 96。需要继续找容量拐点时，
+保持 96 槽和 MTP7，另开结果目录，在两边用相同的较低 `MEMORY_UTIL` 重测。
+若 0.85 下 Replay 已显示更高有效并发，可按第 5 节在匹配 Native 并发的档位
+补测实际显存差值。

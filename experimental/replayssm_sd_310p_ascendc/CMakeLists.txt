@@ -29,8 +29,10 @@ include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
 ascendc_library(replayssm_sd_310p_kernel SHARED
     kernels/verify4.cpp
     kernels/verify6.cpp
+    kernels/verify8.cpp
     kernels/verify4_block_status.cpp
     kernels/verify6_block_status.cpp
+    kernels/verify8_block_status.cpp
     kernels/compact.cpp
     kernels/cursor.cpp
     kernels/io_probe.cpp

@@ -129,16 +129,25 @@ class TestReplaySSM310PServe(unittest.TestCase):
             self.assertEqual(view.numel(), 65)
 
     def test_verify_dispatch_for_full_windows(self):
-        self._check_verify_dispatch((4, 4))
+        for width in (4, 8):
+            with self.subTest(width=width):
+                self._check_verify_dispatch((width, width), width)
 
     def test_verify_dispatch_for_short_windows(self):
-        self._check_verify_dispatch((4, 1, 2))
+        for width in (4, 8):
+            with self.subTest(width=width):
+                self._check_verify_dispatch((width, 1, 2), width)
 
-    def _check_verify_dispatch(self, lengths):
+    def test_mtp7_ring_keeps_32_entries_and_96_request_slots(self):
+        config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=96))
+        self.assertEqual(_cache.replayssm_sd_ring_len(16, 7), 32)
+        self.assertEqual(_cache.replayssm_sd_ring_capacity(config), 96)
+
+    def _check_verify_dispatch(self, lengths, width):
         rows = len(lengths)
         tokens = sum(lengths)
         lengths = torch.tensor(lengths, dtype=torch.int32)
-        pack = _cache.replayssm_sd_pack_indices(lengths, 4)
+        pack = _cache.replayssm_sd_pack_indices(lengths, width)
         v = torch.arange(tokens, dtype=torch.float16).view(1, tokens, 1, 1).expand(1, tokens, 16, 128)
         q = torch.ones(1, tokens, 8, 128, dtype=torch.float16)
         gates = torch.ones(1, tokens, 16)
@@ -154,12 +163,13 @@ class TestReplaySSM310PServe(unittest.TestCase):
             replayssm_sd_lengths=lengths,
             replayssm_sd_pack_indices=pack,
         )
-        if tokens != rows * 4:
-            meta.replayssm_sd_token_gather = _serve.replay_token_gather(pack, rows)
+        if tokens != rows * width:
+            meta.replayssm_sd_token_gather = _serve.replay_token_gather(pack, rows, width)
         checkpoint = torch.empty(rows + 1, 16, 128, 128, dtype=torch.float16)
         layer = SimpleNamespace(
             head_k_dim=128,
             kv_cache=(None, checkpoint),
+            _replayssm_sd_verify_width=width,
             _replayssm_sd_d_ring=torch.empty(0),
             _replayssm_sd_k_ring=torch.empty(0),
             _replayssm_sd_g_ring=torch.empty(0),
@@ -169,7 +179,7 @@ class TestReplaySSM310PServe(unittest.TestCase):
         ops = Mock()
 
         def fake_verify(*args):
-            self.assertEqual(args[0].shape, (rows, 4, 8, 128))
+            self.assertEqual(args[0].shape, (rows, width, 8, 128))
             self.assertEqual(args[3].dtype, torch.float32)
             self.assertEqual(args[4].dtype, torch.float16)
             self.assertIs(args[5], checkpoint)

@@ -45,7 +45,7 @@ void cursor(const at::Tensor& write_pos, const at::Tensor& cache_base,
   }
   // The isolated benchmark passes draft width; serve passes the whole window,
   // since vLLM's accepted count includes the anchor token.
-  TORCH_CHECK(logical_limit == 16 && max_spec_len >= 3 && max_spec_len <= 6 &&
+  TORCH_CHECK(logical_limit == 16 && max_spec_len >= 3 && max_spec_len <= 8 &&
                   ring_len == 32,
               "Invalid logical_limit/max_spec_len/ring_len");
   TORCH_CHECK(batch <= std::numeric_limits<uint32_t>::max() &&

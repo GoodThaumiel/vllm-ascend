@@ -1,4 +1,4 @@
-"""CPU contracts for the two candidate widths and request-owned ring."""
+"""CPU contracts for candidate windows and the request-owned ring."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from experimental.replayssm_sd_310p_ascendc.reference import (
 
 class ReferenceTests(unittest.TestCase):
     def test_candidate_width_and_fp16_dtypes(self):
-        for mtp in (3, 5):
+        for mtp in (3, 5, 7):
             with self.subTest(mtp=mtp):
                 case = make_case(mtp=mtp, pos=0)
                 self.assertEqual(case["q"].shape, (1, mtp + 1, 8, 128))
@@ -95,6 +95,27 @@ class ReferenceTests(unittest.TestCase):
         result = verify_reference(case)
         self.assertTrue(torch.equal(result["out"][1], torch.zeros_like(result["out"][1])))
         self.assertTrue(torch.equal(result["verify_status"], torch.zeros_like(result["verify_status"])))
+
+    def test_mtp7_full_acceptance_wraps_and_keeps_pending_candidates(self):
+        width = 8
+        case = make_case(mtp=7, pos=8, base=28)
+        case["flush"].fill_(1)
+        verified = verify_reference(case)
+        compacted = compact_reference(verified)
+        wp, base, flush, status = cursor_reference(
+            torch.tensor([0, 8], dtype=torch.int32),
+            torch.tensor([0, 28], dtype=torch.int32),
+            torch.tensor([0, 1], dtype=torch.int8),
+            torch.tensor([width], dtype=torch.int32),
+            case["ring_slots"],
+            torch.zeros(1, dtype=torch.int8),
+            width,
+        )
+        self.assertEqual((int(wp[1]), int(base[1]), int(flush[1]), int(status[0])), (8, 4, 1, 0))
+        self.assertFalse(torch.equal(compacted["checkpoint"], case["checkpoint"]))
+        for name in ("d_cache", "k_cache", "g_cache"):
+            torch.testing.assert_close(compacted[name], verified[name], atol=0, rtol=0, equal_nan=True)
+            self.assertTrue(torch.isfinite(compacted[name][1, :, 4:12]).all())
 
     def test_compact_metadata_errors_preserve_state(self):
         changes = (

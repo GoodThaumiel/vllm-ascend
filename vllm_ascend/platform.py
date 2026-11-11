@@ -498,6 +498,8 @@ class NPUPlatform(Platform):
         # this platform hook. Keep the GDN SD opt-in separate from that flag;
         # the Ascend model/cache/runner paths read additional_config directly.
         from vllm_ascend.ops.replayssm.cache import (
+            REPLAYSSM_SD_310P_SPEC_TOKENS,
+            REPLAYSSM_SD_MAX_TOKENS,
             replayssm_sd_enabled,
             replayssm_sd_ring_capacity,
             replayssm_sd_ring_len,
@@ -509,8 +511,11 @@ class NPUPlatform(Platform):
             if spec is None:
                 raise ValueError("additional_config.replayssm_sd requires MTP speculative decoding")
             if is_310p:
-                if spec.num_speculative_tokens != 3 or vllm_config.parallel_config.tensor_parallel_size != 2:
-                    raise ValueError("310P ReplaySSM SD pilot requires TP2 and MTP3")
+                if (
+                    spec.num_speculative_tokens not in REPLAYSSM_SD_310P_SPEC_TOKENS
+                    or vllm_config.parallel_config.tensor_parallel_size != 2
+                ):
+                    raise ValueError("310P ReplaySSM SD pilot requires TP2 and MTP3 or MTP7")
                 if vllm_config.model_config.architecture not in (
                     "Qwen3_5MoeForCausalLM",
                     "Qwen3_5MoeForConditionalGeneration",
@@ -522,10 +527,12 @@ class NPUPlatform(Platform):
                     raise ValueError("310P ReplaySSM SD pilot requires --no-enable-prefix-caching")
                 if enable_sp(vllm_config):
                     raise ValueError("310P ReplaySSM SD pilot requires sequence parallelism disabled")
+            elif not 1 <= spec.num_speculative_tokens < REPLAYSSM_SD_MAX_TOKENS:
+                raise ValueError("Ascend ReplaySSM SD currently supports MTP1/2/3 on this device")
             replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
             replayssm_sd_ring_capacity(vllm_config)
             if getattr(spec, "method", None) != "mtp":
-                raise ValueError("Ascend ReplaySSM SD currently supports MTP1/2/3 only")
+                raise ValueError("Ascend ReplaySSM SD requires the MTP speculative decoding method")
             if vllm_config.model_config.architecture not in (
                 "Qwen3NextForCausalLM",
                 "Qwen3_5ForCausalLM",

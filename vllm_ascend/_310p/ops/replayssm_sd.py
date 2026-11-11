@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from vllm_ascend._310p.ops.replayssm_sd_trace import active_trace
-from vllm_ascend.ops.replayssm.cache import REPLAYSSM_SD_MAX_TOKENS, replayssm_sd_enabled
+from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 
 VERIFY_TILE_V = 64
 COMPACT_TILE_V = 32
@@ -29,9 +29,9 @@ def aligned_metadata_size(size: int, element_size: int) -> int:
     return ((size + alignment - 1) // alignment) * alignment
 
 
-def replay_token_gather(pack: torch.Tensor, rows: int) -> torch.Tensor:
+def replay_token_gather(pack: torch.Tensor, rows: int, width: int) -> torch.Tensor:
     """Invert packed-to-dense indices. Invalid lanes may reuse input token zero."""
-    gather = pack.new_zeros(rows * REPLAYSSM_SD_MAX_TOKENS)
+    gather = pack.new_zeros(rows * width)
     gather[pack] = torch.arange(pack.numel(), dtype=pack.dtype, device=pack.device)
     return gather
 
@@ -40,6 +40,7 @@ def initialize_replayssm_sd_310p(layer, vllm_config) -> None:
     layer.use_replayssm_sd = replayssm_sd_enabled(vllm_config)
     if not layer.use_replayssm_sd:
         return
+    layer._replayssm_sd_verify_width = vllm_config.speculative_config.num_speculative_tokens + 1
     key_heads = layer.num_k_heads // layer.tp_size
     value_heads = layer.num_v_heads // layer.tp_size
     if (key_heads, value_heads) != (8, 16) or layer.head_k_dim != 128 or layer.head_v_dim != 128:
@@ -66,7 +67,7 @@ def replayssm_sd_310p_decode(layer, query, key, value, g, beta, metadata) -> tor
     positions = metadata.replayssm_sd_positions
     bases = metadata.replayssm_sd_bases
     rows = slots.numel()
-    width = REPLAYSSM_SD_MAX_TOKENS
+    width = layer._replayssm_sd_verify_width
     uniform = value.shape[1] == rows * width
     pack = metadata.replayssm_sd_pack_indices
 

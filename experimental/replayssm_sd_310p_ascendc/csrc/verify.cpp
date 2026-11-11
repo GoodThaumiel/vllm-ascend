@@ -12,6 +12,8 @@
 #include "aclrtlaunch_replayssm_sd_310p_verify4_block_status.h"
 #include "aclrtlaunch_replayssm_sd_310p_verify6.h"
 #include "aclrtlaunch_replayssm_sd_310p_verify6_block_status.h"
+#include "aclrtlaunch_replayssm_sd_310p_verify8.h"
+#include "aclrtlaunch_replayssm_sd_310p_verify8_block_status.h"
 
 namespace replayssm_sd_310p {
 void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -33,12 +35,12 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                         bases, lengths, out, status}) {
     TORCH_CHECK(t.is_contiguous(), "Non-cache tensors must be contiguous");
   }
-  TORCH_CHECK(q.dim() == 4 && (q.size(1) == 4 || q.size(1) == 6) &&
+  TORCH_CHECK(q.dim() == 4 && (q.size(1) == 4 || q.size(1) == 6 || q.size(1) == 8) &&
                   q.size(3) == 128 && k.sizes() == q.sizes(),
-              "q/k must be [B,4|6,H,128]");
+              "q/k must be [B,4|6|8,H,128]");
   const int64_t batch = q.size(0), tokens = q.size(1), heads = q.size(2);
   TORCH_CHECK(v.dim() == 4 && v.size(0) == batch && v.size(1) == tokens &&
-                  v.size(3) == 128, "v must be [B,4|6,HV,128]");
+                  v.size(3) == 128, "v must be [B,4|6|8,HV,128]");
   const int64_t value_heads = v.size(2);
   TORCH_CHECK(batch > 0 && batch <= 1024 && heads > 0 && value_heads > 0 &&
                   value_heads <= 32 && value_heads % heads == 0,
@@ -110,11 +112,17 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       static_cast<uint64_t>(checkpoint.stride(0)), static_cast<uint64_t>(d_cache.stride(0)), \
       static_cast<uint64_t>(k_cache.stride(0)), static_cast<uint64_t>(g_cache.stride(0)), \
       static_cast<uint32_t>(tile_v), static_cast<float>(scale)
-  const aclError result = status_variant == 0
-      ? (tokens == 4 ? aclrtlaunch_replayssm_sd_310p_verify4(REPLAY_310P_ARGS)
-                     : aclrtlaunch_replayssm_sd_310p_verify6(REPLAY_310P_ARGS))
-      : (tokens == 4 ? aclrtlaunch_replayssm_sd_310p_verify4_block_status(REPLAY_310P_ARGS)
-                     : aclrtlaunch_replayssm_sd_310p_verify6_block_status(REPLAY_310P_ARGS));
+  aclError result;
+  if (tokens == 4) {
+    result = status_variant == 0 ? aclrtlaunch_replayssm_sd_310p_verify4(REPLAY_310P_ARGS)
+                                 : aclrtlaunch_replayssm_sd_310p_verify4_block_status(REPLAY_310P_ARGS);
+  } else if (tokens == 6) {
+    result = status_variant == 0 ? aclrtlaunch_replayssm_sd_310p_verify6(REPLAY_310P_ARGS)
+                                 : aclrtlaunch_replayssm_sd_310p_verify6_block_status(REPLAY_310P_ARGS);
+  } else {
+    result = status_variant == 0 ? aclrtlaunch_replayssm_sd_310p_verify8(REPLAY_310P_ARGS)
+                                 : aclrtlaunch_replayssm_sd_310p_verify8_block_status(REPLAY_310P_ARGS);
+  }
 #undef REPLAY_310P_ARGS
   TORCH_CHECK(result == ACL_SUCCESS, "ReplaySSM SD 310P verify launch failed: ", result);
 }

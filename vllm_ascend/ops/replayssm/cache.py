@@ -13,6 +13,7 @@ REPLAYSSM_AR_HEAD_DIM = 128
 REPLAYSSM_AR_TILE_V = 32
 REPLAYSSM_AR_CORES = 8
 REPLAYSSM_SD_MAX_TOKENS = 4
+REPLAYSSM_SD_310P_SPEC_TOKENS = (3, 7)
 REPLAYSSM_SD_MAX_HISTORY = 16
 REPLAYSSM_SD_MAX_VALUE_HEADS = 32
 REPLAYSSM_SD_VERIFY_TILE_V = 128
@@ -85,8 +86,10 @@ def replayssm_gdn_enabled(vllm_config) -> bool:
 
 def replayssm_sd_ring_len(buffer_len: int, num_spec: int) -> int:
     max_tokens = num_spec + 1
-    if buffer_len != REPLAYSSM_SD_MAX_HISTORY or not 1 <= num_spec < REPLAYSSM_SD_MAX_TOKENS:
-        raise ValueError("Ascend ReplaySSM SD currently requires buffer_len=16 and MTP1/2/3")
+    if buffer_len != REPLAYSSM_SD_MAX_HISTORY or not (
+        1 <= num_spec < REPLAYSSM_SD_MAX_TOKENS or num_spec in REPLAYSSM_SD_310P_SPEC_TOKENS
+    ):
+        raise ValueError("Ascend ReplaySSM SD requires buffer_len=16 and MTP1/2/3 or 310P MTP7")
     return 1 << (buffer_len + max_tokens - 1).bit_length()
 
 
@@ -96,8 +99,8 @@ def replayssm_sd_pack_indices(
     """Map packed tokens to request rows of the verify kernel's physical width."""
     if physical_tokens is None:
         physical_tokens = max_tokens
-    if not 2 <= max_tokens <= physical_tokens <= REPLAYSSM_SD_MAX_TOKENS:
-        raise ValueError("ReplaySSM SD requires 2-4 logical tokens within 4 physical tokens")
+    if not 2 <= max_tokens <= physical_tokens <= REPLAYSSM_SD_310P_SPEC_TOKENS[-1] + 1:
+        raise ValueError("ReplaySSM SD requires 2-8 logical tokens within the physical window")
     if query_lengths.device.type != "cpu" or query_lengths.dim() != 1:
         raise ValueError("ReplaySSM SD query lengths must be a CPU vector")
     if bool(((query_lengths < 1) | (query_lengths > max_tokens)).any()):
