@@ -58,6 +58,7 @@ mkdir -p "$RESULTS"
 
 run_serve() {
   local variant="$1" execution="$2"
+  shift 2
   local -a opts=()
   if [[ "$variant" == replay ]]; then
     opts+=(--additional-config '{"replayssm_sd":true}')
@@ -76,7 +77,8 @@ run_serve() {
     --max-model-len 4096 --max-num-seqs 64 --max-num-batched-tokens 4096 \
     --gpu-memory-utilization 0.85 \
     --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3,"enforce_eager":true}' \
-    "${opts[@]}" 2>&1 | tee "$RESULTS/$variant-$execution.log"
+    "${opts[@]}" "$@" 2>&1 | tee "$RESULTS/$variant-$execution.log"
+  return "${PIPESTATUS[0]}"
 }
 
 run_serve native eager
@@ -114,14 +116,16 @@ python3 scripts/replayssm/validate_sd_serve.py \
 状态重建舍入可能导致贪心分歧，需要结合首个分歧的数据判断。
 
 ```bash
-for bs in 1 16 32 64; do
-  prefix="$RESULTS/$VARIANT-$EXECUTION-b$bs"
-  curl -fsS http://127.0.0.1:18083/metrics > "$prefix.before.metrics"
+run_bench() {
+  local bs="$1" prefix="$2"
+  local sampler bench_status=0
+  curl -fsS http://127.0.0.1:18083/metrics > "$prefix.before.metrics" || return
+  npu-smi info > "$prefix.before.npu-smi"
   (
     while true; do
       date +%s
-      curl -fsS http://127.0.0.1:18083/metrics | \
-        rg '^vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc|num_preemptions_total)'
+      curl -fsS --max-time 2 http://127.0.0.1:18083/metrics | \
+        rg '^vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc|num_preemptions_total|prompt_tokens_total|generation_tokens_total)(\{|[[:space:]])'
       sleep 1
     done
   ) > "$prefix.samples" &
@@ -132,13 +136,16 @@ for bs in 1 16 32 64; do
     --seed 42 --temperature 0 --ignore-eos --request-rate inf --max-concurrency "$bs" \
     --num-prompts "$((2 * bs))" --num-warmups 4 \
     --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
-    --save-result --save-detailed --result-dir "$RESULTS" --result-filename "${prefix##*/}.json"
-  bench_status=$?
+    --save-result --save-detailed --result-dir "$RESULTS" --result-filename "${prefix##*/}.json" || bench_status=$?
   kill "$sampler"
   wait "$sampler" 2>/dev/null || true
   curl -fsS http://127.0.0.1:18083/metrics > "$prefix.after.metrics"
   npu-smi info > "$prefix.npu-smi"
-  [[ "$bench_status" == 0 ]] || break
+  return "$bench_status"
+}
+
+for bs in 1 16 32 64; do
+  run_bench "$bs" "$RESULTS/$VARIANT-$EXECUTION-b$bs" || break
 done
 ```
 
@@ -146,8 +153,8 @@ done
 实际完成数、运行/等待峰值、preemption、输出 tok/s、TTFT/TPOT p50/p90、
 MTP 接受数与草稿数增量，以及 KV block 容量。记录每个 rank 在
 `REPLAYSSM_MEMORY_JSON` 中的 checkpoint、ring 与 cache backing。
-每卡 64 槽的 ring 张量 payload 约 369.4 MiB，满载 MTP3 下仅 SSM 张量的
-投影净节省约 2.45 GiB/卡。实际可运行并发以 scheduler 指标为准。
+每卡 64 槽的 ring 张量 payload 约 369.4 MiB。满载 MTP3 下按逻辑 SSM
+张量内容估算的净节省约 2.45 GiB/卡，实际 backing 和可运行并发按第 5 节实测。
 
 ## 4. 2026-11-10 上机结果复测
 
@@ -218,3 +225,63 @@ done
 
 上面的强制对照用于定位发散。关闭 trace 后用同一 prompt 自由生成确认
 修复，再恢复 2k/400 压测。
+
+## 5. 并发容量与同并发显存
+
+沿用上机报告的同一份 W8A8 权重、同一对卡和第 2 节启动参数。先完成第 3 节的
+服务正确性检查。两边均关闭 trace，保持 TP2、MTP3、2k/400、`max-num-seqs=64`
+和 Replay 默认 64 个请求 ring 槽。首轮比较 eager，有余量再用同样口径比较 graph。
+每次先停止上一服务并等待显存释放，再启动下一服务。
+
+### 同预算，测有效并发
+
+Native 和 Replay 均使用 `gpu-memory-utilization=0.85`，使用各自自动规划的
+block 数。每个服务完成两轮 B64，每轮 128 个测量请求。服务终端执行
+`unset VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG` 后，依次使用第 2 节的
+`run_serve native eager` 和 `run_serve replay eager`。
+两边终端使用同一个新 `RESULTS` 目录，避免覆盖之前的服务日志。客户端复用
+第 3 节的 `run_bench` 函数，按服务分别设置 `VARIANT` 后执行。
+
+```bash
+VARIANT=native  # Replay 服务启动后改为 replay
+EXECUTION=eager
+for round in 1 2; do
+  run_bench 64 "$RESULTS/capacity-$VARIANT-$EXECUTION-r$round" || break
+done
+```
+
+- 检查每轮 bench JSON 的完成数为 128、失败数为 0，并核对两边实际输入和输出
+  token 长度。记录输出 tok/s、TTFT p50/p90 和 TPOT p50/p90。
+- 用 `.samples` 标出仍有 waiting 且持续产出 token 的 decode 时段。选取
+  prefill 明显放缓、尚未进入收尾的连续样本，记录时间范围和其中的 running
+  中位数及范围，同时报告整轮峰值。用前后 metrics 的差值计算 preemption。
+  若只有瞬时峰值或始终没有排队，报告该限制。若两边在 decode 阶段均维持 64 且无等待，
+  当前测试只确认都能承载 64。
+- 有效并发收益按两轮可复现的 decode running 对比。结合 waiting、
+  KV usage、preemption 和 TTFT 判断是否缓解了 cache 准入压力。
+  把 prefill 或收尾造成的短暂波动留在原始记录里。
+
+### 同有效并发，测实际显存
+
+如果 Replay 在同预算下持续承载更多请求，用 native 自动预算的结果作目标。
+保持 B64 的请求负载和服务上限，逐轮用 `--num-gpu-blocks-override` 降低
+Replay 的 block 数。起点取低于 Replay 自动规划值的档位，每次重启后核对探针
+记录的实际 block 数。找到两轮均能维持 native decode 并发且无新增 preemption
+或请求失败的较小档位后，再比较显存。若无法匹配，回传最接近的档位和对应并发。
+
+```bash
+# 服务终端执行，输入本轮实测后选定的 block 数。
+read -r -p 'Replay block 数 ' BLOCKS
+run_serve replay eager --num-gpu-blocks-override "$BLOCKS"
+```
+
+每次启动前把两边终端的 `RESULTS` 指向新目录，保留该档位自己的服务日志和
+压测结果。压测仍使用上面的两轮 B64 命令。
+
+回传每轮的 bench JSON、`.samples`、前后完整 metrics、启动日志和
+`npu-smi`。从每个 rank 的 `kv_cache_initialized` 阶段同时提取
+`cache_plan.num_blocks`、`cache_views.unique_backing_bytes`、
+`independent_sd_ring.allocated_bytes_per_rank`、`torch_allocated_bytes` 和
+`torch_reserved_bytes`。用去重 backing 加独立 ring 对比物理缓存分配，再用
+同一阶段的 allocator 和设备读数对照整卡占用。`planned_device_backing_bytes`
+留作诊断 block planner。
