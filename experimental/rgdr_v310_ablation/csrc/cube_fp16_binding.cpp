@@ -9,12 +9,14 @@
 #include <limits>
 
 #include "aclrtlaunch_rgdr_v310_cube_fp16.h"
+#include "aclrtlaunch_rgdr_v310_cube_grouped_fp16.h"
 
 namespace {
 void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                const at::Tensor& beta, const at::Tensor& gate, const at::Tensor& state,
                const at::Tensor& indices, const at::Tensor& accepted, const at::Tensor& out,
-               double scale, bool deq, int64_t cores) {
+               double scale, bool deq, int64_t cores, bool grouped) {
+  TORCH_CHECK(!grouped || !deq, "grouped RGDR uses one L0C drain and scales in UB");
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& tensor : {q, k, v, beta, gate, state, indices, accepted, out}) {
     TORCH_CHECK(tensor.device() == q.device() && tensor.is_contiguous(),
@@ -44,19 +46,24 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
               "cores must be in [1,7] and scale in (0,1]");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const auto result = aclrtlaunch_rgdr_v310_cube_fp16(
-      static_cast<uint32_t>(cores), stream, q.data_ptr(), k.data_ptr(), v.data_ptr(),
-      beta.data_ptr(), gate.data_ptr(), state.data_ptr(), indices.data_ptr(),
-      accepted.data_ptr(), out.data_ptr(), static_cast<uint32_t>(batch),
-      static_cast<uint32_t>(tokens / batch), static_cast<uint32_t>(state.size(0)),
-      static_cast<float>(scale), static_cast<uint32_t>(deq));
+#define RGDR_ARGS \
+  static_cast<uint32_t>(cores), stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), \
+      beta.data_ptr(), gate.data_ptr(), state.data_ptr(), indices.data_ptr(), \
+      accepted.data_ptr(), out.data_ptr(), static_cast<uint32_t>(batch), \
+      static_cast<uint32_t>(tokens / batch), static_cast<uint32_t>(state.size(0)), \
+      static_cast<float>(scale)
+  const auto result = grouped
+      ? aclrtlaunch_rgdr_v310_cube_grouped_fp16(RGDR_ARGS)
+      : aclrtlaunch_rgdr_v310_cube_fp16(RGDR_ARGS, static_cast<uint32_t>(deq));
+#undef RGDR_ARGS
   TORCH_CHECK(result == ACL_SUCCESS, "FP16 Cube RGDR launch failed: ", result);
 }
 }  // namespace
 
 TORCH_LIBRARY(rgdr_v310_cube_fp16, m) {
   m.def("run_(Tensor q, Tensor k, Tensor v, Tensor beta, Tensor gate, Tensor(a!) state, "
-        "Tensor indices, Tensor accepted, Tensor(b!) out, float scale, bool deq, int cores=7) -> ()");
+        "Tensor indices, Tensor accepted, Tensor(b!) out, float scale, bool deq, int cores=7, "
+        "bool grouped=False) -> ()");
 }
 TORCH_LIBRARY_IMPL(rgdr_v310_cube_fp16, PrivateUse1, m) {
   m.impl("run_", &cube_fp16);
@@ -65,5 +72,5 @@ TORCH_LIBRARY_IMPL(rgdr_v310_cube_fp16, Meta, m) {
   m.impl("run_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                     double, bool, int64_t) {});
+                     double, bool, int64_t, bool) {});
 }

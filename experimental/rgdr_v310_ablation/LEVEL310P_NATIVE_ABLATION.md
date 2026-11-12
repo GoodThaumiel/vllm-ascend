@@ -174,3 +174,85 @@ and the post-run finite checks by selecting the RGDR task rows. Record
 reported block counts and available Cube, Vector, Scalar and MTE times.
 If task counts differ, return the raw trace and the observed kernel names
 for inspection. Return the four JSONs and profiler summaries.
+
+## Grouped FP16 Cube RGDR vs the preceding Cube DEQ
+
+`cube-grouped` combines the scalar and transfer changes in one kernel.
+A task owns the two value heads for a request's key head. It validates the
+candidate slots and computes their state addresses before the token loop.
+It stages the whole window, batches the gate and dot operations, and loads
+the same RHS into L0B once per token for both heads. Each head uses a full
+V=128 tile, one FP16 L0C drain and UB vector coefficients. The two output
+heads and their candidate states are each written with one contiguous copy.
+All candidate states and the original `−v` augmentation are retained.
+
+Configure a fresh Release build for CANN 9.2.1. This keeps generated M200
+objects from the earlier build out of the link. The target includes both the
+old DEQ and grouped kernels and the half-negation compiler fix.
+
+```bash
+cmake -S . -B build-grouped -DCMAKE_BUILD_TYPE=Release \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DSOC_VERSION=Ascend310P3 -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build build-grouped --target rgdr_v310_cube_fp16_torch -j 8
+export RGDR_GROUPED_LIB="$PWD/build-grouped/librgdr_v310_cube_fp16_torch.so"
+export RGDR_GROUPED_RESULTS=/tmp/rgdr-v310-cube-grouped
+mkdir -p "$RGDR_GROUPED_RESULTS"
+```
+
+First validate both window widths. The route sentinel checks both heads
+with different beta values and selects the last input slot as its initial
+state. The B32 comparison checks output and every candidate state against
+the native FP16 reference at `atol=rtol=2e-3`.
+
+```bash
+(
+  set -e
+  for mtp in 3 7; do
+    python3 bench.py --route-smoke-only --variant cube-grouped --mtp "$mtp" \
+      --cores 1 --library "$RGDR_GROUPED_LIB" \
+      --output "$RGDR_GROUPED_RESULTS/route-mtp$mtp.json"
+    python3 bench.py --variant native --mtp "$mtp" --batch 32 --fp16-gate-input \
+      --warmup 0 --iterations 1 --write-golden "$RGDR_GROUPED_RESULTS/native-mtp$mtp.pt" \
+      --output "$RGDR_GROUPED_RESULTS/native-check-mtp$mtp.json"
+    python3 bench.py --variant cube-grouped --mtp "$mtp" --batch 32 --cores 7 \
+      --library "$RGDR_GROUPED_LIB" --warmup 0 --iterations 1 \
+      --native-golden "$RGDR_GROUPED_RESULTS/native-mtp$mtp.pt" \
+      --output "$RGDR_GROUPED_RESULTS/grouped-check-mtp$mtp.json"
+  done
+)
+```
+
+After those checks pass, profile Native, the preceding Cube DEQ, and the
+grouped candidate on the same idle device. Use the same FP16-rounded gate
+values, seed and 7-core Cube launch in every capture. Select RGDR tasks
+and drop the 20 warmups using the same method as the preceding round.
+
+```bash
+(
+  set -e
+  for mtp in 3 7; do
+    for variant in native cube-deq cube-grouped; do
+      name="$variant-mtp$mtp-b32"
+      msprof --output="$RGDR_GROUPED_RESULTS/$name" --ai-core=on --aic-metrics=PipeUtilization \
+        python3 bench.py --profile-only --variant "$variant" --mtp "$mtp" --batch 32 \
+          --device 0 --cores 7 --fp16-gate-input --warmup 20 --iterations 100 \
+          --library "$RGDR_GROUPED_LIB" --output "$RGDR_GROUPED_RESULTS/$name.json"
+      python3 -c 'import json, sys; sys.exit(json.load(open(sys.argv[1]))["status"] != "PASSED")' \
+        "$RGDR_GROUPED_RESULTS/$name.json"
+    done
+  done
+)
+```
+
+Run the gate once for MTP3 and once for MTP7, passing the matching
+`op_summary_*.csv` files from the DEQ and grouped captures.
+
+```bash
+python3 compare_cube_profiles.py "$BASELINE_CSV" "$GROUPED_CSV"
+```
+
+The candidate passes when both MTP sizes show lower p50 and no higher p90
+than the reprofiled DEQ baseline. Repeat a near-tie with capture order
+reversed. Return both gate results, native timings, and the raw summaries.
+Inspect Scalar, MTE2, MTE3 and Cube time alongside task duration.

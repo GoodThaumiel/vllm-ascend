@@ -86,5 +86,6 @@ endfunction()
 ascendc_library(rgdr_v310_cube_kernel SHARED kernels/cube_matvec.cpp)
 add_cube_torch(rgdr_v310_cube_torch rgdr_v310_cube_kernel csrc/cube_binding.cpp)
 
-ascendc_library(rgdr_v310_cube_fp16_kernel SHARED kernels/rgdr_cube_fp16.cpp)
+ascendc_library(rgdr_v310_cube_fp16_kernel SHARED
+  kernels/rgdr_cube_fp16.cpp kernels/rgdr_cube_grouped_fp16.cpp)
 add_cube_torch(rgdr_v310_cube_fp16_torch rgdr_v310_cube_fp16_kernel csrc/cube_fp16_binding.cpp)

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HEADS_K = 8
 HEADS_V = 16
 DIM = 128
-CUBE_VARIANTS = ("cube-fp16", "cube-deq")
+CUBE_VARIANTS = ("cube-fp16", "cube-deq", "cube-grouped")
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,7 +115,7 @@ def compare_native(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, fl
     return summary
 
 
-def call_fp16_cube(inp: dict[str, torch.Tensor], out: torch.Tensor, scale: float, deq: bool, cores: int) -> None:
+def call_fp16_cube(inp: dict[str, torch.Tensor], out: torch.Tensor, scale: float, variant: str, cores: int) -> None:
     torch.ops.rgdr_v310_cube_fp16.run_(
         inp["q"],
         inp["k"],
@@ -127,12 +127,13 @@ def call_fp16_cube(inp: dict[str, torch.Tensor], out: torch.Tensor, scale: float
         inp["accepted"],
         out,
         scale,
-        deq,
+        variant == "cube-deq",
         cores,
+        variant == "cube-grouped",
     )
 
 
-def check_fp16_cube_route(window: int, device: torch.device, deq: bool) -> None:
+def check_fp16_cube_route(window: int, device: torch.device, variant: str) -> None:
     """Check the two accumulator columns and state write with exactly representable values."""
     q = torch.zeros(window, HEADS_K, DIM, dtype=torch.float16)
     k = torch.zeros_like(q)
@@ -141,8 +142,9 @@ def check_fp16_cube_route(window: int, device: torch.device, deq: bool) -> None:
     v = torch.zeros(window, HEADS_V, DIM, dtype=torch.float16)
     v[0] = torch.arange(DIM, dtype=torch.float16) / 32
     state = torch.zeros(window + 1, HEADS_V, DIM, DIM, dtype=torch.float16)
-    state[1, :, :, 2] = 1
+    state[window, :, :, 2] = 1
     beta = torch.full((window, HEADS_V), 0.5, dtype=torch.float16)
+    beta[:, 1::2] = 0.25
     inp = {
         "q": q,
         "k": k,
@@ -151,13 +153,13 @@ def check_fp16_cube_route(window: int, device: torch.device, deq: bool) -> None:
         "g": torch.zeros_like(beta),
         "state": state,
         "indices": torch.arange(1, window + 1, dtype=torch.int32),
-        "accepted": torch.ones(1, dtype=torch.int32),
+        "accepted": torch.full((1,), window, dtype=torch.int32),
     }
     inp = {name: tensor.to(device) for name, tensor in inp.items()}
     out = torch.full_like(inp["v"], float("nan"))
-    call_fp16_cube(inp, out, scale=1.0, deq=deq, cores=1)
+    call_fp16_cube(inp, out, scale=1.0, variant=variant, cores=1)
     torch.npu.synchronize()
-    expected = 1 + (v[0] - 0.5) * 0.25
+    expected = 1 + (v[0] - 0.5) * beta[0, :, None] * 0.5
     torch.testing.assert_close(out[0].cpu(), expected, atol=0, rtol=0)
     state[1, :, :, 2] = expected
     torch.testing.assert_close(inp["state"][1].cpu(), state[1], atol=0, rtol=0)
@@ -183,7 +185,6 @@ def run(args: argparse.Namespace) -> dict:
     torch_npu.npu.set_compile_mode(jit_compile=False)
     device = torch.device(f"npu:{args.device}")
     cube = args.variant in CUBE_VARIANTS
-    deq = args.variant == "cube-deq"
     if args.variant == "native":
         from vllm_ascend.utils import enable_custom_op
 
@@ -194,7 +195,7 @@ def run(args: argparse.Namespace) -> dict:
         library = args.library or Path(__file__).parent / f"build/librgdr_v310_{name}_torch.so"
         torch.ops.load_library(str(library.resolve()))
     if cube and not args.profile_only:
-        check_fp16_cube_route(args.mtp + 1, device, deq)
+        check_fp16_cube_route(args.mtp + 1, device, args.variant)
         if args.route_smoke_only:
             return {"route_smoke": "PASSED"}
     inp = make_inputs(args, device)
@@ -217,7 +218,7 @@ def run(args: argparse.Namespace) -> dict:
                 scale_value=DIM**-0.5,
             )
         if cube:
-            call_fp16_cube(inp, output, DIM**-0.5, deq, args.cores)
+            call_fp16_cube(inp, output, DIM**-0.5, args.variant, args.cores)
             return output
         torch.ops.rgdr_v310_ablation.run_(
             inp["q"],
@@ -292,7 +293,7 @@ def run(args: argparse.Namespace) -> dict:
         result["route_smoke"] = "PASSED"
     if args.native_golden:
         native = torch.load(args.native_golden, map_location="cpu", weights_only=True)
-        compare_result = compare if cube else compare_native
+        compare_result = compare if cube and args.variant != "cube-grouped" else compare_native
         result["native_correctness"] = {
             "output": compare_result(actual_output, native["output"]),
             "state": compare_result(actual_state, native["state"]),

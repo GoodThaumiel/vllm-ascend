@@ -169,7 +169,7 @@ private:
             Drain(c, scratch, drain);
             delta = scratch;
         } else {
-            Muls(delta, delta, static_cast<half>(-beta), TILE);
+            Muls(delta, delta, static_cast<half>(-static_cast<float>(beta)), TILE);
             PipeBarrier<PIPE_V>();
         }
         c1_.FreeTensor(c);
