@@ -125,35 +125,52 @@ cmake --build build --target rgdr_v310_cube_fp16_torch -j 8
 readelf -d build/librgdr_v310_cube_fp16_torch.so | grep -E 'RUNPATH|RPATH'
 ```
 
-Run the modes separately. Each Cube run first checks an exact, small
-sentinel for the sign of `−v`, the K/Q columns, DEQ scaling, and state
-writeback. It also checks the timed workload for non-finite values.
-If either mode fails, send its JSON and first traceback. Continue with
-the other mode only if the device is healthy.
+### This round: profile Native vs Cube DEQ
+
+Compare only the original `npu_recurrent_gated_delta_rule_310` and
+`cube-deq`, using B32 and MTP3/7. Run the small Cube route sentinel before
+starting profiling. It checks the sign of `−v`, the K/Q columns, DEQ scaling,
+and state writeback.
 
 ```bash
-export RGDR_RESULTS=/tmp/rgdr-v310-cube-fp16
+export RGDR_RESULTS=/tmp/rgdr-v310-cube-deq-profile
 mkdir -p "$RGDR_RESULTS"
-for mtp in 3 7; do
-  python3 bench.py --mtp "$mtp" --batch 32 --variant native --fp16-gate-input \
-    --write-golden "$RGDR_RESULTS/native-mtp$mtp.pt" \
-    --output "$RGDR_RESULTS/native-mtp$mtp.json" || break
-  python3 bench.py --mtp "$mtp" --batch 32 --variant cube-fp16 --cores 7 \
-    --native-golden "$RGDR_RESULTS/native-mtp$mtp.pt" \
-    --output "$RGDR_RESULTS/cube-fp16-mtp$mtp.json" || break
-done
-
-for mtp in 3 7; do
-  python3 bench.py --mtp "$mtp" --batch 32 --variant cube-deq --cores 7 \
-    --native-golden "$RGDR_RESULTS/native-mtp$mtp.pt" \
-    --output "$RGDR_RESULTS/cube-deq-mtp$mtp.json" || break
-done
+python3 bench.py --route-smoke-only --mtp 3 --batch 1 --variant cube-deq \
+  --device 0 --cores 1 --output "$RGDR_RESULTS/cube-deq-smoke.json"
 ```
 
-Native gets the same FP16-rounded log-gate values in its FP32 input ABI.
-The timed graph includes Q/K packing, state packing, L0C drain, recurrence
-and writes. Q/K normalization, gate ABI preparation and state reset are
-outside timing for both paths. Return the six JSONs with timing source,
-p50/p90, and optionally the profiler's task duration, Cube/Vector/Scalar
-and MTE timings. Native output and state differences are recorded for
-diagnosis. Model-level precision is a separate follow-up.
+After the sentinel passes, run four separate captures on the same idle
+device. `--profile-only` submits the complete operator eagerly, with 20
+warmups and 100 measured launches per capture. It restores the same input
+state before every launch.
+
+```bash
+(
+  set -e
+  for mtp in 3 7; do
+    for variant in native cube-deq; do
+      name="$variant-mtp$mtp-b32"
+      msprof --output="$RGDR_RESULTS/$name" --ai-core=on --aic-metrics=PipeUtilization \
+        python3 bench.py --profile-only --variant "$variant" --mtp "$mtp" --batch 32 \
+          --device 0 --cores 7 --fp16-gate-input --warmup 20 --iterations 100 \
+          --output "$RGDR_RESULTS/$name.json"
+      python3 -c 'import json, sys; sys.exit(json.load(open(sys.argv[1]))["status"] != "PASSED")' \
+        "$RGDR_RESULTS/$name.json"
+    done
+  done
+)
+```
+
+The inputs share a seed, including Q/K/V, beta, the initial state, state
+indices and accepted counts. Native receives the same FP16-rounded log-gate
+values in its FP32 input ABI. The Cube task includes Q/K and state packing,
+both L0C drains, recurrence and candidate state writes.
+
+In each `op_summary_*.csv`, select the Native V310 or
+`rgdr_v310_cube_fp16` task and order matching rows by start time. Expect
+120 matching launches and discard the first 20. Use the remaining 100
+task durations for p50/p90. Exclude state-reset copies, tensor preparation,
+and the post-run finite checks by selecting the RGDR task rows. Record
+reported block counts and available Cube, Vector, Scalar and MTE times.
+If task counts differ, return the raw trace and the observed kernel names
+for inspection. Return the four JSONs and profiler summaries.

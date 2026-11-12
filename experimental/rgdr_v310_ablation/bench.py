@@ -1,4 +1,4 @@
-"""Isolated 310P native GDR ablations: MTP3/7, batch 32, one graph launch per iteration."""
+"""Isolated 310P GDR ablations for graph timing or direct device profiling."""
 
 from __future__ import annotations
 
@@ -30,13 +30,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--profile-only", action="store_true", help="launch eagerly for msprof without event timing")
+    modes.add_argument("--route-smoke-only", action="store_true", help="check the Cube route eagerly and exit")
     parser.add_argument("--library", type=Path, help="override the default library for the selected variant")
     parser.add_argument("--fp16-gate-input", action="store_true", help="round log-gate to match the FP16 Cube inputs")
     parser.add_argument("--golden", type=Path)
     parser.add_argument("--native-golden", type=Path, help="native output/state for tolerance comparison")
     parser.add_argument("--write-golden", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.warmup < 0 or args.iterations < 1:
+        parser.error("--warmup must be non-negative and --iterations must be positive")
+    if (args.profile_only or args.route_smoke_only) and (args.golden or args.native_golden or args.write_golden):
+        parser.error("profiling and route smoke modes do not read or write precision goldens")
+    if args.route_smoke_only and args.variant not in CUBE_VARIANTS:
+        parser.error("--route-smoke-only requires a Cube variant")
+    return args
 
 
 def make_inputs(args: argparse.Namespace, device: torch.device) -> dict[str, torch.Tensor]:
@@ -153,6 +163,21 @@ def check_fp16_cube_route(window: int, device: torch.device, deq: bool) -> None:
     torch.testing.assert_close(inp["state"][1].cpu(), state[1], atol=0, rtol=0)
 
 
+def run_profile_launches(call, state, original_state, warmup: int, iterations: int) -> dict:
+    for _ in range(warmup):
+        state.copy_(original_state)
+        call()
+    torch.npu.synchronize()
+
+    for _ in range(iterations):
+        state.copy_(original_state)
+        output = call()
+    torch.npu.synchronize()
+    if not bool(torch.isfinite(output.cpu()).all() and torch.isfinite(state.cpu()).all()):
+        raise AssertionError("RGDR profiling run produced non-finite output or state")
+    return {"warmup_launches": warmup, "measurement_launches": iterations, "execution": "eager"}
+
+
 def run(args: argparse.Namespace) -> dict:
     torch.npu.set_device(args.device)
     torch_npu.npu.set_compile_mode(jit_compile=False)
@@ -168,8 +193,10 @@ def run(args: argparse.Namespace) -> dict:
         name = "cube_fp16" if cube else "vec"
         library = args.library or Path(__file__).parent / f"build/librgdr_v310_{name}_torch.so"
         torch.ops.load_library(str(library.resolve()))
-    if cube:
+    if cube and not args.profile_only:
         check_fp16_cube_route(args.mtp + 1, device, deq)
+        if args.route_smoke_only:
+            return {"route_smoke": "PASSED"}
     inp = make_inputs(args, device)
     original_state = inp["state"].clone()
     output = torch.full_like(inp["v"], float("nan")) if cube else torch.empty_like(inp["v"])
@@ -208,6 +235,9 @@ def run(args: argparse.Namespace) -> dict:
             args.cores,
         )
         return output
+
+    if args.profile_only:
+        return {"profile": run_profile_launches(call, inp["state"], original_state, args.warmup, args.iterations)}
 
     inp["state"].copy_(original_state)
     graph = torch.npu.NPUGraph()
