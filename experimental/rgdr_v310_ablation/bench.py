@@ -18,18 +18,20 @@ ROOT = Path(__file__).resolve().parents[2]
 HEADS_K = 8
 HEADS_V = 16
 DIM = 128
+CUBE_VARIANTS = ("cube-fp16", "cube-deq")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=("native", "0", "1", "2", "3"), required=True)
+    parser.add_argument("--variant", choices=("native", "0", "1", "2", "3", *CUBE_VARIANTS), required=True)
     parser.add_argument("--mtp", type=int, choices=(3, 7), required=True)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--library", type=Path, default=Path(__file__).parent / "build/librgdr_v310_vec_torch.so")
+    parser.add_argument("--library", type=Path, help="override the default library for the selected variant")
+    parser.add_argument("--fp16-gate-input", action="store_true", help="round log-gate to match the FP16 Cube inputs")
     parser.add_argument("--golden", type=Path)
     parser.add_argument("--native-golden", type=Path, help="native output/state for tolerance comparison")
     parser.add_argument("--write-golden", type=Path)
@@ -50,6 +52,10 @@ def make_inputs(args: argparse.Namespace, device: torch.device) -> dict[str, tor
     v = random((total, HEADS_V, DIM), 0.09)
     beta = torch.rand((total, HEADS_V), generator=gen).mul(0.8).half()
     g = torch.rand((total, HEADS_V), generator=gen).mul(-0.04)
+    if args.variant in CUBE_VARIANTS or args.fp16_gate_input:
+        g = g.half()
+        if args.variant not in CUBE_VARIANTS:
+            g = g.float()
     state = torch.zeros((total + 1, HEADS_V, DIM, DIM), dtype=torch.float16)
     accepted = torch.arange(args.batch, dtype=torch.int32).remainder(tokens).add(1)
     for row in range(args.batch):
@@ -99,20 +105,74 @@ def compare_native(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, fl
     return summary
 
 
+def call_fp16_cube(inp: dict[str, torch.Tensor], out: torch.Tensor, scale: float, deq: bool, cores: int) -> None:
+    torch.ops.rgdr_v310_cube_fp16.run_(
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["beta"],
+        inp["g"],
+        inp["state"],
+        inp["indices"],
+        inp["accepted"],
+        out,
+        scale,
+        deq,
+        cores,
+    )
+
+
+def check_fp16_cube_route(window: int, device: torch.device, deq: bool) -> None:
+    """Check the two accumulator columns and state write with exactly representable values."""
+    q = torch.zeros(window, HEADS_K, DIM, dtype=torch.float16)
+    k = torch.zeros_like(q)
+    q[:, :, 2] = 1
+    k[:, :, 2] = 0.5
+    v = torch.zeros(window, HEADS_V, DIM, dtype=torch.float16)
+    v[0] = torch.arange(DIM, dtype=torch.float16) / 32
+    state = torch.zeros(window + 1, HEADS_V, DIM, DIM, dtype=torch.float16)
+    state[1, :, :, 2] = 1
+    beta = torch.full((window, HEADS_V), 0.5, dtype=torch.float16)
+    inp = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "beta": beta,
+        "g": torch.zeros_like(beta),
+        "state": state,
+        "indices": torch.arange(1, window + 1, dtype=torch.int32),
+        "accepted": torch.ones(1, dtype=torch.int32),
+    }
+    inp = {name: tensor.to(device) for name, tensor in inp.items()}
+    out = torch.full_like(inp["v"], float("nan"))
+    call_fp16_cube(inp, out, scale=1.0, deq=deq, cores=1)
+    torch.npu.synchronize()
+    expected = 1 + (v[0] - 0.5) * 0.25
+    torch.testing.assert_close(out[0].cpu(), expected, atol=0, rtol=0)
+    state[1, :, :, 2] = expected
+    torch.testing.assert_close(inp["state"][1].cpu(), state[1], atol=0, rtol=0)
+
+
 def run(args: argparse.Namespace) -> dict:
     torch.npu.set_device(args.device)
     torch_npu.npu.set_compile_mode(jit_compile=False)
     device = torch.device(f"npu:{args.device}")
+    cube = args.variant in CUBE_VARIANTS
+    deq = args.variant == "cube-deq"
     if args.variant == "native":
         from vllm_ascend.utils import enable_custom_op
 
         if not enable_custom_op():
             raise RuntimeError("native V310 custom op is unavailable")
     else:
-        torch.ops.load_library(str(args.library.resolve()))
+        name = "cube_fp16" if cube else "vec"
+        library = args.library or Path(__file__).parent / f"build/librgdr_v310_{name}_torch.so"
+        torch.ops.load_library(str(library.resolve()))
+    if cube:
+        check_fp16_cube_route(args.mtp + 1, device, deq)
     inp = make_inputs(args, device)
     original_state = inp["state"].clone()
-    output = torch.empty_like(inp["v"])
+    output = torch.full_like(inp["v"], float("nan")) if cube else torch.empty_like(inp["v"])
 
     def call() -> torch.Tensor:
         if args.variant == "native":
@@ -129,6 +189,9 @@ def run(args: argparse.Namespace) -> dict:
                 num_accepted_tokens=inp["accepted"],
                 scale_value=DIM**-0.5,
             )
+        if cube:
+            call_fp16_cube(inp, output, DIM**-0.5, deq, args.cores)
+            return output
         torch.ops.rgdr_v310_ablation.run_(
             inp["q"],
             inp["k"],
@@ -193,11 +256,16 @@ def run(args: argparse.Namespace) -> dict:
     actual_output = graph_output.cpu()
     actual_state = inp["state"].cpu()
     result = {"graph_perf": elapsed_us(samples, source)}
+    if cube:
+        if not bool(torch.isfinite(actual_output).all() and torch.isfinite(actual_state).all()):
+            raise AssertionError("FP16 Cube RGDR produced non-finite output or state")
+        result["route_smoke"] = "PASSED"
     if args.native_golden:
         native = torch.load(args.native_golden, map_location="cpu", weights_only=True)
+        compare_result = compare if cube else compare_native
         result["native_correctness"] = {
-            "output": compare_native(actual_output, native["output"]),
-            "state": compare_native(actual_state, native["state"]),
+            "output": compare_result(actual_output, native["output"]),
+            "state": compare_result(actual_state, native["state"]),
         }
     if args.golden:
         golden = torch.load(args.golden, map_location="cpu", weights_only=True)
@@ -225,6 +293,7 @@ def main() -> None:
         "cores": args.cores if args.variant != "native" else "host tiling",
         "device": args.device,
         "scope": "isolated native V310 op; Q/K normalization and cache reset excluded",
+        "fp16_gate_input": args.fp16_gate_input or args.variant in CUBE_VARIANTS,
     }
     try:
         report["source_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()

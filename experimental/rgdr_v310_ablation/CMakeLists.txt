@@ -60,24 +60,31 @@ target_link_options(rgdr_v310_vec_torch PRIVATE
   "LINKER:-rpath,\$ORIGIN/lib"
   "LINKER:--enable-new-dtags")
 
+function(add_cube_torch target kernel binding)
+  add_library(${target} SHARED ${binding})
+  add_dependencies(${target} ${kernel})
+  target_include_directories(${target} PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/include"
+    "${torch_npu_root}/include"
+    "${torch_npu_root}/.."
+    "${ASCEND_CANN_PACKAGE_PATH}/include"
+    ${TORCH_INCLUDE_DIRS})
+  target_compile_options(${target} PRIVATE ${torch_cxx_flags} -O2 -Wall)
+  target_link_libraries(${target} PRIVATE
+    ${kernel} ${TORCH_LIBRARIES} "${TORCH_NPU_LIB}" "${ASCENDCL_LIB}")
+  set_target_properties(${target} PROPERTIES
+    BUILD_RPATH "$ORIGIN/lib"
+    INSTALL_RPATH "$ORIGIN/lib"
+    BUILD_RPATH_USE_ORIGIN TRUE
+    SKIP_BUILD_RPATH FALSE
+    BUILD_WITH_INSTALL_RPATH FALSE)
+  target_link_options(${target} PRIVATE
+    "LINKER:-rpath,\$ORIGIN/lib"
+    "LINKER:--enable-new-dtags")
+endfunction()
+
 ascendc_library(rgdr_v310_cube_kernel SHARED kernels/cube_matvec.cpp)
-add_library(rgdr_v310_cube_torch SHARED csrc/cube_binding.cpp)
-add_dependencies(rgdr_v310_cube_torch rgdr_v310_cube_kernel)
-target_include_directories(rgdr_v310_cube_torch PRIVATE
-  "${CMAKE_CURRENT_BINARY_DIR}/include"
-  "${torch_npu_root}/include"
-  "${torch_npu_root}/.."
-  "${ASCEND_CANN_PACKAGE_PATH}/include"
-  ${TORCH_INCLUDE_DIRS})
-target_compile_options(rgdr_v310_cube_torch PRIVATE ${torch_cxx_flags} -O2 -Wall)
-target_link_libraries(rgdr_v310_cube_torch PRIVATE
-  rgdr_v310_cube_kernel ${TORCH_LIBRARIES} "${TORCH_NPU_LIB}" "${ASCENDCL_LIB}")
-set_target_properties(rgdr_v310_cube_torch PROPERTIES
-  BUILD_RPATH "$ORIGIN/lib"
-  INSTALL_RPATH "$ORIGIN/lib"
-  BUILD_RPATH_USE_ORIGIN TRUE
-  SKIP_BUILD_RPATH FALSE
-  BUILD_WITH_INSTALL_RPATH FALSE)
-target_link_options(rgdr_v310_cube_torch PRIVATE
-  "LINKER:-rpath,\$ORIGIN/lib"
-  "LINKER:--enable-new-dtags")
+add_cube_torch(rgdr_v310_cube_torch rgdr_v310_cube_kernel csrc/cube_binding.cpp)
+
+ascendc_library(rgdr_v310_cube_fp16_kernel SHARED kernels/rgdr_cube_fp16.cpp)
+add_cube_torch(rgdr_v310_cube_fp16_torch rgdr_v310_cube_fp16_kernel csrc/cube_fp16_binding.cpp)

@@ -99,7 +99,61 @@ durations to explain task duration because they overlap.
 
 Return the ten full-operator JSON files, four Cube JSON files, first failing
 compile/runtime logs, `npu-smi info`, and the relevant `msprof` summary.
-An improvement is actionable only if correctness passes and the **full**
-vector variant is faster than native on both MTP sizes. Cube integration
-requires a later full-operator implementation and its own correctness/perf
-gate.
+The full vector variant's results are actionable after correctness passes
+and it is faster than native on both MTP sizes. The next section benchmarks
+the full Cube operator separately.
+
+## FP16 single-pass Cube RGDR
+
+This experiment covers uniform MTP3 and MTP7 windows on 310P3. Each
+`(request, value head, V tile)` retains its FP16 state in UB across tokens.
+One `LoadData2D` / `Mmad` path computes two live columns with FP16 L0C.
+The extra K block encodes `[Hg | v] × [k,q; −1,0]`. This places `Hgk−v`
+and `Hgq` directly in L0C. Vector updates the state and adds
+`delta × (k·q)` to the output. Every candidate state is written to GM.
+
+- `cube-fp16` drains the 16×16 fractal once and computes `−beta` scaling in UB.
+- `cube-deq` drains the same L0C fractal twice. The ordinary drain supplies
+  `Hgq`. The FP16-to-FP16 DEQ drain applies `−beta` during transfer and supplies
+  delta. The second drain and transpose are included in its latency.
+
+The target builds independently from the vector and matvec probes.
+Follow the environment and CMake configure steps above, then build:
+
+```bash
+cmake --build build --target rgdr_v310_cube_fp16_torch -j 8
+readelf -d build/librgdr_v310_cube_fp16_torch.so | grep -E 'RUNPATH|RPATH'
+```
+
+Run the modes separately. Each Cube run first checks an exact, small
+sentinel for the sign of `−v`, the K/Q columns, DEQ scaling, and state
+writeback. It also checks the timed workload for non-finite values.
+If either mode fails, send its JSON and first traceback. Continue with
+the other mode only if the device is healthy.
+
+```bash
+export RGDR_RESULTS=/tmp/rgdr-v310-cube-fp16
+mkdir -p "$RGDR_RESULTS"
+for mtp in 3 7; do
+  python3 bench.py --mtp "$mtp" --batch 32 --variant native --fp16-gate-input \
+    --write-golden "$RGDR_RESULTS/native-mtp$mtp.pt" \
+    --output "$RGDR_RESULTS/native-mtp$mtp.json" || break
+  python3 bench.py --mtp "$mtp" --batch 32 --variant cube-fp16 --cores 7 \
+    --native-golden "$RGDR_RESULTS/native-mtp$mtp.pt" \
+    --output "$RGDR_RESULTS/cube-fp16-mtp$mtp.json" || break
+done
+
+for mtp in 3 7; do
+  python3 bench.py --mtp "$mtp" --batch 32 --variant cube-deq --cores 7 \
+    --native-golden "$RGDR_RESULTS/native-mtp$mtp.pt" \
+    --output "$RGDR_RESULTS/cube-deq-mtp$mtp.json" || break
+done
+```
+
+Native gets the same FP16-rounded log-gate values in its FP32 input ABI.
+The timed graph includes Q/K packing, state packing, L0C drain, recurrence
+and writes. Q/K normalization, gate ABI preparation and state reset are
+outside timing for both paths. Return the six JSONs with timing source,
+p50/p90, and optionally the profiler's task duration, Cube/Vector/Scalar
+and MTE timings. Native output and state differences are recorded for
+diagnosis. Model-level precision is a separate follow-up.
