@@ -88,6 +88,27 @@ class ReferenceTests(unittest.TestCase):
             torch.testing.assert_close(compacted[name], verified[name], atol=0, rtol=0, equal_nan=True)
         self.assertTrue(torch.isfinite(verified["d_cache"][1, :, (31 + 16) & 31]).all())
 
+    def test_fp32_suffix_fold_matches_sequential_compact(self):
+        for pos, base in ((1, 0), (7, 29), (12, 31), (16, 0), (16, 29)):
+            with self.subTest(pos=pos, base=base):
+                case = make_case(pos=pos, base=base)
+                case["flush"].fill_(1)
+                expected = compact_reference(case)["checkpoint"][1]
+                physical = [(base + i) % RING for i in range(pos)]
+                gate = case["g_cache"][1, :, physical].exp()
+                key = case["k_cache"][1, :, physical].float().repeat_interleave(2, dim=0)
+                delta = case["d_cache"][1, :, physical].float()
+                weights = torch.empty_like(gate)
+                scale = torch.ones_like(gate[:, 0])
+                for i in reversed(range(pos)):
+                    weights[:, i] = scale
+                    scale = scale * gate[:, i]
+                state = case["checkpoint"][1].float() * scale[:, None, None]
+                for i in range(pos):
+                    weighted_delta = delta[:, i] * weights[:, i, None]
+                    state += weighted_delta[:, :, None] * key[:, i, None, :]
+                torch.testing.assert_close(state.half(), expected, atol=2**-14, rtol=0)
+
     def test_detached_ring_matches_tied_geometry(self):
         tied = make_case(mtp=5, batch=2, pos=12, base=31)
         tied["flush"].fill_(1)

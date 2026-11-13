@@ -203,3 +203,89 @@ OSL 400，在相同显存预算和同一档 MTP 下对照。以实际输出 toke
 需要补原生 V310 的同输入算子基线时，使用 `--stage perf --tile-v 64
 --status-variant 2`。该入口使用固定满窗，并在计时前为原生路径物化初始
 state。它与上面混合窗口测试的负载不同，报告应分开比较。
+
+## 批量 FP32 compact 上机清单
+
+`7371f73` 上机时，B128 全批 flush 的 V12 compact 约 33.86 ms，占
+整窗 Cube 路径组合图的 79%–82%。从 B32 到 B128，compact 的时延约
+增至 4 倍，接近请求行数的倍率。这轮优先压低每个 flush row 的成本。
+
+`--compact-variant 2` 按 `(row, key head)` 分任务，要求每个 key head
+对应两个 value head。两头复用同一个 K panel 和计算缓冲。历史 K/D 按
+ring 边界拆成至多两次对齐搬运，G 整段搬入并一次做 Exp。每个 value
+head 一次搬入完整 128×128 checkpoint，用 FP32 后缀积预乘 D，
+checkpoint 只缩放一次。计算结果按 M200 的 `CAST_NONE` 存回 FP16。
+计算顺序发生变化，仍用原有 FP16 容差检验。ring 逐位保持，checkpoint
+只写 flush 且 pos 非零的有效槽。
+
+每个有效任务拥有一个 32B status 块，直接覆盖整块；无折叠的行由第
+一个任务覆盖整行 status。各核首次执行折叠时才初始化工作缓冲。
+重路径显式 UB 分配约 216.5 KiB（TP2），实际资源以 CCE 编译为准。
+服务调用仍默认选 compact variant 1。
+
+### 构建与精度
+
+重新构建库。先跑 MTP3/7 的 smoke、sequence 和 graph。保留上一轮
+Cube verify，用同一个 FP32 顺序递推参考检查 checkpoint 和下一轮
+输出。回传第一个编译或精度错误及对应 JSON。
+
+```bash
+set -e
+op=experimental/replayssm_sd_310p_ascendc
+build="$op/build-compact-batch"
+lib="$build/libreplayssm_sd_310p_torch.so"
+results=/tmp/replayssm-310p-compact-batch
+mkdir -p "$results"
+cmake -S "$op" -B "$build" -DCMAKE_BUILD_TYPE=Release \
+  -DSOC_VERSION=Ascend310P3 -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build "$build" -j 8
+readelf -d "$lib" | grep -E 'RUNPATH|RPATH'
+python3 -m unittest experimental.replayssm_sd_310p_ascendc.tests.test_reference
+for mtp in 3 7; do
+  for stage in smoke sequence graph; do
+    python3 "$op/run.py" --library "$lib" --mtp "$mtp" --batch 2 \
+      --stage "$stage" --tile-v 64 --cores 7 --status-variant 2 --compact-variant 2 \
+      --output "$results/mtp$mtp-$stage.json"
+  done
+done
+```
+
+### 高并发与 profiling
+
+两侧固定同一个整窗 Cube verify、cursor 和数据，只切换 compact。
+测 B32/B64/B128 × MTP3/7，覆盖 cold、mixed 和 full_flush。
+计时前在组合图重放后比对输出、status、ring、checkpoint 和 cursor。
+JSON 中 `compact_p50_speedup` 对应单算子，`combined_vs_cube` 对应
+三算子同图。B64/B128 的 mixed/full_flush 要求组合 p50 降低，
+p90 最多增加 5%。cold 的 p50/p90 都允许 5% 计时波动。
+同时看 `scaling_vs_b32`，观察 B64/B128 的单位时间处理量。
+
+```bash
+for mtp in 3 7; do
+  baseline="$results/mtp$mtp-b32.json"
+  for batch in 32 64 128; do
+    scaling=()
+    if [ "$batch" -ne 32 ]; then
+      scaling=(--capacity-b32 "$baseline")
+    fi
+    python3 "$op/run.py" --library "$lib" --mtp "$mtp" --batch "$batch" \
+      --stage capacity_perf --cores 7 --compact-variant 2 --warmup 20 --iterations 100 \
+      "${scaling[@]}" --output "$results/mtp$mtp-b$batch.json"
+  done
+done
+```
+
+优先抓 B128 的 full_flush 和 mixed。对照 kernel 名
+`replayssm_sd_310p_compact` 与 `replayssm_sd_310p_compact_batch`，
+回传 task duration、Scalar、Vector、MTE2、MTE3。先用两组负载判断批量
+搬运和减少整块缩放的收益，再决定是否把短 K 轴的历史折叠交给 Cube。
+
+```bash
+for workload in full_flush mixed; do
+  msprof --output="$results/prof-$workload" --ai-core=on --aic-metrics=PipeUtilization \
+    python3 "$op/run.py" --library "$lib" --mtp 7 --batch 128 --cores 7 \
+    --stage capacity_perf --compact-variant 2 --capacity-workload "$workload" \
+    --warmup 20 --iterations 100 --output "$results/prof-$workload.json"
+done
+```

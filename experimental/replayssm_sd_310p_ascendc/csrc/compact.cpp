@@ -6,6 +6,7 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <acl/acl.h>
 #include "aclrtlaunch_replayssm_sd_310p_compact.h"
+#include "aclrtlaunch_replayssm_sd_310p_compact_batch.h"
 
 #include <algorithm>
 
@@ -15,8 +16,8 @@ void compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
                           const at::Tensor& slots, const at::Tensor& positions,
                           const at::Tensor& bases, const at::Tensor& flush,
                           const at::Tensor& status, int64_t tile_v, int64_t cores,
-                          c10::optional<at::Tensor> ring_slots) {
-  constexpr int64_t variant = 1;
+                          c10::optional<at::Tensor> ring_slots, int64_t variant) {
+  TORCH_CHECK(variant == 1 || variant == 2, "compact variant must be 1 (V12) or 2 (batched FP32)");
   const at::Tensor& ring_ids = ring_slots.has_value() ? *ring_slots : slots;
   TORCH_CHECK(checkpoint.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& t : {d_cache, k_cache, g_cache, slots, positions, bases, flush, status}) {
@@ -49,6 +50,8 @@ void compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
   const int64_t heads = k_cache.size(1);
   TORCH_CHECK(heads > 0 && value_heads > 0 && value_heads % heads == 0,
               "Invalid head geometry");
+  TORCH_CHECK(variant == 1 || value_heads == 2 * heads,
+              "batched compact requires exactly two value heads per key head");
   TORCH_CHECK(g_cache.sizes() == at::IntArrayRef({num_ring_slots, value_heads, ring_len}) &&
                   g_cache.scalar_type() == at::kFloat,
               "g_cache must be FP32[slots,HV,R]");
@@ -93,6 +96,23 @@ void compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
   const int64_t heads_per_status_block = 8 / (128 / tile_v);
   const auto block_dim = static_cast<uint32_t>(std::min<int64_t>(
       cores, batch * value_heads / heads_per_status_block));
+  if (variant == 2) {
+    constexpr int64_t dma_block_bytes = 32;
+    for (const auto& t : {checkpoint, d_cache, k_cache, g_cache, status}) {
+      TORCH_CHECK((t.storage_offset() * t.element_size()) % dma_block_bytes == 0 &&
+                      (t.dim() == 1 || (t.stride(0) * t.element_size()) % dma_block_bytes == 0),
+                  "batched compact requires 32-byte aligned data and slot strides");
+    }
+    const auto result = aclrtlaunch_replayssm_sd_310p_compact_batch(
+        block_dim, stream, checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(),
+        slots.data_ptr(), ring_ids.data_ptr(), positions.data_ptr(), bases.data_ptr(), flush.data_ptr(),
+        status.data_ptr(), static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots),
+        static_cast<uint32_t>(num_ring_slots), static_cast<uint32_t>(heads),
+        static_cast<uint64_t>(checkpoint.stride(0)), static_cast<uint64_t>(d_cache.stride(0)),
+        static_cast<uint64_t>(k_cache.stride(0)), static_cast<uint64_t>(g_cache.stride(0)));
+    TORCH_CHECK(result == ACL_SUCCESS, "Replay SD batched compact launch failed: ", result);
+    return;
+  }
   const auto result = aclrtlaunch_replayssm_sd_310p_compact(
       block_dim, stream, checkpoint.data_ptr(),
       d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(), slots.data_ptr(), ring_ids.data_ptr(),

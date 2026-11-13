@@ -55,15 +55,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-v", type=int, choices=(32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
     parser.add_argument("--status-variant", type=int, choices=(0, 1, 2), default=0)
+    parser.add_argument("--compact-variant", type=int, choices=(1, 2), default=1)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--capacity-workload",
+        choices=("cold", "mixed", "full_flush"),
+        help="Run just one capacity workload for profiling",
+    )
     parser.add_argument("--capacity-b32", type=Path, help="Compare scaling against a matching B32 capacity_perf report")
     args = parser.parse_args()
     if args.stage == "capacity_perf" and (args.batch not in (32, 64, 128) or args.mtp not in (3, 7)):
         parser.error("capacity_perf requires B32/B64/B128 and MTP3/7")
     if args.warmup < 0 or args.iterations < 1:
         parser.error("--warmup must be non-negative and --iterations must be positive")
+    if args.capacity_workload and args.stage != "capacity_perf":
+        parser.error("--capacity-workload requires capacity_perf")
     if args.capacity_b32 and (args.stage != "capacity_perf" or args.batch == 32):
         parser.error("--capacity-b32 requires capacity_perf at B64 or B128")
     if args.stage != "capacity_perf" and args.status_variant == 2 and (args.mtp not in (3, 7) or args.tile_v != 64):
@@ -96,7 +104,8 @@ def verify(case: dict[str, torch.Tensor], tile_v: int, cores: int, status_varian
     )
 
 
-def compact(case: dict[str, torch.Tensor], cores: int) -> None:
+def compact(case: dict[str, torch.Tensor], cores: int, variant: int = 1) -> None:
+    variant_args = {"variant": variant} if variant != 1 else {}
     torch.ops.replayssm_sd_310p.compact_(
         case["checkpoint"],
         case["d_cache"],
@@ -110,6 +119,7 @@ def compact(case: dict[str, torch.Tensor], cores: int) -> None:
         32,
         cores,
         case["ring_slots"],
+        **variant_args,
     )
 
 
@@ -387,7 +397,7 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
         verify_errors = compare_verify(gpu, expected)
         compact_expected = compact_reference(expected)
         cache_before = {name: gpu[name].cpu().clone() for name in ("d_cache", "k_cache", "g_cache")}
-        compact(gpu, args.cores)
+        compact(gpu, args.cores, args.compact_variant)
         torch.npu.synchronize()
         compact_errors = compare_compact(gpu, compact_expected, cache_before)
         cursor_cpu = cursor_case(cpu, args.mtp)
@@ -430,7 +440,7 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
         invalid_gpu = clone(invalid, device)
         invalid_expected = compact_reference(invalid)
         cache_before = {name: invalid_gpu[name].cpu().clone() for name in ("d_cache", "k_cache", "g_cache")}
-        compact(invalid_gpu, args.cores)
+        compact(invalid_gpu, args.cores, args.compact_variant)
         torch.npu.synchronize()
         invalid_errors = compare_compact(invalid_gpu, invalid_expected, cache_before)
         status_rows = invalid_gpu["compact_status"].cpu().reshape(args.batch, -1)
@@ -479,7 +489,7 @@ def invalid_bindings(args: argparse.Namespace, device: torch.device) -> list[str
     broken = dict(case)
     broken["checkpoint"] = case["checkpoint"].float()
     try:
-        compact(broken, args.cores)
+        compact(broken, args.cores, args.compact_variant)
     except RuntimeError:
         checks.append("compact_dtype")
     else:
@@ -517,7 +527,7 @@ def sequence(args: argparse.Namespace, device: torch.device) -> list[dict]:
         verify_errors = compare_verify(gpu, expected_verify)
         expected_compact = compact_reference(expected_verify)
         cache_before = {name: gpu[name].cpu().clone() for name in ("d_cache", "k_cache", "g_cache")}
-        compact(gpu, args.cores)
+        compact(gpu, args.cores, args.compact_variant)
         torch.npu.synchronize()
         compact_errors = compare_compact(gpu, expected_compact, cache_before)
         cpu = expected_compact
@@ -653,12 +663,12 @@ def _graph_case(args: argparse.Namespace, device: torch.device, pos: int, base: 
     replay_before = {name: gpu[name].clone() for name in CACHE}
 
     verify_graph = graph_of(lambda: verify(gpu, args.tile_v, args.cores, args.status_variant))
-    compact_graph = graph_of(lambda: compact(gpu, args.cores))
+    compact_graph = graph_of(lambda: compact(gpu, args.cores, args.compact_variant))
     cursor_graph = graph_of(lambda: cursor(cur, args.mtp))
     combined_graph = graph_of(
         lambda: (
             verify(gpu, args.tile_v, args.cores, args.status_variant),
-            compact(gpu, args.cores),
+            compact(gpu, args.cores, args.compact_variant),
             cursor(cur, args.mtp),
         )
     )
@@ -831,46 +841,81 @@ def capacity_perf(args: argparse.Namespace, device: torch.device, workload: str)
     # Establish correctness on the exact benchmark inputs before timing.
     expected = verify_reference(cpu)
     expected_compact = compact_reference(expected)
+    flushed_slots = cpu["slots"][(cpu["flush"] == 1) & (cpu["positions"] > 0)]
+    untouched = torch.ones(cpu["checkpoint"].size(0), dtype=torch.bool)
+    untouched[flushed_slots] = False
     timings = {}
-    for variant in (1, 2):
+    paths = (
+        (("cube", 2, 1), ("cube_batched_compact", 2, 2))
+        if args.compact_variant == 2
+        else (("v12", 1, 1), ("cube", 2, 1))
+    )
+    for path, verify_variant, compact_variant in paths:
         reset_combined()
-        verify(gpu, 64, args.cores, variant)
+        verify(gpu, 64, args.cores, verify_variant)
         torch.npu.synchronize()
         verify_errors = compare_verify(gpu, expected)
         ring_before = {name: gpu[name].cpu().clone() for name in CACHE if name != "checkpoint"}
-        compact(gpu, args.cores)
+        compact(gpu, args.cores, compact_variant)
         cursor(cur, width)
         torch.npu.synchronize()
         compact_errors = compare_compact(gpu, expected_compact, ring_before)
         for name, expected_tensor in cursor_expected.items():
             torch.testing.assert_close(cur[name].cpu(), expected_tensor, atol=0, rtol=0)
 
-        def combined(variant=variant):
-            verify(gpu, 64, args.cores, variant)
-            compact(gpu, args.cores)
+        def combined(verify_variant=verify_variant, compact_variant=compact_variant):
+            verify(gpu, 64, args.cores, verify_variant)
+            compact(gpu, args.cores, compact_variant)
             cursor(cur, width)
 
         measurements = {}
         for name, call, reset in (
-            ("verify", partial(verify, gpu, 64, args.cores, variant), reset_replay),
-            ("compact", partial(compact, gpu, args.cores), reset_replay),
+            ("verify", partial(verify, gpu, 64, args.cores, verify_variant), reset_replay),
+            ("compact", partial(compact, gpu, args.cores, compact_variant), reset_replay),
             ("cursor", partial(cursor, cur, width), reset_cursor),
             ("combined", combined, reset_combined),
         ):
             reset()
             graph = graph_of(call)
+            if name == "combined":
+                reset()
+                graph.replay()
+                torch.npu.synchronize()
+                compare_verify({**gpu, "checkpoint": before["checkpoint"]}, expected)
+                compare_compact(gpu, expected_compact, ring_before)
+                torch.testing.assert_close(
+                    gpu["checkpoint"].cpu().view(torch.int16)[untouched],
+                    cpu["checkpoint"].view(torch.int16)[untouched],
+                    atol=0,
+                    rtol=0,
+                )
+                for field, expected_tensor in cursor_expected.items():
+                    torch.testing.assert_close(cur[field].cpu(), expected_tensor, atol=0, rtol=0)
             timing = time_graph(graph, reset, warmup=args.warmup, iterations=args.iterations)
             if name == "combined":
                 timing["rows_per_second"] = args.batch * 1e6 / timing["p50_us"]
                 timing["candidate_tokens_per_second"] = int(cpu["lengths"].sum()) * 1e6 / timing["p50_us"]
             measurements[name] = timing
-        timings["v12" if variant == 1 else "cube"] = {
+        timings[path] = {
             "verify_errors": verify_errors,
             "compact_errors": compact_errors,
             "graph_replay_us": measurements,
         }
-    baseline, candidate = (timings[name]["graph_replay_us"]["combined"] for name in ("v12", "cube"))
+    base_path, candidate_path = (path[0] for path in paths)
+    baseline, candidate = (timings[path]["graph_replay_us"]["combined"] for path in (base_path, candidate_path))
     comparable = baseline["timing_source"] == candidate["timing_source"]
+    baseline_compact = timings[base_path]["graph_replay_us"]["compact"]
+    candidate_compact = timings[candidate_path]["graph_replay_us"]["compact"]
+    same_compact_timer = baseline_compact["timing_source"] == candidate_compact["timing_source"]
+    if args.compact_variant == 2:
+        # Allow 5% wall-clock jitter. Require a real p50 improvement when
+        # the workload folds history, and keep p90 within the same budget.
+        p50_limit = 1.05 if workload == "cold" else 1.0
+        passed = (
+            candidate["p50_us"] < p50_limit * baseline["p50_us"] and candidate["p90_us"] <= 1.05 * baseline["p90_us"]
+        )
+    else:
+        passed = candidate["p50_us"] < baseline["p50_us"] and candidate["p90_us"] <= baseline["p90_us"]
     return {
         "workload": workload,
         "rows": args.batch,
@@ -881,23 +926,20 @@ def capacity_perf(args: argparse.Namespace, device: torch.device, workload: str)
         "flush_history_tokens": int((cpu["flush"] * cpu["positions"]).sum()),
         "cursor_metadata_exact": True,
         "timings": timings,
-        "combined_vs_v12": {
+        ("combined_vs_cube" if args.compact_variant == 2 else "combined_vs_v12"): {
             "p50_speedup": baseline["p50_us"] / candidate["p50_us"] if comparable else None,
             "p90_speedup": baseline["p90_us"] / candidate["p90_us"] if comparable else None,
-            "status": (
-                "PASSED"
-                if candidate["p50_us"] < baseline["p50_us"] and candidate["p90_us"] <= baseline["p90_us"]
-                else "FAILED"
-            )
-            if comparable
-            else "INCOMPARABLE",
+            "status": ("PASSED" if passed else "FAILED") if comparable else "INCOMPARABLE",
         },
+        "compact_p50_speedup": (
+            baseline_compact["p50_us"] / candidate_compact["p50_us"] if same_compact_timer else None
+        ),
     }
 
 
 def add_capacity_scaling(report: dict, baseline_path: Path) -> None:
     baseline = json.loads(baseline_path.read_text())
-    matching_fields = ("stage", "mtp", "cores", "tile_v", "device_name", "source_commit")
+    matching_fields = ("stage", "mtp", "cores", "tile_v", "device_name", "source_commit", "compact_variant")
     if (
         baseline["status"] != "PASSED"
         or baseline["batch"] != 32
@@ -931,6 +973,7 @@ def main() -> None:
         "batch": args.batch,
         "tile_v": args.tile_v,
         "cores": args.cores,
+        "compact_variant": args.compact_variant,
         "device": args.device,
         "stage": args.stage,
         "status_variant": args.status_variant,
@@ -997,16 +1040,18 @@ def main() -> None:
             report["graph"] = graph_and_perf(args, device, args.stage in ("perf", "all"))
         if args.stage == "capacity_perf":
             report["tile_v"] = 64
-            report["status_variant"] = [1, 2]
+            report["status_variant"] = 2 if args.compact_variant == 2 else [1, 2]
             report["capacity_perf"] = []
-            for workload in ("cold", "mixed", "full_flush"):
+            workloads = (args.capacity_workload,) if args.capacity_workload else ("cold", "mixed", "full_flush")
+            for workload in workloads:
                 report["active_workload"] = workload
                 report["capacity_perf"].append(capacity_perf(args, device, workload))
             del report["active_workload"]
             if args.capacity_b32:
                 add_capacity_scaling(report, args.capacity_b32)
             if args.batch >= 64:
-                gates = [case["combined_vs_v12"]["status"] for case in report["capacity_perf"]]
+                comparison = "combined_vs_cube" if args.compact_variant == 2 else "combined_vs_v12"
+                gates = [case[comparison]["status"] for case in report["capacity_perf"]]
                 report["high_batch_gate"] = "PASSED" if all(gate == "PASSED" for gate in gates) else "FAILED"
         report["status"] = "PASSED"
     except Exception:

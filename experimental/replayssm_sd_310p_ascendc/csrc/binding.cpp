@@ -12,7 +12,7 @@ TORCH_LIBRARY(replayssm_sd_310p, m) {
         "float scale, int tile_v=32, int cores=7, Tensor? ring_slots=None, int status_variant=0) -> ()");
   m.def("compact_(Tensor(a!) checkpoint, Tensor d_cache, Tensor k_cache, Tensor g_cache, "
         "Tensor slots, Tensor positions, Tensor bases, Tensor flush, Tensor(b!) status, "
-        "int tile_v=32, int cores=7, Tensor? ring_slots=None) -> ()");
+        "int tile_v=32, int cores=7, Tensor? ring_slots=None, int variant=1) -> ()");
   m.def("cursor_(Tensor(a!) write_pos, Tensor(b!) cache_base, Tensor(c!) is_flush, "
         "Tensor accepted, Tensor slots, Tensor do_reset, Tensor(d!) status, "
         "int logical_limit=16, int max_spec_len=3, int ring_len=32) -> ()");
@@ -39,7 +39,7 @@ TORCH_LIBRARY_IMPL(replayssm_sd_310p, Meta, m) {
                          const at::Tensor&, const at::Tensor&, const at::Tensor&,
                          const at::Tensor&, const at::Tensor&, const at::Tensor&,
                          int64_t, int64_t,
-                         c10::optional<at::Tensor>) {});
+                         c10::optional<at::Tensor>, int64_t) {});
   m.impl("cursor_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, int64_t, int64_t, int64_t) {});

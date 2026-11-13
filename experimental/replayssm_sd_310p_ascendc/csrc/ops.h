@@ -22,7 +22,7 @@ void compact(const at::Tensor& checkpoint, const at::Tensor& d_cache,
              const at::Tensor& slots, const at::Tensor& positions,
              const at::Tensor& bases, const at::Tensor& flush,
              const at::Tensor& status, int64_t tile_v, int64_t cores,
-             c10::optional<at::Tensor> ring_slots);
+             c10::optional<at::Tensor> ring_slots, int64_t variant);
 
 void cursor(const at::Tensor& write_pos, const at::Tensor& cache_base,
             const at::Tensor& is_flush, const at::Tensor& accepted,
