@@ -14,6 +14,7 @@
 #include "aclrtlaunch_replayssm_sd_310p_verify6_block_status.h"
 #include "aclrtlaunch_replayssm_sd_310p_verify8.h"
 #include "aclrtlaunch_replayssm_sd_310p_verify8_block_status.h"
+#include "aclrtlaunch_replayssm_sd_310p_verify_cube.h"
 
 namespace replayssm_sd_310p {
 void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -91,8 +92,12 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(value_heads % heads_per_status_block == 0,
               "value heads must align to a 32-byte status block");
   TORCH_CHECK(cores >= 1 && cores <= 7, "310P pilot cores must be in [1,7]");
-  TORCH_CHECK(status_variant == 0 || status_variant == 1,
-              "status_variant must be 0 (V11) or 1 (aligned 32B block)");
+  TORCH_CHECK(status_variant >= 0 && status_variant <= 2,
+              "status_variant must be 0 (V11), 1 (V12), or 2 (Cube)");
+  if (status_variant == 2) {
+    TORCH_CHECK(heads == 8 && value_heads == 16 && tile_v == 64 && (tokens == 4 || tokens == 8),
+                "Cube verify requires HK=8, HV=16, MTP3/7 and tile_v=64 status layout");
+  }
   TORCH_CHECK(std::isfinite(scale) && scale > 0, "scale must be finite and positive");
 
   const c10_npu::OptionalNPUGuard guard(q.device());
@@ -101,6 +106,20 @@ void verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   // heads sharing that block before distributing groups across cores.
   const auto block_dim = static_cast<uint32_t>(std::min<int64_t>(
       cores, batch * value_heads / heads_per_status_block));
+  if (status_variant == 2) {
+    const auto result = aclrtlaunch_replayssm_sd_310p_verify_cube(
+        block_dim, stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
+        beta.data_ptr(), checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(),
+        g_cache.data_ptr(), slots.data_ptr(), ring_ids.data_ptr(), positions.data_ptr(),
+        bases.data_ptr(), lengths.data_ptr(), out.data_ptr(), status.data_ptr(),
+        static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots),
+        static_cast<uint32_t>(num_ring_slots), static_cast<uint64_t>(checkpoint.stride(0)),
+        static_cast<uint64_t>(d_cache.stride(0)), static_cast<uint64_t>(k_cache.stride(0)),
+        static_cast<uint64_t>(g_cache.stride(0)), static_cast<float>(scale),
+        static_cast<uint32_t>(tokens));
+    TORCH_CHECK(result == ACL_SUCCESS, "ReplaySSM SD 310P Cube verify launch failed: ", result);
+    return;
+  }
 #define REPLAY_310P_ARGS \
   block_dim, stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), \
       beta.data_ptr(), checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), \

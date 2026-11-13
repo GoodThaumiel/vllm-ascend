@@ -18,6 +18,38 @@ from experimental.replayssm_sd_310p_ascendc.reference import (
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_projected_verify_matches_dense_recurrence(self):
+        for mtp, length, pos, base in ((3, 4, 0, 0), (7, 1, 7, 29), (7, 8, 16, 31)):
+            with self.subTest(mtp=mtp, length=length, pos=pos, base=base):
+                case = make_case(mtp=mtp, pos=pos, base=base)
+                case["lengths"].fill_(length)
+                expected = verify_reference(case)
+                history = (torch.arange(pos) + base) % RING
+                for key_head in range(8):
+                    keys = case["k"][0, :length, key_head].double()
+                    queries = case["q"][0, :length, key_head].double()
+                    panel = torch.cat((keys, queries))
+                    history_dots = case["k_cache"][1, key_head, history].double() @ panel.T
+                    candidate_dots = keys @ panel.T
+                    for head in (2 * key_head, 2 * key_head + 1):
+                        projected = case["checkpoint"][1, head].double() @ panel.T
+                        for i, physical in enumerate(history):
+                            alpha = case["g_cache"][1, head, physical].double().exp()
+                            delta = case["d_cache"][1, head, physical].double()
+                            projected = alpha * projected + delta[:, None] * history_dots[i]
+                        for token in range(length):
+                            projected *= case["g"][0, token, head].double().exp()
+                            value = case["v"][0, token, head].double()
+                            beta = case["beta"][0, token, head].double()
+                            delta = beta * (value - projected[:, token])
+                            projected += delta[:, None] * candidate_dots[token]
+                            out = (projected[:, length + token] * 128**-0.5).half()
+                            physical = (base + pos + token) % RING
+                            torch.testing.assert_close(out, expected["out"][0, token, head], atol=0, rtol=0)
+                            torch.testing.assert_close(
+                                delta.half(), expected["d_cache"][1, head, physical], atol=0, rtol=0
+                            )
+
     def test_candidate_width_and_fp16_dtypes(self):
         for mtp in (3, 5, 7):
             with self.subTest(mtp=mtp):

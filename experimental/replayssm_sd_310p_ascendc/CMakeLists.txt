@@ -33,6 +33,7 @@ ascendc_library(replayssm_sd_310p_kernel SHARED
     kernels/verify4_block_status.cpp
     kernels/verify6_block_status.cpp
     kernels/verify8_block_status.cpp
+    kernels/verify_cube.cpp
     kernels/compact.cpp
     kernels/cursor.cpp
     kernels/io_probe.cpp

@@ -51,11 +51,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(32, 64), default=32)
     parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
-    parser.add_argument("--status-variant", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--status-variant", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.status_variant == 2 and (args.mtp not in (3, 7) or args.tile_v != 64):
+        parser.error("Cube verify (--status-variant 2) requires MTP3/7 and --tile-v 64")
+    return args
 
 
 def verify(case: dict[str, torch.Tensor], tile_v: int, cores: int, status_variant: int = 0) -> None:
@@ -412,7 +415,7 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
     if args.batch > 1:
         # Keep the normal padding case valid, then test the reserved-slot
         # error explicitly rather than silently accepting malformed metadata.
-        invalid = make_case(mtp=args.mtp, batch=args.batch, pos=0, padding=True)
+        invalid = make_case(mtp=args.mtp, batch=args.batch, pos=0, tile_v=args.tile_v, padding=True)
         invalid["flush"][-1] = 1
         invalid_gpu = clone(invalid, device)
         invalid_expected = compact_reference(invalid)
@@ -429,6 +432,14 @@ def smoke(args: argparse.Namespace, device: torch.device) -> list[dict]:
                 }
             }
         )
+        if args.status_variant == 2:
+            invalid["lengths"][-1] = 1
+            invalid_verify = clone(invalid, device)
+            verify(invalid_verify, args.tile_v, args.cores, args.status_variant)
+            torch.npu.synchronize()
+            records.append(
+                {"case": "invalid_verify_padding", "verify": compare_verify(invalid_verify, verify_reference(invalid))}
+            )
     records.append({"invalid_bindings": invalid_bindings(args, device)})
     return records
 
@@ -450,7 +461,7 @@ def invalid_bindings(args: argparse.Namespace, device: torch.device) -> list[str
         else:
             raise AssertionError(f"{label} unexpectedly accepted")
     try:
-        verify(case, args.tile_v, args.cores, 2)
+        verify(case, args.tile_v, args.cores, 3)
     except RuntimeError:
         checks.append("verify_status_variant")
     else:
