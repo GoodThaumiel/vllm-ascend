@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import time
 import traceback
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -21,6 +22,7 @@ from reference import (
     compact_reference,
     cursor_reference,
     fp16_error,
+    make_capacity_case,
     make_case,
     verify_reference,
 )
@@ -43,6 +45,7 @@ def parse_args() -> argparse.Namespace:
             "sequence",
             "graph",
             "perf",
+            "capacity_perf",
             "all",
         ),
         default="smoke",
@@ -55,8 +58,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--capacity-b32", type=Path, help="Compare scaling against a matching B32 capacity_perf report")
     args = parser.parse_args()
-    if args.status_variant == 2 and (args.mtp not in (3, 7) or args.tile_v != 64):
+    if args.stage == "capacity_perf" and (args.batch not in (32, 64, 128) or args.mtp not in (3, 7)):
+        parser.error("capacity_perf requires B32/B64/B128 and MTP3/7")
+    if args.warmup < 0 or args.iterations < 1:
+        parser.error("--warmup must be non-negative and --iterations must be positive")
+    if args.capacity_b32 and (args.stage != "capacity_perf" or args.batch == 32):
+        parser.error("--capacity-b32 requires capacity_perf at B64 or B128")
+    if args.stage != "capacity_perf" and args.status_variant == 2 and (args.mtp not in (3, 7) or args.tile_v != 64):
         parser.error("Cube verify (--status-variant 2) requires MTP3/7 and --tile-v 64")
     return args
 
@@ -777,6 +787,142 @@ def graph_and_perf(args: argparse.Namespace, device: torch.device, perf: bool) -
     ]
 
 
+def capacity_perf(args: argparse.Namespace, device: torch.device, workload: str) -> dict:
+    cpu = make_capacity_case(args.mtp, args.batch, workload)
+    gpu = clone(cpu, device)
+    before = {name: gpu[name].clone() for name in CACHE}
+    cur_cpu = cursor_case(cpu, args.mtp)
+    cur_cpu["accepted"].copy_(cpu["lengths"])
+    cur = clone(cur_cpu, device)
+    cursor_before = {name: cur[name].clone() for name in ("write_pos", "cache_base", "is_flush", "status")}
+    width = args.mtp + 1
+    cursor_expected = dict(
+        zip(
+            cursor_before,
+            cursor_reference(
+                cur_cpu["write_pos"],
+                cur_cpu["cache_base"],
+                cur_cpu["is_flush"],
+                cur_cpu["accepted"],
+                cur_cpu["slots"],
+                cur_cpu["do_reset"],
+                width,
+            ),
+        )
+    )
+
+    torch.testing.assert_close(cursor_expected["status"], torch.zeros_like(cur_cpu["status"]))
+
+    def reset_replay():
+        for name in CACHE:
+            gpu[name].copy_(before[name])
+        gpu["out"].zero_()
+        gpu["verify_status"].fill_(-1)
+        gpu["compact_status"].fill_(-1)
+
+    def reset_cursor():
+        for name, value in cursor_before.items():
+            cur[name].copy_(value)
+
+    def reset_combined():
+        reset_replay()
+        reset_cursor()
+
+    # Establish correctness on the exact benchmark inputs before timing.
+    expected = verify_reference(cpu)
+    expected_compact = compact_reference(expected)
+    timings = {}
+    for variant in (1, 2):
+        reset_combined()
+        verify(gpu, 64, args.cores, variant)
+        torch.npu.synchronize()
+        verify_errors = compare_verify(gpu, expected)
+        ring_before = {name: gpu[name].cpu().clone() for name in CACHE if name != "checkpoint"}
+        compact(gpu, args.cores)
+        cursor(cur, width)
+        torch.npu.synchronize()
+        compact_errors = compare_compact(gpu, expected_compact, ring_before)
+        for name, expected_tensor in cursor_expected.items():
+            torch.testing.assert_close(cur[name].cpu(), expected_tensor, atol=0, rtol=0)
+
+        def combined(variant=variant):
+            verify(gpu, 64, args.cores, variant)
+            compact(gpu, args.cores)
+            cursor(cur, width)
+
+        measurements = {}
+        for name, call, reset in (
+            ("verify", partial(verify, gpu, 64, args.cores, variant), reset_replay),
+            ("compact", partial(compact, gpu, args.cores), reset_replay),
+            ("cursor", partial(cursor, cur, width), reset_cursor),
+            ("combined", combined, reset_combined),
+        ):
+            reset()
+            graph = graph_of(call)
+            timing = time_graph(graph, reset, warmup=args.warmup, iterations=args.iterations)
+            if name == "combined":
+                timing["rows_per_second"] = args.batch * 1e6 / timing["p50_us"]
+                timing["candidate_tokens_per_second"] = int(cpu["lengths"].sum()) * 1e6 / timing["p50_us"]
+            measurements[name] = timing
+        timings["v12" if variant == 1 else "cube"] = {
+            "verify_errors": verify_errors,
+            "compact_errors": compact_errors,
+            "graph_replay_us": measurements,
+        }
+    baseline, candidate = (timings[name]["graph_replay_us"]["combined"] for name in ("v12", "cube"))
+    comparable = baseline["timing_source"] == candidate["timing_source"]
+    return {
+        "workload": workload,
+        "rows": args.batch,
+        "candidate_tokens": int(cpu["lengths"].sum()),
+        "length_histogram": cpu["lengths"].bincount(minlength=width + 1).tolist(),
+        "position_histogram": cpu["positions"].bincount(minlength=17).tolist(),
+        "flush_rows": int(cpu["flush"].sum()),
+        "flush_history_tokens": int((cpu["flush"] * cpu["positions"]).sum()),
+        "cursor_metadata_exact": True,
+        "timings": timings,
+        "combined_vs_v12": {
+            "p50_speedup": baseline["p50_us"] / candidate["p50_us"] if comparable else None,
+            "p90_speedup": baseline["p90_us"] / candidate["p90_us"] if comparable else None,
+            "status": (
+                "PASSED"
+                if candidate["p50_us"] < baseline["p50_us"] and candidate["p90_us"] <= baseline["p90_us"]
+                else "FAILED"
+            )
+            if comparable
+            else "INCOMPARABLE",
+        },
+    }
+
+
+def add_capacity_scaling(report: dict, baseline_path: Path) -> None:
+    baseline = json.loads(baseline_path.read_text())
+    matching_fields = ("stage", "mtp", "cores", "tile_v", "device_name", "source_commit")
+    if (
+        baseline["status"] != "PASSED"
+        or baseline["batch"] != 32
+        or any(baseline[key] != report[key] for key in matching_fields)
+    ):
+        raise ValueError("B32 scaling report must match this run's stage, MTP, cores, tile, device type and source")
+    baseline_cases = {case["workload"]: case for case in baseline["capacity_perf"]}
+    for case in report["capacity_perf"]:
+        case["scaling_vs_b32"] = {}
+        for variant, measurements in case["timings"].items():
+            low = baseline_cases[case["workload"]]["timings"][variant]["graph_replay_us"]
+            scaling = {}
+            for operator, high in measurements["graph_replay_us"].items():
+                ref = low[operator]
+                if ref["timing_source"] != high["timing_source"]:
+                    scaling[operator] = {"status": "INCOMPARABLE"}
+                    continue
+                ratio = high["p50_us"] / ref["p50_us"]
+                scaling[operator] = {
+                    "p50_latency_ratio": ratio,
+                    "p50_work_per_second_ratio": (report["batch"] / 32) / ratio,
+                }
+            case["scaling_vs_b32"][variant] = scaling
+
+
 def main() -> None:
     args = parse_args()
     report = {
@@ -849,12 +995,27 @@ def main() -> None:
             report["sequence"] = sequence(args, device)
         if args.stage in ("graph", "perf", "all"):
             report["graph"] = graph_and_perf(args, device, args.stage in ("perf", "all"))
+        if args.stage == "capacity_perf":
+            report["tile_v"] = 64
+            report["status_variant"] = [1, 2]
+            report["capacity_perf"] = []
+            for workload in ("cold", "mixed", "full_flush"):
+                report["active_workload"] = workload
+                report["capacity_perf"].append(capacity_perf(args, device, workload))
+            del report["active_workload"]
+            if args.capacity_b32:
+                add_capacity_scaling(report, args.capacity_b32)
+            if args.batch >= 64:
+                gates = [case["combined_vs_v12"]["status"] for case in report["capacity_perf"]]
+                report["high_batch_gate"] = "PASSED" if all(gate == "PASSED" for gate in gates) else "FAILED"
         report["status"] = "PASSED"
     except Exception:
         report["error"] = traceback.format_exc()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-    summary = {key: value for key, value in report.items() if key not in ("smoke", "sequence", "graph")}
+    summary = {
+        key: value for key, value in report.items() if key not in ("smoke", "sequence", "graph", "capacity_perf")
+    }
     print(json.dumps(summary, ensure_ascii=False))
     if report["status"] != "PASSED":
         raise SystemExit(1)

@@ -145,26 +145,61 @@ for mtp in 3 7; do
 done
 ```
 
-精度通过后，先测 B32，再扩到 B64/B128。使用同一空闲设备，每轮
-生成同一组 Q/K/V/g/beta、checkpoint、ring 和 metadata。
-`status_variant=1` 是 V12，`2` 是整窗 Cube。可给下方命令加
-`msprof --output=... --ai-core=on --aic-metrics=PipeUtilization` 前缀，
-用 kernel 名和 timeline 区分独立 verify 与三算子组合的 launch。
+## 高并发性能验收
+
+通过上面的精度测试后，在同一张空闲卡依次跑 B32、B64、B128。
+如果已有整窗 Cube verify 首版的库，可直接沿用。本节只需要更新 Python 脚本。
 
 ```bash
-for batch in 32 64 128; do
-  for mtp in 3 7; do
-    for variant in 1 2; do
-      python3 "$op/run.py" --library "$lib" --mtp "$mtp" --batch "$batch" \
-        --stage perf --tile-v 64 --cores 7 --status-variant "$variant" \
-        --warmup 20 --iterations 100 \
-        --output "$results/v$variant-mtp$mtp-b$batch.json"
-    done
+set -e
+op=experimental/replayssm_sd_310p_ascendc
+lib="$op/build-cube-verify/libreplayssm_sd_310p_torch.so"
+results=/tmp/replayssm-310p-cube-capacity
+mkdir -p "$results"
+for mtp in 3 7; do
+  baseline="$results/mtp$mtp-b32.json"
+  for batch in 32 64 128; do
+    scaling=()
+    if [ "$batch" -ne 32 ]; then
+      scaling=(--capacity-b32 "$baseline")
+    fi
+    python3 "$op/run.py" --library "$lib" --mtp "$mtp" --batch "$batch" \
+      --stage capacity_perf --cores 7 --warmup 20 --iterations 100 \
+      "${scaling[@]}" --output "$results/mtp$mtp-b$batch.json"
   done
 done
 ```
 
-回传首个编译或运行错误、精度 JSON 和同口径 p50/p90。
-重点比较 `verify` 及 `combined`，同时记录 compact 和 cursor。
-对比 pos0、pos12 两种 flush、pos16 flush。首次检查 FP32 L0C
-搬出后的列布局、短窗零填充、ring 跨尾和 status 是否与 reference 一致。
+每份报告在同一组输入上比较 V12 与整窗 Cube verify。两边使用相同的
+compact 和 cursor。分别测 verify、compact、cursor，以及三者放进
+同一张图的实际重放时间。每个用例先检查 verify、compact 和 cursor
+的输出与状态，再计时。缓存重置放在计时区间外。
+
+- `cold` 使用满窗、空历史和无 flush，用来观察固定开销与批次扩展。
+- `mixed` 混用四种窗口长度、四种历史长度及不同 flush 状态。各 batch
+  重复同一行分布。JSON 记录窗口和历史直方图、flush 行数及折叠历史总量。
+- `full_flush` 使用满窗、16 条历史和跨 ring 尾的 flush，用来观察重路径上限。
+  这组是压力测试，实际服务的分布需要从运行日志采样。
+
+查看 `high_batch_gate`。B64/B128 的各用例要求组合图 p50 低于 V12，
+且 p90 不增加。脚本把性能门槛单独写进 JSON，以便继续收集后续 batch
+的数据。NPU event 计时失败时会标明 wall clock，两种计时来源分开比较。
+
+同时查看 `scaling_vs_b32`。其中 `p50_work_per_second_ratio` 用批次倍率除以
+时延倍率。若 B128 的时延是 B32 的 10 倍，即使每步处理 4 倍请求，
+单位时间的处理量也只有 B32 的 40%。组合路径的比值低于 1 时，先定位
+verify、compact、cursor 中各自的增长，再评估能否提高服务的并发上限。
+
+回传六份 JSON。若 B128 的单位时间处理量下降，再对下降最大的 workload
+抓 msprof，回传对应 kernel 的 task duration、Scalar、Vector、MTE 和
+Cube 时间。用于决定是否继续优化 compact 或重新划分 verify 的 task。
+
+上面的候选 tokens/s 是算子指标。服务验收仍用 TP2、W8A8、ISL 2k、
+OSL 400，在相同显存预算和同一档 MTP 下对照。以实际输出 tokens/s 为主，
+同时记录有效 running、waiting、preemption、TTFT 和 TPOT。粗略看，若每轮
+实际接受数接近，有效并发的倍率需要超过整轮 decode 时延的倍率，才能靠
+提高并发换来更高的输出吞吐。
+
+需要补原生 V310 的同输入算子基线时，使用 `--stage perf --tile-v 64
+--status-variant 2`。该入口使用固定满窗，并在计时前为原生路径物化初始
+state。它与上面混合窗口测试的负载不同，报告应分开比较。

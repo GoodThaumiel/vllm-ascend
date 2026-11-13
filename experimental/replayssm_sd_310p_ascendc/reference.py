@@ -73,6 +73,27 @@ def clone(case: dict[str, torch.Tensor], device: str | torch.device = "cpu") -> 
     return {key: value.to(device).clone() for key, value in case.items()}
 
 
+def make_capacity_case(mtp: int, batch: int, workload: str) -> dict[str, torch.Tensor]:
+    """Use the same case for both kernels and the same row pattern at every batch."""
+    width = mtp + 1
+    if workload == "cold":
+        return make_case(mtp=mtp, batch=batch, pos=0, base=0, tile_v=64)
+    case = make_case(mtp=mtp, batch=batch, pos=16, base=29, tile_v=64)
+    if workload == "full_flush":
+        case["flush"].fill_(1)
+    elif workload == "mixed":
+        row = torch.arange(batch, dtype=torch.int32)
+        # Cross the four history positions with four window lengths.
+        positions = (0, 4, 8, 12) if mtp == 3 else (0, 1, 4, 8)
+        lengths = (1, 2, width // 2 + 1, width)
+        case["positions"].copy_(torch.tensor(positions)[row % 4])
+        case["lengths"].copy_(torch.tensor(lengths)[row // 4 % 4])
+        case["flush"].copy_(case["positions"] + 2 * width > HISTORY)
+    else:
+        raise ValueError(f"Unknown capacity workload: {workload}")
+    return case
+
+
 def verify_reference(case: dict[str, torch.Tensor], scale: float = DIM**-0.5) -> dict[str, torch.Tensor]:
     result = clone(case)
     result["out"].zero_()

@@ -12,12 +12,26 @@ from experimental.replayssm_sd_310p_ascendc.reference import (
     compact_reference,
     cursor_reference,
     fp16_error,
+    make_capacity_case,
     make_case,
     verify_reference,
 )
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_capacity_mixed_workload_preserves_row_distribution(self):
+        for mtp in (3, 7):
+            with self.subTest(mtp=mtp):
+                width = mtp + 1
+                case = make_capacity_case(mtp, 32, "mixed")
+                rows = torch.stack([case[name] for name in ("positions", "lengths", "flush")], dim=1)
+                self.assertEqual(len(rows.unique(dim=0)), 16)
+                torch.testing.assert_close(rows[:16], rows[16:])
+                self.assertGreater(int(case["flush"].sum()), 0)
+                self.assertLess(int(case["flush"].sum()), 32)
+                self.assertEqual(int(case["lengths"].max()), width)
+                self.assertTrue(torch.all(case["positions"] + case["lengths"] <= HISTORY))
+
     def test_projected_verify_matches_dense_recurrence(self):
         for mtp, length, pos, base in ((3, 4, 0, 0), (7, 1, 7, 29), (7, 8, 16, 31)):
             with self.subTest(mtp=mtp, length=length, pos=pos, base=base):
