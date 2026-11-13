@@ -1,4 +1,4 @@
-"""Compare original and grouped Cube RGDR device task times from msprof CSVs."""
+"""Compare two RGDR device task times from msprof CSVs."""
 
 from __future__ import annotations
 
@@ -35,16 +35,18 @@ def summarize(samples: list[float]) -> dict[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("baseline", type=Path, help="original cube-deq op_summary CSV")
+    parser.add_argument("baseline", type=Path, help="baseline op_summary CSV")
     parser.add_argument("candidate", type=Path, help="cube-grouped op_summary CSV")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--baseline-kernel", default="rgdr_v310_cube_fp16")
+    parser.add_argument("--candidate-kernel", default="rgdr_v310_cube_grouped")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations < 1:
         parser.error("--warmup must be non-negative and --iterations must be positive")
     try:
-        baseline = summarize(task_times(args.baseline, "rgdr_v310_cube_fp16", args.warmup, args.iterations))
-        candidate = summarize(task_times(args.candidate, "rgdr_v310_cube_grouped_fp16", args.warmup, args.iterations))
+        baseline = summarize(task_times(args.baseline, args.baseline_kernel, args.warmup, args.iterations))
+        candidate = summarize(task_times(args.candidate, args.candidate_kernel, args.warmup, args.iterations))
     except (OSError, ValueError) as error:
         parser.error(str(error))
     passed = candidate["p50_us"] < baseline["p50_us"] and candidate["p90_us"] <= baseline["p90_us"]

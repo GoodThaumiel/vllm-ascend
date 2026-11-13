@@ -89,6 +89,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Optional path to a JSON config for the 310P single-request eager trace.
     # Default: unset. The path itself is not sensitive. Trace data contains tokens and model tensors.
     "VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG": lambda: os.getenv("VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG"),
+    # Absolute path to the experimental 310P3 grouped RGDR Torch library.
+    # Unset uses native V310. The path is local and is not sensitive.
+    "VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY": lambda: os.getenv("VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY"),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

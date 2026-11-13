@@ -1,5 +1,9 @@
 import unittest
+from argparse import Namespace
 
+import torch
+
+from experimental.rgdr_v310_ablation.bench import make_inputs
 from experimental.rgdr_v310_ablation.task_mapping import assigned_tasks
 
 
@@ -31,3 +35,20 @@ class TestTaskMapping(unittest.TestCase):
         for args in (([4], 0, 7), ([4], 16, 0), ([-1], 16, 7)):
             with self.assertRaises(ValueError):
                 assigned_tasks(*args)
+
+
+class TestPackedInputs(unittest.TestCase):
+    def test_ragged_mtp1_to_7_uses_same_native_slots(self):
+        for mtp in range(1, 8):
+            with self.subTest(mtp=mtp):
+                args = Namespace(mtp=mtp, batch=3, ragged=True, fp16_gate_input=True, variant="native")
+                native = make_inputs(args, torch.device("cpu"))
+                args.variant = "cube-grouped"
+                grouped = make_inputs(args, torch.device("cpu"))
+                self.assertEqual(grouped["slot_table"].shape, (args.batch, mtp + 1))
+                for row, length in enumerate(native["lengths"].tolist()):
+                    start, end = native["offsets"][row : row + 2].tolist()
+                    torch.testing.assert_close(grouped["slot_table"][row, :length], native["indices"][start:end])
+                    self.assertTrue(1 <= int(grouped["accepted"][row]) <= length)
+                torch.testing.assert_close(native["state"], grouped["state"], atol=0, rtol=0)
+                torch.testing.assert_close(native["g"], grouped["g"].float(), atol=0, rtol=0)

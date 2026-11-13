@@ -30,11 +30,13 @@ __aicore__ inline void Sync()
     WaitFlag<Event>(id);
 }
 
+template <bool PACKED = false>
 class GroupedFp16RGDR {
 public:
     __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate,
                                 GM_ADDR state, GM_ADDR indices, GM_ADDR accepted, GM_ADDR out,
-                                uint32_t batch, uint32_t window, uint32_t slots, float scale)
+                                uint32_t batch, uint32_t window, uint32_t slots, float scale,
+                                GM_ADDR rowOffsets = nullptr, uint32_t tokens = 0, uint64_t stateStride = HV * STATE)
     {
         q_.SetGlobalBuffer((__gm__ half*)q);
         k_.SetGlobalBuffer((__gm__ half*)k);
@@ -45,6 +47,11 @@ public:
         indices_.SetGlobalBuffer((__gm__ int32_t*)indices);
         accepted_.SetGlobalBuffer((__gm__ int32_t*)accepted);
         out_.SetGlobalBuffer((__gm__ half*)out);
+        if constexpr (PACKED) {
+            rowOffsets_.SetGlobalBuffer((__gm__ int32_t*)rowOffsets);
+            tokens_ = tokens;
+            stateStride_ = stateStride;
+        }
         batch_ = batch;
         window_ = window;
         slots_ = slots;
@@ -81,39 +88,90 @@ public:
 
     __aicore__ inline void Process()
     {
+        if constexpr (PACKED) {
+            const int32_t end = rowOffsets_.GetValue(batch_);
+            if (end < 0 || static_cast<uint32_t>(end) > tokens_) {
+                return;
+            }
+            // Graph padding can leave a tail outside the packed query rows.
+            if (static_cast<uint32_t>(end) < tokens_) {
+                ZeroOutputTail(static_cast<uint32_t>(end));
+            }
+        }
         for (uint32_t task = GetBlockIdx(); task < batch_ * HK; task += GetBlockNum()) {
             const uint32_t row = task / HK;
             const uint32_t keyHead = task % HK;
             const uint32_t head = keyHead * PAIR;
-            const uint32_t start = row * window_;
+            uint32_t start = row * window_;
+            uint32_t length = window_;
+            if constexpr (PACKED) {
+                const int32_t begin = rowOffsets_.GetValue(row);
+                const int32_t end = rowOffsets_.GetValue(row + 1);
+                if (begin < 0 || end <= begin || static_cast<uint32_t>(end) > tokens_ ||
+                    static_cast<uint32_t>(end - begin) > window_) {
+                    continue;
+                }
+                start = static_cast<uint32_t>(begin);
+                length = static_cast<uint32_t>(end - begin);
+            }
             const int32_t accepted = accepted_.GetValue(row);
             if (accepted <= 0 || accepted > static_cast<int32_t>(window_)) {
                 continue;
             }
             uint64_t offsets[MAX_WINDOW];
-            if (!ReadStateOffsets(start, head, offsets)) {
+            // The selected previous state can lie beyond this step's short
+            // query window. The row's full slot table preserves that state.
+            const uint32_t slotRow = row * window_;
+            if (!ReadStateOffsets(slotRow, head, length, offsets)) {
                 continue;
             }
-            ProcessPair(start, keyHead, head, offsets, static_cast<uint32_t>(accepted - 1));
+            const uint32_t acceptedIndex = static_cast<uint32_t>(accepted - 1);
+            uint64_t initialOffset;
+            if (acceptedIndex < length) {
+                initialOffset = offsets[acceptedIndex];
+            } else if (!ReadStateOffset(slotRow + acceptedIndex, head, initialOffset)) {
+                continue;
+            }
+            ProcessPair(start, length, keyHead, head, offsets, initialOffset);
         }
     }
 
 private:
-    __aicore__ inline bool ReadStateOffsets(uint32_t start, uint32_t head, uint64_t* offsets)
+    __aicore__ inline void ZeroOutputTail(uint32_t start)
     {
-        const uint64_t headBase = static_cast<uint64_t>(head) * STATE;
-        for (uint32_t t = 0; t < window_; ++t) {
-            const int32_t slot = indices_.GetValue(start + t);
-            if (slot <= 0 || static_cast<uint32_t>(slot) >= slots_) {
+        auto zero = vectors_.Get<half>();
+        Duplicate(zero, static_cast<half>(0), PAIR_VALUE);
+        Sync<HardEvent::V_MTE3>();
+        for (uint32_t chunk = GetBlockIdx(); chunk < (tokens_ - start) * HK; chunk += GetBlockNum()) {
+            DataCopy(out_[static_cast<uint64_t>(start) * HV * V + static_cast<uint64_t>(chunk) * PAIR_VALUE],
+                     zero, PAIR_VALUE);
+        }
+        Sync<HardEvent::MTE3_V>();
+    }
+
+    __aicore__ inline bool ReadStateOffset(uint32_t index, uint32_t head, uint64_t& offset)
+    {
+        const int32_t slot = indices_.GetValue(index);
+        if (slot <= 0 || static_cast<uint32_t>(slot) >= slots_) {
+            return false;
+        }
+        const uint64_t stateStride = PACKED ? stateStride_ : HV * STATE;
+        offset = static_cast<uint64_t>(slot) * stateStride + head * STATE;
+        return true;
+    }
+
+    __aicore__ inline bool ReadStateOffsets(uint32_t start, uint32_t head, uint32_t length, uint64_t* offsets)
+    {
+        for (uint32_t t = 0; t < length; ++t) {
+            if (!ReadStateOffset(start + t, head, offsets[t])) {
                 return false;
             }
-            offsets[t] = static_cast<uint64_t>(slot) * HV * STATE + headBase;
         }
         return true;
     }
 
-    __aicore__ inline void ProcessPair(uint32_t start, uint32_t keyHead, uint32_t head,
-                                      const uint64_t* offsets, uint32_t acceptedIndex)
+    __aicore__ inline void ProcessPair(uint32_t start, uint32_t length, uint32_t keyHead, uint32_t head,
+                                      const uint64_t* offsets, uint64_t initialOffset)
     {
         auto states = states_.Get<half>();
         auto qkv = qkv_.Get<half>();
@@ -132,24 +190,24 @@ private:
         const uint64_t gateBase = static_cast<uint64_t>(start) * HV;
         const uint64_t valueBase = (gateBase + head) * V;
 
-        DataCopy(states, state_[offsets[acceptedIndex]], PAIR_STATE);
-        const DataCopyParams qkCopy{static_cast<uint16_t>(window_), K / C0, (HK - 1) * K / C0, 0};
+        DataCopy(states, state_[initialOffset], PAIR_STATE);
+        const DataCopyParams qkCopy{static_cast<uint16_t>(length), K / C0, (HK - 1) * K / C0, 0};
         DataCopy(keys, k_[qkBase], qkCopy);
         DataCopy(queries, q_[qkBase], qkCopy);
         DataCopy(values, v_[valueBase],
-                 DataCopyParams{static_cast<uint16_t>(window_), PAIR_VALUE / C0,
+                 DataCopyParams{static_cast<uint16_t>(length), PAIR_VALUE / C0,
                                 (HV * V - PAIR_VALUE) / C0, 0});
-        DataCopy(gates, gate_[gateBase], window_ * HV);
-        DataCopy(negativeBeta, beta_[gateBase], window_ * HV);
+        DataCopy(gates, gate_[gateBase], length * HV);
+        DataCopy(negativeBeta, beta_[gateBase], length * HV);
         Sync<HardEvent::MTE2_V>();
-        Exp(gates, gates, window_ * HV);
-        Muls(negativeBeta, negativeBeta, static_cast<half>(-1), window_ * HV);
-        Mul(update, keys, queries, window_ * K);
+        Exp(gates, gates, length * HV);
+        Muls(negativeBeta, negativeBeta, static_cast<half>(-1), length * HV);
+        Mul(update, keys, queries, length * K);
         PipeBarrier<PIPE_V>();
-        WholeReduceSum(dots, update, K, window_, 1, 1, K / C0);
+        WholeReduceSum(dots, update, K, length, 1, 1, K / C0);
 
         uint64_t outOffset = valueBase;
-        for (uint32_t t = 0; t < window_; ++t, outOffset += HV * V) {
+        for (uint32_t t = 0; t < length; ++t, outOffset += HV * V) {
             auto key = keys[t * K];
             PackRhs(key, queries[t * K]);
             // RHS packing can run while the previous candidate drains to GM.
@@ -178,7 +236,7 @@ private:
 
     __aicore__ inline void BroadcastLane(LocalTensor<half> dst, LocalTensor<half> src, uint32_t lane)
     {
-        auto offset = gatherOffsets_.Get<uint32_t>()[2 * V];
+        LocalTensor<uint32_t> offset = gatherOffsets_.Get<uint32_t>()[2 * V];
         Duplicate(offset.ReinterpretCast<int32_t>(), static_cast<int32_t>(lane * sizeof(half)), V);
         PipeBarrier<PIPE_V>();
         Gather(dst, src, offset, 0, V);
@@ -307,8 +365,9 @@ private:
     TQue<TPosition::CO2, 1> c2_;
     TBuf<TPosition::VECCALC> states_, update_, qkv_, gates_, rhs_, valueTail_, scratch_, vectors_, gatherOffsets_;
     GlobalTensor<half> q_, k_, v_, beta_, gate_, state_, out_;
-    GlobalTensor<int32_t> indices_, accepted_;
-    uint32_t batch_, window_, slots_;
+    GlobalTensor<int32_t> indices_, accepted_, rowOffsets_;
+    uint32_t batch_, window_, slots_, tokens_;
+    uint64_t stateStride_;
     half scale_;
 };
 } // namespace
@@ -319,7 +378,18 @@ extern "C" __global__ __aicore__ void rgdr_v310_cube_grouped_fp16(
     uint32_t slots, float scale)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC);
-    GroupedFp16RGDR op;
+    GroupedFp16RGDR<> op;
     op.Init(q, k, v, beta, gate, state, indices, accepted, out, batch, window, slots, scale);
+    op.Process();
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_grouped_packed_fp16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC);
+    GroupedFp16RGDR<true> op;
+    op.Init(q, k, v, beta, gate, state, indices, accepted, out, batch, window, slots, scale, rowOffsets, tokens, stateStride);
     op.Process();
 }

@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -100,6 +101,30 @@ class NPUModelRunner310(NPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        grouped_library = ascend_envs.VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY
+        if grouped_library:
+            if (
+                self._replayssm_sd_ring_slots is not None
+                or self.cache_config.use_replayssm
+                or ascend_envs.VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG
+            ):
+                raise ValueError("310P grouped RGDR uses the native cache lifecycle. Disable ReplaySSM and trace.")
+            if (
+                self.speculative_config is None
+                or self.speculative_config.method != "mtp"
+                or not 1 <= self.num_spec_tokens <= 7
+                or self.parallel_config.tensor_parallel_size != 2
+                or self.cache_config.mamba_cache_mode != "none"
+            ):
+                raise ValueError("310P grouped RGDR pilot requires TP2, MTP1–7 and --mamba-cache-mode none")
+            library = Path(grouped_library).expanduser()
+            if not library.is_absolute() or not library.is_file():
+                raise ValueError("VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY must be an absolute path to the built .so")
+            torch.ops.load_library(str(library))
+            op = getattr(torch.ops.rgdr_v310_cube_fp16, "run_", None)
+            if op is None or not any(arg.name == "row_offsets" for arg in op.default._schema.arguments):
+                raise RuntimeError("Rebuild the 310P grouped RGDR library with packed row support")
+            logger.info("310P grouped FP16 RGDR enabled for MTP%d (%s)", self.num_spec_tokens, library)
         if self._replayssm_sd_ring_slots is not None:
             load_replayssm_sd_310p_ops()
             logger.info(

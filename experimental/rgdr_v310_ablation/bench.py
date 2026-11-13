@@ -12,7 +12,6 @@ import traceback
 from pathlib import Path
 
 import torch
-import torch_npu
 
 ROOT = Path(__file__).resolve().parents[2]
 HEADS_K = 8
@@ -24,8 +23,9 @@ CUBE_VARIANTS = ("cube-fp16", "cube-deq", "cube-grouped")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=("native", "0", "1", "2", "3", *CUBE_VARIANTS), required=True)
-    parser.add_argument("--mtp", type=int, choices=(3, 7), required=True)
+    parser.add_argument("--mtp", type=int, choices=range(1, 8), required=True)
     parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--ragged", action="store_true", help="vary the actual window length per request")
     parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-golden", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if not 1 <= args.batch <= 1024:
+        parser.error("--batch must be in [1,1024]")
+    if (args.ragged or args.mtp not in (3, 7)) and args.variant not in ("native", "cube-grouped"):
+        parser.error("extended window geometries require native or cube-grouped")
     if args.warmup < 0 or args.iterations < 1:
         parser.error("--warmup must be non-negative and --iterations must be positive")
     if (args.profile_only or args.route_smoke_only) and (args.golden or args.native_golden or args.write_golden):
@@ -51,7 +55,11 @@ def parse_args() -> argparse.Namespace:
 
 def make_inputs(args: argparse.Namespace, device: torch.device) -> dict[str, torch.Tensor]:
     tokens = args.mtp + 1
-    total = args.batch * tokens
+    lengths = torch.full((args.batch,), tokens, dtype=torch.int32)
+    if args.ragged:
+        lengths = torch.arange(args.batch, dtype=torch.int32).remainder(tokens).add(1)
+    offsets = torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))
+    total = int(offsets[-1])
     gen = torch.Generator().manual_seed(3102026)
 
     def random(shape: tuple[int, ...], scale: float) -> torch.Tensor:
@@ -67,9 +75,13 @@ def make_inputs(args: argparse.Namespace, device: torch.device) -> dict[str, tor
         if args.variant not in CUBE_VARIANTS:
             g = g.float()
     state = torch.zeros((total + 1, HEADS_V, DIM, DIM), dtype=torch.float16)
-    accepted = torch.arange(args.batch, dtype=torch.int32).remainder(tokens).add(1)
-    for row in range(args.batch):
-        slot = 1 + row * tokens + int(accepted[row]) - 1
+    rows = torch.arange(args.batch, dtype=torch.int32)
+    accepted = (3 * rows + 1).remainder(lengths).add(1) if args.ragged else rows.remainder(tokens).add(1)
+    indices = torch.arange(1, total + 1, dtype=torch.int32)
+    slot_table = torch.zeros((args.batch, tokens), dtype=torch.int32)
+    for row, (begin, end) in enumerate(zip(offsets[:-1].tolist(), offsets[1:].tolist())):
+        slot_table[row, : end - begin] = indices[begin:end]
+        slot = begin + int(accepted[row])
         state[slot] = random((HEADS_V, DIM, DIM), 0.02)
     cpu = {
         "q": q,
@@ -78,9 +90,11 @@ def make_inputs(args: argparse.Namespace, device: torch.device) -> dict[str, tor
         "beta": beta,
         "g": g,
         "state": state,
-        "lengths": torch.full((args.batch,), tokens, dtype=torch.int32),
-        "indices": torch.arange(1, total + 1, dtype=torch.int32),
+        "lengths": lengths,
+        "indices": indices,
         "accepted": accepted,
+        "offsets": offsets,
+        "slot_table": slot_table,
     }
     return {name: value.to(device) for name, value in cpu.items()}
 
@@ -123,13 +137,14 @@ def call_fp16_cube(inp: dict[str, torch.Tensor], out: torch.Tensor, scale: float
         inp["beta"],
         inp["g"],
         inp["state"],
-        inp["indices"],
+        inp["slot_table"] if variant == "cube-grouped" else inp["indices"],
         inp["accepted"],
         out,
         scale,
         variant == "cube-deq",
         cores,
         variant == "cube-grouped",
+        inp["offsets"] if variant == "cube-grouped" else None,
     )
 
 
@@ -154,6 +169,8 @@ def check_fp16_cube_route(window: int, device: torch.device, variant: str) -> No
         "state": state,
         "indices": torch.arange(1, window + 1, dtype=torch.int32),
         "accepted": torch.full((1,), window, dtype=torch.int32),
+        "slot_table": torch.arange(1, window + 1, dtype=torch.int32).view(1, window),
+        "offsets": torch.tensor([0, window], dtype=torch.int32),
     }
     inp = {name: tensor.to(device) for name, tensor in inp.items()}
     out = torch.full_like(inp["v"], float("nan"))
@@ -163,6 +180,28 @@ def check_fp16_cube_route(window: int, device: torch.device, variant: str) -> No
     torch.testing.assert_close(out[0].cpu(), expected, atol=0, rtol=0)
     state[1, :, :, 2] = expected
     torch.testing.assert_close(inp["state"][1].cpu(), state[1], atol=0, rtol=0)
+    if variant == "cube-grouped":
+        # Replay a short window after accepting the last slot of a wider
+        # window. A padded row and token tail must not touch the cache.
+        inp["offsets"] = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
+        inp["slot_table"] = torch.cat((inp["slot_table"], torch.full_like(inp["slot_table"], -1)))
+        inp["accepted"] = torch.tensor([window, 0], dtype=torch.int32, device=device)
+        # Model runner pages can include other Mamba state and alignment padding.
+        state_elements = HEADS_V * DIM * DIM
+        padding = 16
+        backing = torch.full((window + 1, state_elements + 2 * padding), 7, dtype=torch.float16, device=device)
+        inp["state"] = backing[:, padding:-padding].view_as(state)
+        inp["state"].zero_()
+        inp["state"][window, :, :, 2] = 1
+        out.fill_(float("nan"))
+        call_fp16_cube(inp, out, scale=1.0, variant=variant, cores=1)
+        torch.npu.synchronize()
+        torch.testing.assert_close(out[0].cpu(), expected, atol=0, rtol=0)
+        torch.testing.assert_close(out[1:].cpu(), torch.zeros_like(v[1:]), atol=0, rtol=0)
+        state[2:window].zero_()
+        torch.testing.assert_close(inp["state"].cpu(), state, atol=0, rtol=0)
+        for guard in (backing[:, :padding].cpu(), backing[:, -padding:].cpu()):
+            torch.testing.assert_close(guard, torch.full_like(guard, 7), atol=0, rtol=0)
 
 
 def run_profile_launches(call, state, original_state, warmup: int, iterations: int) -> dict:
@@ -182,7 +221,7 @@ def run_profile_launches(call, state, original_state, warmup: int, iterations: i
 
 def run(args: argparse.Namespace) -> dict:
     torch.npu.set_device(args.device)
-    torch_npu.npu.set_compile_mode(jit_compile=False)
+    torch.npu.set_compile_mode(jit_compile=False)
     device = torch.device(f"npu:{args.device}")
     cube = args.variant in CUBE_VARIANTS
     if args.variant == "native":
@@ -321,19 +360,22 @@ def main() -> None:
         "variant": args.variant,
         "mtp": args.mtp,
         "batch": args.batch,
+        "ragged": args.ragged,
         "cores": args.cores if args.variant != "native" else "host tiling",
         "device": args.device,
         "scope": "isolated native V310 op; Q/K normalization and cache reset excluded",
         "fp16_gate_input": args.fp16_gate_input or args.variant in CUBE_VARIANTS,
     }
     try:
+        import torch_npu
+
         report["source_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         for package in ("torch", "torch-npu", "vllm", "vllm-ascend"):
             try:
                 report[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 report[package] = "not installed"
-        report["device_name"] = torch.npu.get_device_name(args.device)
+        report["device_name"] = torch_npu.npu.get_device_name(args.device)
         report.update(run(args))
         report["status"] = "PASSED"
     except Exception:

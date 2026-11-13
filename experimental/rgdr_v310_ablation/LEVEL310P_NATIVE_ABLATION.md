@@ -256,3 +256,200 @@ The candidate passes when both MTP sizes show lower p50 and no higher p90
 than the reprofiled DEQ baseline. Repeat a near-tie with capture order
 reversed. Return both gate results, native timings, and the raw summaries.
 Inspect Scalar, MTE2, MTE3 and Cube time alongside task duration.
+
+## Packed grouped RGDR and vLLM Ascend service pilot
+
+The grouped kernel accepts actual packed row lengths of 1–8 tokens and a
+separate candidate slot table of width 2–8 for MTP1–7. The previous
+acceptance selects from the full slot row, even if the current query
+window is shorter. Only current candidates write state. Zero-length
+padding rows leave the cache untouched. The Torch ABI assumes the
+scheduler assigns distinct writable slots to active requests. It writes
+directly to contiguous or page-strided FP16 SSM cache.
+
+From this directory, configure and build a fresh Release extension.
+
+```bash
+cmake -S . -B build-packed -DCMAKE_BUILD_TYPE=Release \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DSOC_VERSION=Ascend310P3 -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build build-packed --target rgdr_v310_cube_fp16_torch -j 8
+export RGDR_PACKED_LIB="$PWD/build-packed/librgdr_v310_cube_fp16_torch.so"
+export RGDR_PACKED_RESULTS=/tmp/rgdr-v310-packed
+mkdir -p "$RGDR_PACKED_RESULTS"
+```
+
+### Single-operator matrix
+
+Run route smoke for MTP1–7. It checks the full window, a one-token window
+with previous acceptance beyond the current length, and padding with
+distinct beta values for the paired heads. It also checks that writes to
+a page-strided cache preserve the guard regions. Compare every candidate state
+and output to native for B1, B16, B32 and B64. Include mixed lengths at B32.
+Native golden and profiler artifacts from `bacade0` are reusable for
+uniform B32 MTP3/7 when generated with the same FP16-rounded gate values.
+
+```bash
+# Optional. Point at the bacade0 directory containing native-mtp3.pt/7.pt.
+export RGDR_NATIVE_HISTORY="${RGDR_NATIVE_HISTORY:-}"
+(
+  set -e
+  for mtp in 1 2 3 4 5 6 7; do
+    python3 bench.py --route-smoke-only --variant cube-grouped --mtp "$mtp" \
+      --library "$RGDR_PACKED_LIB" --output "$RGDR_PACKED_RESULTS/route-mtp$mtp.json"
+    for shape in 1 16 32 64 ragged; do
+      batch="$shape"
+      options=()
+      if [[ "$shape" == ragged ]]; then
+        batch=32
+        options+=(--ragged)
+      fi
+      name="mtp$mtp-$shape"
+      golden="$RGDR_PACKED_RESULTS/native-$name.pt"
+      if [[ "$shape" == 32 && "$mtp" =~ ^[37]$ && -n "$RGDR_NATIVE_HISTORY" &&
+            -f "$RGDR_NATIVE_HISTORY/native-mtp$mtp.pt" ]]; then
+        golden="$RGDR_NATIVE_HISTORY/native-mtp$mtp.pt"
+      else
+        python3 bench.py --variant native --mtp "$mtp" --batch "$batch" "${options[@]}" \
+          --fp16-gate-input --warmup 0 --iterations 1 --write-golden "$golden" \
+          --output "$RGDR_PACKED_RESULTS/native-$name.json"
+      fi
+      python3 bench.py --variant cube-grouped --mtp "$mtp" --batch "$batch" "${options[@]}" \
+        --library "$RGDR_PACKED_LIB" --warmup 0 --iterations 1 --native-golden "$golden" \
+        --output "$RGDR_PACKED_RESULTS/grouped-$name.json"
+    done
+  done
+)
+```
+
+Use direct `msprof` at B32 for all MTP widths and the B32 ragged cases.
+For a batch scaling check, repeat uniform MTP3/7 at B1/16/64 by changing
+`batch` and narrowing the loop. Use the historical native CSVs for uniform
+B32 MTP3/7 if the device, stack and capture settings match. For the
+reported `bacade0` files, set `RGDR_NATIVE_HISTORY=/data/l00972401/rgdr-v310-cube-grouped`.
+
+```bash
+(
+  set -e
+  batch=32
+  for mtp in 1 2 3 4 5 6 7; do
+    for shape in uniform ragged; do
+      options=()
+      if [[ "$shape" == ragged ]]; then
+        options+=(--ragged)
+      fi
+      for variant in native cube-grouped; do
+        if [[ "$variant" == native && "$shape" == uniform && "$batch" == 32 &&
+              "$mtp" =~ ^[37]$ && -n "$RGDR_NATIVE_HISTORY" ]] &&
+           compgen -G "$RGDR_NATIVE_HISTORY/native-mtp$mtp-b32/PROF_*/mindstudio_profiler_output/op_summary_*.csv" >/dev/null; then
+          continue
+        fi
+        name="$variant-mtp$mtp-b$batch-$shape"
+        msprof --output="$RGDR_PACKED_RESULTS/$name" --ai-core=on --aic-metrics=PipeUtilization \
+          python3 bench.py --profile-only --variant "$variant" --mtp "$mtp" --batch "$batch" \
+            "${options[@]}" --library "$RGDR_PACKED_LIB" --fp16-gate-input \
+            --output "$RGDR_PACKED_RESULTS/$name.json"
+        python3 -c 'import json, sys; sys.exit(json.load(open(sys.argv[1]))["status"] != "PASSED")' \
+          "$RGDR_PACKED_RESULTS/$name.json"
+      done
+    done
+  done
+)
+```
+
+Use 100 task durations after dropping 20 warmups. The new Cube task is
+`rgdr_v310_cube_grouped_packed_fp16`. Pass the observed Native kernel
+name via `--baseline-kernel` to `compare_cube_profiles.py`. For the
+uniform B32 MTP3/7 regression check, also compare against the previous
+grouped CSVs (1323.1/2534.4 us p50 reported at `bacade0`).
+
+```bash
+python3 compare_cube_profiles.py "$NATIVE_CSV" "$PACKED_CSV" \
+  --baseline-kernel "$NATIVE_KERNEL" --candidate-kernel rgdr_v310_cube_grouped_packed_fp16
+```
+
+### Service performance, ReplaySSM off
+
+Start from the same W8A8 checkpoint, TP2, FP16 state, eager/graph mode and
+service limits as the archived Native B32 tests. The example below uses
+eager and a service cap of 64. If the archived Native service used a
+different cap or capture configuration, reproduce that setting on the new
+service. The client load stays B32 for both MTP sizes. Use the archived
+Native **service** JSON for the matching MTP and run mode. Single-op timings
+are a separate comparison.
+
+```bash
+# Run from the repository root in the service terminal.
+set -o pipefail
+export REPLAYSSM_MODEL=/path/to/Qwen3.6-35B-A3B-W8A8
+export ASCEND_RT_VISIBLE_DEVICES=0,1 VLLM_USE_V2_MODEL_RUNNER=0
+unset VLLM_ASCEND_REPLAYSSM_310_TRACE_CONFIG
+export VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY="$RGDR_PACKED_LIB"
+
+# Restart for 7 after completing the MTP3 run.
+MTP=3
+MODE=eager
+# Match the archived service's graph settings when using MODE=graph.
+if [[ "$MODE" == graph ]]; then
+  mode_flags=(--cudagraph-metrics --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,16,32,64,128,192,256]}')
+else
+  mode_flags=(--enforce-eager)
+fi
+vllm serve "$REPLAYSSM_MODEL" --host 127.0.0.1 --port 18083 \
+  --served-model-name replayssm-310p --tensor-parallel-size 2 --pipeline-parallel-size 1 \
+  --distributed-executor-backend mp --dtype float16 --mamba-cache-dtype float16 \
+  --mamba-ssm-cache-dtype float16 --mamba-cache-mode none --no-enable-prefix-caching \
+  --enable-chunked-prefill --no-async-scheduling --language-model-only --seed 42 \
+  --max-model-len 4096 --max-num-seqs 64 --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.85 "${mode_flags[@]}" \
+  --speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$MTP,\"enforce_eager\":true}" \
+  2>&1 | tee "$RGDR_PACKED_RESULTS/grouped-serve-mtp$MTP.log"
+```
+
+Confirm both workers log `310P grouped FP16 RGDR enabled` and run one short
+request first. Use a short service trace to confirm the packed Cube symbol
+runs on speculative steps. The original conv, prefill, non-spec decode,
+MTP sampler and checkpoint allocation remain in use. Keep the profiler
+outside the benchmark runs.
+
+```bash
+# In the client terminal, set MTP to the running service and export both paths.
+MTP=3
+curl -fsS http://127.0.0.1:18083/health
+curl -fsS http://127.0.0.1:18083/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"replayssm-310p","prompt":"Hello","max_tokens":32,"temperature":0}' \
+  > "$RGDR_PACKED_RESULTS/grouped-smoke-mtp$MTP.json"
+curl -fsS http://127.0.0.1:18083/metrics > "$RGDR_PACKED_RESULTS/grouped-mtp$MTP.before.metrics"
+vllm bench serve --backend openai --endpoint /v1/completions --host 127.0.0.1 --port 18083 \
+  --model "$REPLAYSSM_MODEL" --served-model-name replayssm-310p --dataset-name random \
+  --random-input-len 2048 --random-output-len 400 --random-range-ratio 0 --seed 42 \
+  --temperature 0 --ignore-eos --request-rate inf --max-concurrency 32 --num-prompts 64 --num-warmups 4 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
+  --save-result --save-detailed --result-dir "$RGDR_PACKED_RESULTS" \
+  --result-filename "grouped-serve-mtp$MTP-b32.json"
+curl -fsS http://127.0.0.1:18083/metrics > "$RGDR_PACKED_RESULTS/grouped-mtp$MTP.after.metrics"
+```
+
+Return throughput, TTFT/TPOT/ITL p50/p90, successful request count, preemptions
+and MTP accepted/draft deltas. Compare each MTP size against its own archived
+Native run. If a matching Native service result is unavailable, retain the
+new measurements and record the missing baseline. The FP16 recurrence may
+change token choices and acceptance, so report those metrics with throughput.
+
+For a separate dispatch trace, add these arguments to the serve command.
+
+```bash
+--profiler-config.profiler=torch \
+--profiler-config.torch_profiler_dir="$RGDR_PACKED_RESULTS/serve-trace-mtp$MTP"
+```
+
+After the short smoke request succeeds, capture one more request between
+`/start_profile` and `/stop_profile`. Look for the packed kernel in the
+worker NPU traces or exported operator summaries.
+
+```bash
+curl -fsS -X POST http://127.0.0.1:18083/start_profile
+curl -fsS http://127.0.0.1:18083/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"replayssm-310p","prompt":"Hello","max_tokens":32,"temperature":0}'
+curl -fsS -X POST http://127.0.0.1:18083/stop_profile
+```

@@ -24,6 +24,7 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_310
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
@@ -115,12 +116,34 @@ def npu_recurrent_gated_delta_rule_310(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     trace_layer: str | None = None,
+    use_grouped: bool = False,
 ) -> torch.Tensor:
     if use_qk_l2norm_in_kernel:
         q = l2norm_310p(q)
         k = l2norm_310p(k)
 
     total_tokens = v.shape[1]
+    if use_grouped and total_tokens:
+        if g is None or num_accepted_tokens is None or ssm_state_indices.ndim != 2:
+            raise ValueError("310P grouped RGDR requires gate, previous acceptance and a per-row candidate slot table")
+        out = torch.empty_like(v, dtype=torch.float16, memory_format=torch.contiguous_format)
+        torch.ops.rgdr_v310_cube_fp16.run_(
+            q.squeeze(0).to(torch.float16).contiguous(),
+            k.squeeze(0).to(torch.float16).contiguous(),
+            v.squeeze(0).to(torch.float16).contiguous(),
+            beta.squeeze(0).to(torch.float16).contiguous(),
+            g.squeeze(0).to(torch.float16).contiguous(),
+            state,
+            ssm_state_indices.to(torch.int32).contiguous(),
+            num_accepted_tokens[: ssm_state_indices.shape[0]].to(torch.int32).contiguous(),
+            out.squeeze(0),
+            k.shape[-1] ** -0.5,
+            False,
+            7,
+            True,
+            cu_seqlens.to(torch.int32).contiguous(),
+        )
+        return out
     flat_state_indices = _flatten_state_indices(ssm_state_indices, cu_seqlens, total_tokens)
     actual_seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32).contiguous()
     # Do not clamp PAD_SLOT_ID (-1) to 0 — that would write mamba block 0.
@@ -386,6 +409,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                         num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens[:num_spec],
                         use_qk_l2norm_in_kernel=True,
                         trace_layer=self.prefix,
+                        use_grouped=bool(ascend_envs.VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY),
                     )
             else:
                 core_attn_out_spec = None
