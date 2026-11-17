@@ -62,6 +62,7 @@ from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.spec_decode.utils import (
@@ -237,6 +238,9 @@ class NPUModelRunner310(NPUModelRunner):
             if np.any(is_prefilling) or num_tokens not in self.cudagraph_batch_sizes:
                 force_eager = True
         is_all_decode = not np.any(is_prefilling)
+        is_dflash = self.speculative_config is not None and self.speculative_config.method == "dflash"
+        if is_dflash and not self._spec_dummy_capture and not is_all_decode:
+            force_eager = True
 
         # Capture dispatch runs before the dummy attention metadata is built.
         attn_state = AscendAttentionState.SpecDecoding if self._spec_dummy_capture else self.attn_state
@@ -261,7 +265,7 @@ class NPUModelRunner310(NPUModelRunner):
                 # Respect explicit caller override: only force when unset.
                 force_uniform_decode = True
 
-        return super()._determine_batch_execution_and_padding(
+        result = super()._determine_batch_execution_and_padding(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
@@ -274,6 +278,14 @@ class NPUModelRunner310(NPUModelRunner):
             force_num_active_loras=force_num_active_loras,
             num_encoder_reqs=num_encoder_reqs,
         )
+        if (
+            is_dflash and not force_eager and is_all_decode
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and not self._spec_dummy_capture
+            and (result[0] != CUDAGraphMode.FULL or result[1].num_tokens != num_tokens)
+        ):
+            raise RuntimeError(f"310P DFlash uniform decode missed its exact target graph: {result[:2]}")
+        return result
 
     def _build_attention_metadata(self, *args: Any, **kwargs: Any):
         # Parent dummy_run assigns ChunkedPrefill for non-MLA MTP (910B FIA graph).
@@ -743,6 +755,19 @@ class NPUModelRunner310(NPUModelRunner):
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
+        if self.speculative_config is not None and self.speculative_config.method == "dflash":
+            self._dflash_target_graph = None
+            if self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                if forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE:
+                    if not forward_context.in_profile_run:
+                        forward_context.skip_compiled = True
+                elif forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                    descriptor = forward_context.batch_descriptor
+                    if not isinstance(self.model, ACLGraphWrapper) or descriptor is None:
+                        raise RuntimeError("310P DFlash target FULL requires an ACLGraph wrapper and descriptor")
+                    graph = self.model.concrete_aclgraph_entries.get(descriptor)
+                    if graph is not None and graph.aclgraph is not None:
+                        self._dflash_target_graph = descriptor
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,
             "positions": positions,
@@ -782,6 +807,12 @@ class NPUModelRunner310(NPUModelRunner):
                 num_tokens_padded,
             )
 
+        descriptor = getattr(self, "_dflash_target_graph", None)
+        if descriptor is not None:
+            logger.info_once(
+                f"310P DFlash graph replay component=target rank={get_tensor_model_parallel_rank()} "
+                f"tokens={descriptor.num_tokens}"
+            )
         return hidden_states
 
     def _check_and_update_cudagraph_mode(

@@ -259,6 +259,14 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             attn_metadata (AscendMetadata): Metadata containing start locations and block tables.
             output: The output tensor.
         """
+        dflash_splitfuse = getattr(attn_metadata, "dflash_splitfuse", None)
+        if dflash_splitfuse is not None:
+            dflash_splitfuse.forward(
+                query, self.key_cache, self.value_cache, num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads, scale=self.scale, output=output,
+            )
+            return output
+
         num_actual_tokens = int(attn_metadata.num_actual_tokens)
         query = query[:num_actual_tokens]
         output_slice = output[:num_actual_tokens]

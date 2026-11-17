@@ -18,6 +18,7 @@
 #
 
 
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.spec_decode.dflash2_proposer import AscendDflash2Proposer, is_dflash2_draft
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -61,6 +62,10 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method == "dflash":
         if is_dflash2_draft(vllm_config.speculative_config):
             return AscendDflash2Proposer(vllm_config, device, runner)
+        if get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY):
+            from vllm_ascend._310p.spec_decode.dflash_proposer_310 import AscendDFlashProposer310
+
+            return AscendDFlashProposer310(vllm_config, device, runner)
         return AscendDflashProposer(vllm_config, device, runner)
     elif method == "draft_model":
         return AscendDraftModelProposer(vllm_config, device, runner)

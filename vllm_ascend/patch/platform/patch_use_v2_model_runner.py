@@ -57,6 +57,18 @@ _original_get_v1_model_runner_unsupported_features = VllmConfig._get_v1_model_ru
 
 def _patched_get_v1_model_runner_unsupported_features(self) -> list[str]:
     unsupported = _original_get_v1_model_runner_unsupported_features(self)
+    spec = self.speculative_config
+    mixed_dflash = "mixed sliding/full dflash drafts"
+    if (
+        mixed_dflash in unsupported
+        and spec is not None
+        and spec.method == "dflash"
+        and spec.num_speculative_tokens == 7
+        and self.parallel_config.tensor_parallel_size == 2
+        and not self._is_dflash2_draft()
+        and get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY)
+    ):
+        unsupported.remove(mixed_dflash)
     return [feature for feature in unsupported if feature not in _ASCEND_V1_SUPPORTED_FEATURES]
 
 

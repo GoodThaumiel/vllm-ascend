@@ -1,9 +1,23 @@
 import torch
 import torch.nn.functional as F
+from vllm.model_executor.models import qwen3_dflash
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
+
+from vllm_ascend._310p.dflash_config import dflash_layer_attention
+
+_original_resolve_layer_attention = qwen3_dflash._resolve_layer_attention
+
+
+def _resolve_layer_attention(config, layer_index):
+    return dflash_layer_attention(
+        config, layer_index, _original_resolve_layer_attention, qwen3_dflash._dflash_layer_causal
+    )
+
+
+qwen3_dflash._resolve_layer_attention = _resolve_layer_attention
 
 
 def precompute_and_store_context_kv(
@@ -40,10 +54,20 @@ def precompute_and_store_context_kv(
     # --- Fused RoPE across all layers ---
     # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
     # In-place RoPE: pass K as the "query" arg with key=None.
-    all_k_flat = all_k_normed.view(L * num_ctx, kv)
-    positions_repeated = context_positions.repeat(L)
-    tmpv = all_k_flat.clone()
-    self.layers[0].self_attn.rotary_emb(positions_repeated, all_k_flat, tmpv)
+    rotary = self.layers[0].self_attn.rotary_emb
+    if getattr(rotary, "dflash_310p", False):
+        # Apply draft frequencies per layer. Query graph tables are independent
+        # of the potentially much larger context extent.
+        for i in range(L):
+            key = all_k_normed[i].view(num_ctx, kv)
+            key_rot, _ = rotary(context_positions, key, key)
+            all_k_normed[i].copy_(key_rot.view_as(all_k_normed[i]))
+        all_k_flat = all_k_normed.view(L * num_ctx, kv)
+    else:
+        all_k_flat = all_k_normed.view(L * num_ctx, kv)
+        positions_repeated = context_positions.repeat(L)
+        tmpv = all_k_flat.clone()
+        rotary(positions_repeated, all_k_flat, tmpv)
 
     if context_slot_mapping is None:
         return
