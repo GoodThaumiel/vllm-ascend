@@ -25,9 +25,10 @@ def run(args, report):
     keys, values = (torch.randn(shape, generator=generator).half() for _ in range(2))
 
     def pack_cache(tensor):
-        return (
+        packed = (
             tensor.reshape(pages, page_size, kv_heads * head_dim // 16, 16).permute(0, 2, 1, 3).contiguous().to(device)
         )
+        return torch_npu.npu_format_cast(packed, ACL_FORMAT_FRACTAL_NZ)
 
     key_cache, value_cache = pack_cache(keys), pack_cache(values)
     query = query_cpu.to(device)
@@ -37,8 +38,10 @@ def run(args, report):
     table = torch.empty((rows, pages_per_row), dtype=torch.int32, device=device)
     columns = torch.arange(page_size * pages_per_row, dtype=torch.int32, device=device).reshape(1, 1, -1)
     query_offsets = torch.arange(width, dtype=torch.int32, device=device).reshape(1, -1, 1)
+    mask_nd = torch.zeros((rows * width, columns.numel()), dtype=torch.float16, device=device)
+    mask_buffer = torch_npu.npu_format_cast(nd_to_nz_spec(mask_nd).contiguous(), ACL_FORMAT_FRACTAL_NZ)
 
-    def forward(causal, window):
+    def update_mask(causal, window):
         lengths = seq[:, None, None]
         positions = lengths - width + query_offsets
         visible = columns < lengths
@@ -49,12 +52,14 @@ def run(args, report):
             if not causal:
                 visible = visible & (columns <= positions + window - 1)
         mask = (~visible.expand(rows, width, -1)).reshape(rows * width, -1).to(torch.float16) * -10000.0
-        mask = torch_npu.npu_format_cast(nd_to_nz_spec(mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+        mask_buffer.copy_(torch_npu.npu_format_cast(nd_to_nz_spec(mask).contiguous(), ACL_FORMAT_FRACTAL_NZ))
+
+    def forward():
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
-            mask=mask,
+            mask=mask_buffer,
             block_table=table,
             seq_len=qlens,
             context_lens=seq,
@@ -95,16 +100,17 @@ def run(args, report):
         graph = None
         for lengths, block_ids in (([width + 4, 139], [[0, 1], [2, 3]]), ([142, 44], [[3, 2], [1, 0]])):
             update(lengths, block_ids)
+            update_mask(causal, window)
             if args.stage == "graph":
                 if graph is None:
-                    forward(causal, window)
+                    forward()
                     torch.npu.synchronize()
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph):
-                        forward(causal, window)
+                        forward()
                 graph.replay()
             else:
-                forward(causal, window)
+                forward()
             torch.npu.synchronize()
             actual = output.cpu()
             ref = expected(lengths, block_ids, causal, window)
