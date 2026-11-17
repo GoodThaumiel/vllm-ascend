@@ -40,7 +40,9 @@ python3 -m experimental.dflash_310p_ascendc.probe_attention --stage graph --devi
   --output /tmp/dflash-310p-attention-k7-graph.json
 ```
 
-探针用 35B TP2 的 draft head 形状，验证全注意力非因果和滑窗因果两条 mask 路径。滑窗缩短为 32 以便低成本覆盖截断边界。两次 replay 在固定地址上修改有效长度和物理页顺序，用 CPU dense reference 比对。若 eager 或 graph 失败，请回传 JSON 及第一条 CANN 错误，尤其是算子名称、错误码和 tiling 信息。
+探针用 35B TP2 的 draft head 形状，在同一图内验证全注意力非因果和滑窗因果两条 mask 路径。滑窗缩短为 32 以便低成本覆盖截断边界。两组拥有各自的固定地址 mask 和 block table，均在回放前刷新。两次 replay 修改有效长度和物理页顺序，逐组与 CPU dense reference 比对。若 eager 或 graph 失败，请回传 JSON 及第一条 CANN 错误，尤其是算子名称、错误码和 tiling 信息。
+
+已通过 LEVEL1 的环境可沿用 `.so`，单跑 K=7 attention graph 命令验证两组同图回放。输入准备的五份原始上机结果仍有效。
 
 输入准备和 SplitFuse 可以在不同空闲设备并行。回传实际设备、编译日志及 JSON。此级使用合成张量，服务接入的下一道验收是 K=7、35B TP2、C1 后 C10 持续补入。
 

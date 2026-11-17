@@ -11,9 +11,10 @@ def run(args, report):
     import torch
     import torch_npu
 
-    from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_spec
+    from vllm_ascend._310p.attention.dflash_splitfuse import DFlashSplitFuse310, draft_kv_group_order
+    from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
-    device = f"npu:{args.device}"
+    device = torch.device("npu", args.device)
     torch.npu.set_device(args.device)
     page_size, pages_per_row, rows = 128, 2, 2
     width, heads, kv_heads, head_dim = args.k + 1, 16, 4, 128
@@ -32,42 +33,6 @@ def run(args, report):
 
     key_cache, value_cache = pack_cache(keys), pack_cache(values)
     query = query_cpu.to(device)
-    output = torch.empty_like(query)
-    qlens = torch.full((rows,), width, dtype=torch.int32)
-    seq = torch.empty(rows, dtype=torch.int32, device=device)
-    table = torch.empty((rows, pages_per_row), dtype=torch.int32, device=device)
-    columns = torch.arange(page_size * pages_per_row, dtype=torch.int32, device=device).reshape(1, 1, -1)
-    query_offsets = torch.arange(width, dtype=torch.int32, device=device).reshape(1, -1, 1)
-    mask_nd = torch.zeros((rows * width, columns.numel()), dtype=torch.float16, device=device)
-    mask_buffer = torch_npu.npu_format_cast(nd_to_nz_spec(mask_nd).contiguous(), ACL_FORMAT_FRACTAL_NZ)
-
-    def update_mask(causal, window):
-        lengths = seq[:, None, None]
-        positions = lengths - width + query_offsets
-        visible = columns < lengths
-        if causal:
-            visible = visible & (columns <= positions)
-        if window is not None:
-            visible = visible & (columns >= positions - window + 1)
-            if not causal:
-                visible = visible & (columns <= positions + window - 1)
-        mask = (~visible.expand(rows, width, -1)).reshape(rows * width, -1).to(torch.float16) * -10000.0
-        mask_buffer.copy_(torch_npu.npu_format_cast(nd_to_nz_spec(mask).contiguous(), ACL_FORMAT_FRACTAL_NZ))
-
-    def forward():
-        torch_npu._npu_paged_attention_splitfuse(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            mask=mask_buffer,
-            block_table=table,
-            seq_len=qlens,
-            context_lens=seq,
-            num_kv_heads=kv_heads,
-            num_heads=heads,
-            scale_value=scale,
-            out=output,
-        )
 
     def expected(lengths, block_ids, causal, window):
         results = []
@@ -92,30 +57,68 @@ def run(args, report):
             results.append(result.half())
         return torch.cat(results)
 
-    def update(lengths, block_ids):
-        seq.copy_(torch.tensor(lengths, dtype=torch.int32))
-        table.copy_(torch.tensor(block_ids, dtype=torch.int32))
+    policies = {"full_noncausal": (False, None), "sliding_causal": (True, 32)}
+    layers = list(reversed(policies))
+    group_ids, layer_to_index = draft_kv_group_order(
+        layers,
+        [["target.full", "full_noncausal"], ["target.gdn"], ["sliding_causal"]],
+    )
+    buffers = [
+        DFlashSplitFuse310(
+            rows=rows,
+            query_width=width,
+            table_width=pages_per_row,
+            page_size=page_size,
+            device=device,
+            causal=causal,
+            window=window,
+        )
+        for causal, window in policies.values()
+    ]
+    outputs = {name: torch.empty_like(query) for name in layers}
 
-    for name, causal, window in (("full_noncausal", False, None), ("sliding_causal", True, 32)):
-        graph = None
-        for lengths, block_ids in (([width + 4, 139], [[0, 1], [2, 3]]), ([142, 44], [[3, 2], [1, 0]])):
-            update(lengths, block_ids)
-            update_mask(causal, window)
-            if args.stage == "graph":
-                if graph is None:
-                    forward()
-                    torch.npu.synchronize()
-                    graph = torch.npu.NPUGraph()
-                    with torch.npu.graph(graph):
-                        forward()
-                graph.replay()
-            else:
+    def forward():
+        for name, index in zip(layers, layer_to_index):
+            buffers[index].forward(
+                query,
+                key_cache,
+                value_cache,
+                num_kv_heads=kv_heads,
+                num_heads=heads,
+                scale=scale,
+                output=outputs[name],
+            )
+
+    graph = None
+    for lengths, block_ids in (([width + 4, 139], [[0, 1], [2, 3]]), ([142, 44], [[3, 2], [1, 0]])):
+        tables = [block_ids, block_ids[::-1]]
+        assert len(group_ids) == len(tables)
+        for metadata, table in zip(buffers, tables):
+            metadata.refresh(torch.tensor(lengths, dtype=torch.int32), torch.tensor(table, dtype=torch.int32))
+        if args.stage == "graph":
+            if graph is None:
                 forward()
-            torch.npu.synchronize()
-            actual = output.cpu()
-            ref = expected(lengths, block_ids, causal, window)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    forward()
+            graph.replay()
+        else:
+            forward()
+        torch.npu.synchronize()
+        for name, index in zip(layers, layer_to_index):
+            causal, window = policies[name]
+            actual = outputs[name].cpu()
+            ref = expected(lengths, tables[index], causal, window)
             torch.testing.assert_close(actual, ref, rtol=0.01, atol=0.002)
-            report["cases"].append({"case": name, "lengths": lengths, "max_abs": (actual - ref).abs().max().item()})
+            report["cases"].append(
+                {
+                    "case": name,
+                    "group_id": group_ids[index],
+                    "lengths": lengths,
+                    "max_abs": (actual - ref).abs().max().item(),
+                }
+            )
 
 
 def main():
