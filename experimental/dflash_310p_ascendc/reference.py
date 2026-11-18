@@ -110,3 +110,26 @@ def cases():
         info,
     )
     return {"mixed": mixed, "long_context": long_context, "reuse": reused, "invalid": invalid}
+
+
+def large_prefill_cases(rows: int, max_model_len: int):
+    """Use the same physical context capacity for a full and a partial tail."""
+    capacity = 8192
+    page_sizes = (128, 64)
+    table_width = (max_model_len + min(page_sizes) - 1) // min(page_sizes)
+    tables = [
+        [list(range(row * table_width + 1, (row + 1) * table_width + 1)) for row in range(rows)] for _ in page_sizes
+    ]
+    group_info = [[page_size, rows * table_width + 1, 0, 0, 0, 0, 0, 0] for page_size in page_sizes]
+    result = {}
+    for active in (capacity, capacity - 1):
+        requests, positions = [], []
+        tokens_per_row, remainder = divmod(active, rows)
+        for row in range(rows):
+            count = tokens_per_row + (row < remainder)
+            start = len(positions)
+            positions.extend(range(row % 3, row % 3 + count))
+            requests.append([start, start + count, 0, 107 + row, 0, 0, 0, 0])
+        positions.extend([0] * (capacity - active))
+        result[f"prefill_{rows}_{active}"] = (requests, positions, tables, group_info)
+    return result

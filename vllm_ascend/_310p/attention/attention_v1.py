@@ -140,6 +140,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             )
             return output
 
+        # ATB SelfAttention v3 reads sequence lengths from hostData.
+        seq_len = seq_len.detach().to(device="cpu", dtype=torch.int32)
         torch_npu._npu_flash_attention_v3(
             query=query,
             key=key,

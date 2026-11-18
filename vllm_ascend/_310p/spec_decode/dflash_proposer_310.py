@@ -17,8 +17,8 @@ from vllm_ascend import envs
 from vllm_ascend._310p.attention.dflash_splitfuse import DFlashSplitFuse310, draft_kv_group_order
 from vllm_ascend._310p.dflash_config import (
     DFLASH_MRV1_LOADING,
-    exact_decode_sizes,
     retained_page_range,
+    usable_decode_sizes,
     validate_packed_context,
 )
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
@@ -167,10 +167,15 @@ class AscendDFlashProposer310(AscendDflashProposer):
         self.kv_cache_gid = gids[0]
         self.block_size = self._groups[0].page_size
         if self.use_cuda_graph:
-            sizes = set(self.vllm_config.compilation_config.cudagraph_capture_sizes or ())
-            missing = exact_decode_sizes(self.max_batch_size, WIDTH) - sizes
-            if missing:
-                raise ValueError(f"310P DFlash L2 exact graph capture sizes are missing: {sorted(missing)}")
+            sizes = usable_decode_sizes(
+                self.vllm_config.compilation_config.cudagraph_capture_sizes,
+                self.max_batch_size,
+                self.max_num_tokens,
+                WIDTH,
+            )
+            if not sizes:
+                raise ValueError("310P DFlash FULL_DECODE_ONLY needs a usable capture size divisible by 8")
+            logger.info("310P DFlash exact capture token sizes: %s", sorted(sizes))
         if not hasattr(torch.ops.dflash_310p, "prepare_"):
             root = Path(__file__).resolve().parents[3]
             library = root / "experimental/dflash_310p_ascendc/build/libdflash_310p_torch.so"
@@ -274,7 +279,9 @@ class AscendDFlashProposer310(AscendDflashProposer):
             self.parallel_drafting_token_id,
             False,
         )
+        self.runner._trace_dflash("draft_prepare_readback_begin")
         query_host = query.cpu()
+        self.runner._trace_dflash("draft_prepare_readback_end")
         if torch.any(query_host[:, :, REQUEST_INFO, 3] != 0):
             raise RuntimeError(f"310P DFlash invalid prepared metadata: {query_host[:, :, REQUEST_INFO, 3].tolist()}")
         return query_host
@@ -357,22 +364,29 @@ class AscendDFlashProposer310(AscendDflashProposer):
         if scheduler_output is not None and scheduler_output.scheduled_encoder_inputs:
             raise ValueError("310P DFlash L2 accepts text requests only")
         rows = common_attn_metadata.num_reqs
+        count = target_token_ids.numel()
+        self.runner._trace_dflash("draft_begin", rows=rows, context_tokens=count)
         # Do not update graph-retained storage until the previous replay has completed.
         if self.use_cuda_graph:
+            self.runner._trace_dflash("draft_prior_stream_wait_begin")
             torch.npu.current_stream().synchronize()
+            self.runner._trace_dflash("draft_prior_stream_wait_end")
         tables = self._host_tables(rows)
         prepared = self._prepare(
             common_attn_metadata, target_positions, next_token_ids, num_rejected_tokens_gpu, tables
         )
-        count = target_token_ids.numel()
         context_positions = self._context_out[0, 0, :count]
         context_slots = [self._context_out[index, 1, :count] for index in self._layer_group_indices]
+        self.runner._trace_dflash("draft_context_kv_begin")
         context = self.model.combine_hidden_states(target_hidden_states)
         with set_ascend_forward_context(
             None, self.vllm_config, num_tokens=count, is_draft_model=True, skip_compiled=True
         ):
             self.model.precompute_and_store_context_kv(context, context_positions, context_slots)
+        self.runner._trace_dflash("draft_context_kv_enqueued")
+        self.runner._trace_dflash("draft_stage_begin")
         self._stage(prepared, tables)
+        self.runner._trace_dflash("draft_stage_enqueued")
         descriptor = getattr(self.runner, "_dflash_target_graph", None)
         mode = CUDAGraphMode.FULL if descriptor is not None else CUDAGraphMode.NONE
         if mode == CUDAGraphMode.FULL:
@@ -383,7 +397,9 @@ class AscendDFlashProposer310(AscendDflashProposer):
                 or descriptor not in self._runnable.concrete_aclgraph_entries
             ):
                 raise RuntimeError(f"Missing matching 310P DFlash draft graph for {descriptor}")
+        self.runner._trace_dflash("draft_forward_begin", mode=mode.name, tokens=rows * WIDTH)
         hidden = self._forward(rows, mode, descriptor)
+        self.runner._trace_dflash("draft_forward_enqueued")
         if mode == CUDAGraphMode.FULL and rows not in self._draft_route_logged:
             self._draft_route_logged.add(rows)
             logger.info(
@@ -392,7 +408,9 @@ class AscendDFlashProposer310(AscendDflashProposer):
                 rows * WIDTH,
             )
         indices = prepared[0, :, 3, :DRAFT_TOKENS].reshape(-1).to(self.device)
+        self.runner._trace_dflash("draft_sample_begin")
         draft_ids, _ = self.compute_draft_token_ids(hidden.index_select(0, indices), None)
+        self.runner._trace_dflash("draft_sample_end")
         return draft_ids.view(rows, DRAFT_TOKENS)
 
     def dummy_run(

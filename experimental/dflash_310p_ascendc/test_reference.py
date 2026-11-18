@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from .reference import cases, prepare_reference
+from .reference import cases, large_prefill_cases, prepare_reference
 
 
 class PrepareReferenceTest(unittest.TestCase):
@@ -49,6 +49,17 @@ class PrepareReferenceTest(unittest.TestCase):
         self.assertEqual(query[1][1][5][3], 1)
         self.assertEqual(query[1][0][2][:3], [-1] * 3)
         self.assertEqual(context[1][1], [-1] * 24)
+
+    def test_large_prefill_full_and_partial_tail(self):
+        for rows in (10, 48):
+            for case in large_prefill_cases(rows, 4608).values():
+                with self.subTest(rows=rows, active=case[0][-1][1]):
+                    query, context = prepare_reference(*case, 7, 4608, 248077, False)
+                    active = case[0][-1][1]
+                    for group, (_, slots) in zip(query, context):
+                        self.assertTrue(all(row[5][3] == 0 for row in group))
+                        self.assertTrue(all(slot > 0 for slot in slots[:active]))
+                        self.assertEqual(slots[active:], [-1] * (8192 - active))
 
 
 if __name__ == "__main__":

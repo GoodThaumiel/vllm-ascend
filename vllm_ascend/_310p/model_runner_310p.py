@@ -102,6 +102,13 @@ class NPUModelRunner310(NPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._dflash_trace_limit = (
+            ascend_envs.VLLM_ASCEND_310P_DFLASH_STAGE_TRACE
+            if self.speculative_config is not None and self.speculative_config.method == "dflash"
+            else 0
+        )
+        self._dflash_trace_step = 0
+        self._dflash_reported_replays: set[int] = set()
         grouped_library = ascend_envs.VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY
         if grouped_library:
             if (
@@ -239,8 +246,10 @@ class NPUModelRunner310(NPUModelRunner):
                 force_eager = True
         is_all_decode = not np.any(is_prefilling)
         is_dflash = self.speculative_config is not None and self.speculative_config.method == "dflash"
-        if is_dflash and not self._spec_dummy_capture and not is_all_decode:
-            force_eager = True
+        if is_dflash and not self._spec_dummy_capture:
+            # Uncaptured batches must not be padded to another descriptor:
+            # the draft graph owns exact-size KV and query buffers.
+            force_eager |= not is_all_decode or num_tokens not in self.cudagraph_batch_sizes
 
         # Capture dispatch runs before the dummy attention metadata is built.
         attn_state = AscendAttentionState.SpecDecoding if self._spec_dummy_capture else self.attn_state
@@ -279,7 +288,9 @@ class NPUModelRunner310(NPUModelRunner):
             num_encoder_reqs=num_encoder_reqs,
         )
         if (
-            is_dflash and not force_eager and is_all_decode
+            is_dflash
+            and not force_eager
+            and is_all_decode
             and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
             and not self._spec_dummy_capture
             and (result[0] != CUDAGraphMode.FULL or result[1].num_tokens != num_tokens)
@@ -355,6 +366,15 @@ class NPUModelRunner310(NPUModelRunner):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        if self._dflash_trace_limit:
+            self._dflash_trace_step += 1
+            self._trace_dflash(
+                "target_input_begin",
+                rows=num_reqs,
+                tokens=total_num_scheduled_tokens,
+                max_query=int(num_scheduled_tokens.max()),
+                spec_rows=len(scheduler_output.scheduled_spec_decode_tokens),
+            )
 
         self.input_batch.block_table.commit_block_table(num_reqs)
 
@@ -661,16 +681,26 @@ class NPUModelRunner310(NPUModelRunner):
             )
             trace.record["previous_accepted"] = self.num_accepted_tokens.gpu[:1].cpu().item()
 
-        return (
-            logits_indices,
-            spec_decode_metadata,
-            total_num_scheduled_tokens,
-        )
+        self._trace_dflash("target_input_end", attn_state=attn_state.name)
+        return logits_indices, spec_decode_metadata, total_num_scheduled_tokens
+
+    def _trace_dflash(self, phase: str, **fields) -> None:
+        if 0 < self._dflash_trace_step <= self._dflash_trace_limit:
+            logger.info(
+                "310P DFlash stage rank=%d step=%d phase=%s %s",
+                get_tensor_model_parallel_rank(),
+                self._dflash_trace_step,
+                phase,
+                fields,
+            )
 
     def _sample(self, logits, spec_decode_metadata):
         trace = getattr(self, "_replayssm_trace", None)
         if trace is None or not trace.record:
-            return super()._sample(logits, spec_decode_metadata)
+            self._trace_dflash("target_sample_begin", logits_rows=logits.shape[0])
+            output = super()._sample(logits, spec_decode_metadata)
+            self._trace_dflash("target_sample_end")
+            return output
         raw_logits = logits.detach().cpu().clone()
         output = super()._sample(logits, spec_decode_metadata)
         observed = output.sampled_token_ids.detach().cpu().clone()
@@ -755,6 +785,11 @@ class NPUModelRunner310(NPUModelRunner):
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
+        self._trace_dflash(
+            "target_forward_begin",
+            tokens=num_tokens_padded,
+            mode=forward_context.cudagraph_runtime_mode.name,
+        )
         if self.speculative_config is not None and self.speculative_config.method == "dflash":
             self._dflash_target_graph = None
             if self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
@@ -807,11 +842,14 @@ class NPUModelRunner310(NPUModelRunner):
                 num_tokens_padded,
             )
 
+        self._trace_dflash("target_forward_enqueued")
         descriptor = getattr(self, "_dflash_target_graph", None)
-        if descriptor is not None:
-            logger.info_once(
-                f"310P DFlash graph replay component=target rank={get_tensor_model_parallel_rank()} "
-                f"tokens={descriptor.num_tokens}"
+        if descriptor is not None and descriptor.num_tokens not in self._dflash_reported_replays:
+            self._dflash_reported_replays.add(descriptor.num_tokens)
+            logger.info(
+                "310P DFlash graph replay component=target rank=%d tokens=%d",
+                get_tensor_model_parallel_rank(),
+                descriptor.num_tokens,
             )
         return hidden_states
 

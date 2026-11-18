@@ -6,7 +6,7 @@ import json
 import traceback
 from pathlib import Path
 
-from .reference import LANES, QUERY_FIELDS, cases, prepare_reference
+from .reference import LANES, QUERY_FIELDS, cases, large_prefill_cases, prepare_reference
 
 GUARD = -20261116
 MASK_ID = 248077
@@ -19,8 +19,10 @@ def run_device(args, report):
 
     torch.npu.set_device(args.device)
     torch.ops.load_library(str(args.library.resolve()))
-    inputs = cases()
-    requests, positions, tables, _ = inputs["mixed"]
+    max_len = 4608 if args.prefill_rows is not None else MAX_LEN
+    inputs = large_prefill_cases(args.prefill_rows, max_len) if args.prefill_rows is not None else cases()
+    first = next(iter(inputs))
+    requests, positions, tables, _ = inputs[first]
     groups = len(tables)
     batch = len(requests)
     device = f"npu:{args.device}"
@@ -35,23 +37,25 @@ def run_device(args, report):
         backing = torch.full((count + 2 * LANES,), GUARD, dtype=torch.int32, device=device)
         return backing, backing[LANES:-LANES].view(shape)
 
-    prepared = [upload(values) for values in inputs["mixed"]]
+    prepared = [upload(values) for values in inputs[first]]
     query_guard, query = guarded((groups, batch, QUERY_FIELDS, LANES))
     context_guard, context = guarded((groups, 2, len(positions)))
     op = torch.ops.dflash_310p.prepare_
 
     def launch(spec, anchor):
-        op(*prepared, query, context, spec, MAX_LEN, MASK_ID, anchor)
+        op(*prepared, query, context, spec, max_len, MASK_ID, anchor)
 
     def check(name, spec, anchor, graph=None):
         for target, values in zip(prepared, inputs[name]):
             target.copy_(upload(values))
+        if args.prefill_rows is not None:
+            print(f"launch {name} stage={args.stage} k={spec} anchor={anchor}", flush=True)
         if graph is None:
             launch(spec, anchor)
         else:
             graph.replay()
         torch.npu.synchronize()
-        expected_query, expected_context = prepare_reference(*inputs[name], spec, MAX_LEN, MASK_ID, anchor)
+        expected_query, expected_context = prepare_reference(*inputs[name], spec, max_len, MASK_ID, anchor)
         torch.testing.assert_close(query.cpu(), upload(expected_query, "cpu"), rtol=0, atol=0)
         torch.testing.assert_close(context.cpu(), upload(expected_context, "cpu"), rtol=0, atol=0)
         for backing in (query_guard, context_guard):
@@ -62,14 +66,15 @@ def run_device(args, report):
     report.update(torch=torch.__version__, torch_npu=torch_npu.__version__)
     for spec in args.k:
         for anchor in (False, True):
-            launch(spec, anchor)
-            torch.npu.synchronize()
             graph = None
             if args.stage == "graph":
+                print(f"warmup {first} k={spec} anchor={anchor}", flush=True)
+                launch(spec, anchor)
+                torch.npu.synchronize()
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph):
                     launch(spec, anchor)
-            for name in (*inputs, "mixed"):
+            for name in (*inputs, first):
                 check(name, spec, anchor, graph)
 
 
@@ -83,6 +88,7 @@ def main():
     parser.add_argument("--stage", choices=("eager", "graph"), required=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--k", type=int, choices=range(1, 8), nargs="+", default=[7])
+    parser.add_argument("--prefill-rows", type=int, choices=(10, 48), help="Stress 8192-token packed prefill")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     report = {"stage": args.stage, "device": args.device, "library": str(args.library.resolve()), "cases": []}

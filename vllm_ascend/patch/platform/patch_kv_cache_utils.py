@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
@@ -587,12 +588,40 @@ def _ascend_max_memory_usage_bytes_from_groups(
     )
 
 
-def _get_glm5_next_kv_cache_groups(
+def _get_dflash_bucket_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    spec = vllm_config.speculative_config
+    if (
+        spec is None
+        or spec.method != "dflash"
+        or spec.num_speculative_tokens != 7
+        or vllm_config.use_v2_model_runner
+        or vllm_config.parallel_config.tensor_parallel_size != 2
+        or not any(isinstance(layer_spec, MambaSpec) for layer_spec in kv_cache_spec.values())
+        or not get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY)
+    ):
+        return None
+    cache_utils = vllm.v1.core.kv_cache_utils
+    aligned_specs = cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+    buckets: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in aligned_specs.items():
+        buckets[layer_spec].append(layer_name)
+    groups = cache_utils.create_kv_cache_group_specs(aligned_specs, list(buckets.values()))
+    cache_utils._annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+    logger.info("310P DFlash KV buckets: %s", [(type(g.kv_cache_spec).__name__, len(g.layer_names)) for g in groups])
+    return groups
+
+
+def _ascend_get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
+    if dflash_groups := _get_dflash_bucket_kv_cache_groups(vllm_config, kv_cache_spec):
+        return dflash_groups
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
@@ -661,7 +690,7 @@ vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_ca
 assert _orig_get_packed_kv_cache_groups is not None
 vllm.v1.core.kv_cache_utils._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
-vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _get_glm5_next_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _ascend_get_kv_cache_groups
 KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
     _kv_cache_config_has_mamba_layers
 )

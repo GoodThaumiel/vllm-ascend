@@ -34,9 +34,15 @@ class DFlash310PServiceContractTest(unittest.TestCase):
         finally:
             loading.reset(token)
 
-    def test_exact_buckets_cover_each_replenishment_batch(self):
-        sizes = CONTRACT["exact_decode_sizes"](10, 8)
-        self.assertEqual(sizes, set(range(8, 81, 8)))
+    def test_sparse_exact_buckets_do_not_require_all_request_counts(self):
+        selected = CONTRACT["usable_decode_sizes"]([1, 8, 64, 384, 392], 48, 8192, 8)
+        self.assertEqual(selected, {8, 64, 384})
+        self.assertNotIn(16, selected)
+
+    def test_exact_capture_sizes_respect_token_budget(self):
+        sizes = CONTRACT["usable_decode_sizes"]
+        self.assertEqual(sizes([8, 192, 384], 48, 256, 8), {8, 192})
+        self.assertFalse(sizes([1, 4, 392], 48, 8192, 8))
 
     def test_crop_keeps_a_boundary_page_for_first_query(self):
         retained = CONTRACT["retained_page_range"]

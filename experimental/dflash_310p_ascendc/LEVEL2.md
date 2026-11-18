@@ -53,7 +53,7 @@ python3 scripts/replayssm/validate_sd_serve.py --model dflash310 \
 
 ## 3. L2B · 双图 C1 / C10 补入
 
-停止 eager 服务后，在相同设备启动。首版使用 8-token 的精确 descriptor，覆盖 1–10 个活跃请求。
+停止 eager 服务后，在相同设备启动。以下配置覆盖 1–10 个活跃请求。可以按需只配置部分 `cudagraph_capture_sizes`，以 token 数为单位。K=7 时每个可用值是 8 的倍数。只有与实际均匀 decode token 数完全匹配的配置才同时回放 target 和 draft 图，其他批次走 eager。配置稀疏时，实际回放覆盖率取决于运行时批大小。
 
 ```bash
 vllm serve "${COMMON[@]}" \
@@ -75,3 +75,31 @@ grep -E '310P DFlash (MRv1 draft KV groups|graph replay|graph ready)' "$RESULTS/
 C1 要求每个 TP rank 都出现 `component=target` 和 `component=draft` 的 8-token **replay**。C10 要求 20/20 完成、出现多请求 descriptor 的双图 replay，并且补入后无 QBM/L0C、507015、越界或非法 metadata。出现分叉时保留同一 prompt 序列的首个不匹配位置和 top-5，作为后续固定历史定位的输入。原始服务压测 JSON 与日志用于本轮验收，性能基线另测。
 
 回传两份服务日志、四份 JSON、首个错误（含 rank、descriptor 和 CANN 日志），以及 `git status --short`。若服务启动或 C1 已失败，可直接回传该项日志。
+
+## 4. C48 首轮挂起定位
+
+保持两个 checkpoint、请求文件、卡对和其他服务参数一致。以下对照只比较是否完成及首个停滞阶段。
+
+1. 复现原配置 `--max-num-seqs 48 --max-num-batched-tokens 8192` 和 C48。启动前设置 `VLLM_ASCEND_310P_DFLASH_STAGE_TRACE=8`，记录最早 8 个调度步的两个 TP rank 日志。若原图配置需要缩小，可先测 `[8,32,64,128,256,384]`，并写清实际配置。
+2. 保持 C48 / 8192，切换到 `--enforce-eager`。若两个模式都卡在相同 prefill 阶段，再保持 C48 和 eager，将批 token 上限降到 4096，对比第一批的 `rows`、`tokens` 和 `max_query`。若改图配置或降低 token 上限后通过，保留失败配置作为对照。
+3. 若 eager 稳定复现且边界日志只指向整个 forward，用相同 eager 配置加 `ASCEND_LAUNCH_BLOCKING=1` 单跑定位。该设置会改变算子提交方式和时延，定位结果单独记录。
+4. 若两 rank 停在 draft prepare 的回读附近，单卡隔离 `prepare_`。使用同一个 LEVEL1 库，分别运行下列命令。每组覆盖 8192 个 context token 及 8191 个有效 token 的尾块场景。完整跑通只排除这些输入的独立复现。
+
+```bash
+for rows in 10 48; do
+  python3 -m experimental.dflash_310p_ascendc.run --stage eager --device 0 \
+    --k 7 --prefill-rows "$rows" --output "$RESULTS/prepare-prefill-${rows}.json"
+done
+```
+
+提取两 rank 的边界日志，保留完整原始日志和卡占用变化。
+
+```bash
+grep -E '310P DFlash (stage|KV buckets|exact capture|graph replay)|507015|HCCL|QuantBatchMatmul|L0C' "$RESULTS/c48.log"
+npu-smi info
+```
+
+- `target_input_end` 后无 `target_forward_begin` 时，看两 rank 的 metadata / 位置准备与 prefill 路径。
+- `target_forward_begin` 的 `mode` 为 `NONE`，且此前读到的是 prefill 时，若没有 `target_forward_enqueued`，优先定位 target prefill 内的算子和 TP 通信。
+- `draft_prepare_readback_begin` 或 `draft_prior_stream_wait_begin` 后无对应结束时，记录前面最后完成的边界。这些等待会暴露更早的异步算子失败。
+- 只有 trace 先出现 `mode` 为 `FULL`，才把 ACLGraph replay 列为当前卡点。日志里的 `enqueued` 表示主机已返回，设备工作可能仍在执行。

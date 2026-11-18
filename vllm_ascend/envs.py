@@ -92,6 +92,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Absolute path to the experimental 310P3 grouped RGDR Torch library.
     # Unset uses native V310. The path is local and is not sensitive.
     "VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY": lambda: os.getenv("VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY"),
+    # Number of initial 310P DFlash scheduler steps to log per TP rank.
+    # Default 0; valid values >=0. Diagnostic only and not sensitive.
+    "VLLM_ASCEND_310P_DFLASH_STAGE_TRACE": lambda: int(os.getenv("VLLM_ASCEND_310P_DFLASH_STAGE_TRACE") or 0),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

@@ -20,8 +20,10 @@ def dflash_layer_attention(config, layer_index, upstream, layer_causal):
     return window, layer_causal(config, layer_index)
 
 
-def exact_decode_sizes(max_requests: int, width: int) -> set[int]:
-    return {width * rows for rows in range(1, max_requests + 1)}
+def usable_decode_sizes(capture_sizes, max_requests: int, max_tokens: int, width: int) -> frozenset[int]:
+    """Select exact, unpadded DFlash decode shapes from the configured sizes."""
+    limit = min(max_requests * width, max_tokens)
+    return frozenset(size for size in capture_sizes or () if 0 < size <= limit and size % width == 0)
 
 
 def retained_page_range(length: int, width: int, page_size: int, window: int | None) -> tuple[int, int]:
