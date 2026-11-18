@@ -185,3 +185,20 @@ def test_310p_dflash_grouping_reuses_slots_and_preserves_draft_attention(monkeyp
     monkeypatch.setenv("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "0")
     assert make_dflash_shared_kv_groups(config, specs) is None
     assert dflash_shared_kv_layout(config, groups) is None
+
+
+@pytest.mark.parametrize("mode, expected_blocks", [("physical", 6), ("v24", 10), ("explicit", 6)])
+def test_310p_dflash_worker_advertises_the_correct_number_of_blocks(monkeypatch, mode, expected_blocks) -> None:
+    from vllm_ascend._310p import worker_310p
+
+    page = SimpleNamespace(page_size_bytes=1024)
+    groups = [SimpleNamespace(layer_names=["state.0", "state.1", "state.2"], kv_cache_spec=page)]
+    monkeypatch.setattr(worker_310p, "get_kv_cache_groups", lambda *_: groups)
+    monkeypatch.setattr(worker_310p, "dflash_shared_kv_layout", lambda *_: SimpleNamespace(bytes_per_pool_block=5120))
+    worker = SimpleNamespace(
+        get_kv_cache_spec=lambda: {},
+        vllm_config=SimpleNamespace(cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: None)),
+    )
+    # The upstream planner always divides by the largest logical group.
+    planner_bytes = worker_310p.NPUWorker310._scale_kv_cache_memory_for_multi_group(worker, 30720, mode=mode)
+    assert planner_bytes == expected_blocks * 3072

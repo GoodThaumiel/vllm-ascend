@@ -142,3 +142,17 @@ npu-smi info
 3. 跑 C48 的 2k/400，记录峰值和持续 running、waiting、preemption、吞吐，以及每 rank 服务稳定后的 HBM。`estimated_concurrency` 按完整 2k/400 序列和一个保留 ID 计算，调度分块及请求长度变化会影响实测值。
 
 以 30 个 GDN 层、10 个 target attention 层、5 个 draft SWA 层和 1 个 draft full 层为例，假设 target 每 rank 一个 256 维 KV head、draft 每 rank 四个 128 维 KV head，max-model-len 4096。共享版使用 6 个 GDN backing 槽、5 对 K/V 槽。Target/draft 调度页分别为 768/384 token，底层仍按 64/128 token 的 kernel 页访问。即使每个请求需要的全局 ID 从约 36 增到 62，ID 的物理成本也从约 25.2 MiB 降到 7.0 MiB。如果旧版持续 7 条请求对应 253–288 个总 block，且两次 `physical_budget_bytes` 相同，新版预计持续 14–16 条。实际模型以日志中的池大小和每请求 ID 数为准。
+
+## 8. v24 自动预算与显式物理预算
+
+本轮是 Python-only。用 §7 已验证的 TP2、K7、2k/400、共享 KV、无 prefix cache 配置，分别以以下方式启动，每轮先结束旧实例。外置 v24 插件关闭。三轮保持相同的权重、卡对、`max-num-batched-tokens`、capture sizes 和 `gpu-memory-utilization`。
+
+| 对照 | 启动方式 | 池大小 |
+|---|---|---|
+| 0.30 默认 | `VLLM_ASCEND_310P_DFLASH_V24_KV_BUDGET=0` | `profile 后剩余 / 2 / 物理 bytes per block` |
+| v24 预算算法 | `VLLM_ASCEND_310P_DFLASH_V24_KV_BUDGET=1` | `profile 后剩余 / 2 / planner 逻辑 bytes per block` |
+| 显式物理预算 | 加 `--kv-cache-memory-bytes <每卡物理字节>` | `显式预算 / 物理 bytes per block` |
+
+显式值优先于环境变量。该值按每 rank 计，profile 仍执行，输入不得超过 profile 后实测空闲内存。先复用默认轮的 `planned_backing_bytes` 校验显式路径的 block 数，再结合实际 workspace/graph 余量选需要对比的预算。v24 模式沿用当前 0.30 分组，按 v24 的逻辑计费方式定容。不同分组会产生不同的倍数。
+
+每轮先检查 `/health` 和 C1 双图，再跑 C10 补入、C48 2k/400。回传两 rank 的 `310P DFlash KV memory after profiling`、`shared KV budget`、`shared KV allocation`、图内存日志、启动后每卡显存、实际持续 running 和抢占次数。缓存分配早于图捕获。若扩大预算后捕获或补入 OOM，记录首个失败阶段，改用较低的显式物理预算验证容量曲线。测 52 的上限时，需把 `max-num-seqs` 和施压并发都设在 52 以上。

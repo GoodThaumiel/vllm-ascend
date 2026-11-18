@@ -94,6 +94,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY": lambda: os.getenv("VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY"),
     # Use shared backing across compatible 310P DFlash MRv1 KV groups.
     "VLLM_ASCEND_310P_DFLASH_SHARED_KV": lambda: _strict_binary_env("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "1"),
+    # Size the shared DFlash pool using v24's logical bytes per block.
+    "VLLM_ASCEND_310P_DFLASH_V24_KV_BUDGET": lambda: _strict_binary_env("VLLM_ASCEND_310P_DFLASH_V24_KV_BUDGET"),
     # Number of initial 310P DFlash scheduler steps to log per TP rank.
     # Default 0; valid values >=0. Diagnostic only and not sensitive.
     "VLLM_ASCEND_310P_DFLASH_STAGE_TRACE": lambda: int(os.getenv("VLLM_ASCEND_310P_DFLASH_STAGE_TRACE") or 0),

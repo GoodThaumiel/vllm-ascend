@@ -25,6 +25,7 @@ from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
+from vllm_ascend import envs
 from vllm_ascend._310p.dflash_kv_layout import dflash_shared_kv_layout
 from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
@@ -34,22 +35,33 @@ from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
 
 
 class NPUWorker310(NPUWorker):
-    def _scale_kv_cache_memory_for_multi_group(self, available_memory: int) -> int:
+    def _scale_kv_cache_memory_for_multi_group(self, available_memory: int, *, mode: str = "physical") -> int:
         kv_cache_spec = self.get_kv_cache_spec()
         layout_resolver = getattr(self.vllm_config.cache_config, "get_resolved_kv_cache_layout", None)
         if isinstance(kv_cache_spec, dict) and callable(layout_resolver):
             groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
             if layout := dflash_shared_kv_layout(self.vllm_config, groups):
                 planner_bytes = max(len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups)
-                num_blocks = available_memory // layout.bytes_per_pool_block
+                # v24 charged one logical page per slot against its half-budget.
+                # The runner still allocates both backing families in either mode.
+                divisor = planner_bytes if mode == "v24" else layout.bytes_per_pool_block
+                num_blocks = available_memory // divisor
+                backing_bytes = num_blocks * layout.bytes_per_pool_block
                 logger.info(
                     "310P DFlash shared KV budget: physical_budget_bytes=%d physical_bytes_per_pool_block=%d "
-                    "blocks_from_budget=%d",
-                    available_memory,
+                    "blocks_from_budget=%d mode=%s input_budget_bytes=%d planner_bytes_per_pool_block=%d "
+                    "planned_backing_bytes=%d",
+                    backing_bytes if mode == "v24" else available_memory,
                     layout.bytes_per_pool_block,
                     num_blocks,
+                    mode,
+                    available_memory,
+                    planner_bytes,
+                    backing_bytes,
                 )
                 return num_blocks * planner_bytes
+            if mode == "v24":
+                raise ValueError("310P DFlash v24 KV budget requires the shared KV layout")
             private_pages = get_310p_dflash_private_page_bytes(self.vllm_config, groups)
             if private_pages is not None:
                 logical_group_bytes = [len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups]
@@ -60,17 +72,20 @@ class NPUWorker310(NPUWorker):
                 num_blocks = available_memory // physical_bytes
                 logger.info(
                     "310P DFlash KV budget: physical_budget_bytes=%d old_bytes_per_pool_block=%d "
-                    "physical_bytes_per_pool_block=%d blocks_from_budget=%d old_blocks_from_budget=%d",
+                    "physical_bytes_per_pool_block=%d blocks_from_budget=%d old_blocks_from_budget=%d mode=%s",
                     available_memory,
                     sum(logical_group_bytes),
                     physical_bytes,
                     num_blocks,
                     available_memory // sum(logical_group_bytes),
+                    mode,
                 )
                 return num_blocks * max(logical_group_bytes)
             share_slots = get_310p_shared_cache_slots(groups, layout_resolver()) if groups else {}
         else:
             share_slots = {}
+        if mode != "physical":
+            raise ValueError(f"310P DFlash KV budget mode {mode!r} requires a supported MRv1 DFlash cache layout")
         if share_slots:
             # Both 310P runners alias compatible Mamba groups at each slot,
             # matching the v0.28 shared_by allocation.
@@ -168,20 +183,44 @@ class NPUWorker310(NPUWorker):
 
         if is_rc_device():
             vm = psutil.virtual_memory()
-            self.available_kv_cache_memory_bytes = (self.requested_memory - (vm.total - vm.available)) // 2
+            remaining_memory = self.requested_memory - (vm.total - vm.available)
+            physical_free_bytes = vm.available
         else:
-            self.available_kv_cache_memory_bytes = (
+            remaining_memory = (
                 self.requested_memory - profile_result.non_kv_cache_memory - non_torch_memory_cleared_by_empty_cache
-            ) // 2
+            )
+            physical_free_bytes = free_gpu_memory
 
-        self.available_kv_cache_memory_bytes = self._scale_kv_cache_memory_for_multi_group(
-            self.available_kv_cache_memory_bytes,
-        )
+        mode = "physical"
+        input_budget = remaining_memory // 2
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is not None and spec_config.method == "dflash" and not self.use_v2_model_runner:
+            explicit_bytes = self.cache_config.kv_cache_memory_bytes
+            if explicit_bytes is not None:
+                if not 0 < explicit_bytes <= physical_free_bytes:
+                    raise ValueError(
+                        f"310P DFlash explicit KV budget {explicit_bytes} bytes must be positive and fit within "
+                        f"the {physical_free_bytes} free bytes after profiling"
+                    )
+                mode = "explicit"
+                input_budget = explicit_bytes
+            elif envs.VLLM_ASCEND_310P_DFLASH_V24_KV_BUDGET:
+                mode = "v24"
+            logger.info(
+                "310P DFlash KV memory after profiling: mode=%s requested_bytes=%d remaining_bytes=%d free_bytes=%d",
+                mode,
+                int(self.requested_memory),
+                int(remaining_memory),
+                physical_free_bytes,
+            )
+
+        self.available_kv_cache_memory_bytes = self._scale_kv_cache_memory_for_multi_group(int(input_budget), mode=mode)
 
         logger.debug(profile_result)
         logger.info_once(
-            "Available KV cache memory: %.2f GiB (halved for workspace)",
+            "Available KV cache memory for planner: %.2f GiB (budget mode %s)",
             GiB(self.available_kv_cache_memory_bytes),
+            mode,
             scope="local",
         )
         return int(self.available_kv_cache_memory_bytes)
