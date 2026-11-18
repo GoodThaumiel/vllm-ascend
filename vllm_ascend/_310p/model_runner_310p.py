@@ -49,7 +49,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
 from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
-from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
+from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.replayssm_sd import (
     CORES,
@@ -928,10 +928,12 @@ class NPUModelRunner310(NPUModelRunner):
         """
         # init kv cache tensors
         kv_cache: dict[str, list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]] = {}
+        groups = kv_cache_config.kv_cache_groups
+        private_pages = get_310p_dflash_private_page_bytes(self.vllm_config, groups)
         layout_resolver = getattr(self.cache_config, "get_resolved_kv_cache_layout", None)
         share_slots = (
-            get_310p_shared_cache_slots(kv_cache_config.kv_cache_groups, layout_resolver())
-            if callable(layout_resolver)
+            get_310p_shared_cache_slots(groups, layout_resolver())
+            if private_pages is None and callable(layout_resolver)
             else {}
         )
         mamba_slot_caches: dict[int, list[torch.Tensor]] = {}
@@ -953,10 +955,11 @@ class NPUModelRunner310(NPUModelRunner):
                     # vLLM #51718 packs all group layers into one tensor on main;
                     # MambaSpec.page_size_bytes is per-layer, so num_blocks times
                     # it is the per-layer byte count (matching v0.28.0's size).
-                    per_layer_size = kv_cache_config.num_blocks * cache_spec.page_size_bytes
-                    assert per_layer_size % cache_spec.page_size_bytes == 0
-                    num_blocks = per_layer_size // cache_spec.page_size_bytes
-                    assert num_blocks >= kv_cache_config.num_blocks
+                    num_blocks = kv_cache_config.num_blocks
+                    page_bytes = (
+                        cache_spec.real_page_size_bytes if private_pages is not None else cache_spec.page_size_bytes
+                    )
+                    per_layer_size = num_blocks * page_bytes
                     # Standardized descriptors name each layer separately.
                     # Compatible Mamba groups reuse one state cache per slot.
                     for layer_name_inner in shared_names:
@@ -1029,6 +1032,25 @@ class NPUModelRunner310(NPUModelRunner):
                     continue
                 layer_names.add(layer_name)
         assert layer_names == set(kv_cache.keys()), "Some layers are not correctly initialized"
+        if private_pages is not None:
+            logger.info(
+                "310P DFlash KV allocation rank=%d pool_blocks=%d groups "
+                "(gid, type, layers, block_tokens, planner_page_bytes, backing_page_bytes, speculative_blocks)=%s",
+                get_tensor_model_parallel_rank(),
+                kv_cache_config.num_blocks,
+                [
+                    (
+                        gid,
+                        type(group.kv_cache_spec).__name__,
+                        len(group.layer_names),
+                        group.kv_cache_spec.block_size,
+                        group.kv_cache_spec.page_size_bytes,
+                        page_bytes,
+                        getattr(group.kv_cache_spec, "num_speculative_blocks", 0),
+                    )
+                    for gid, (group, page_bytes) in enumerate(zip(groups, private_pages))
+                ],
+            )
         return kv_cache
 
     # Override this function because of tensor.copy_(other) accuracy issue.

@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
+from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 
 
 def _make_groups() -> list[KVCacheGroupSpec]:
@@ -86,3 +94,35 @@ def test_uses_per_layer_specs_from_uniform_type_group() -> None:
         ),
     )
     assert get_310p_shared_cache_slots(groups, KVCacheLayout.LBNHC)["L4"] == 1
+
+
+def test_dflash_private_pages_charge_backing_bytes_without_changing_cache_geometry() -> None:
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash", num_speculative_tokens=7),
+        use_v2_model_runner=False,
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    common_page = 640 * 1024
+    target = FullAttentionSpec(
+        block_size=640, num_kv_heads=1, head_size=256, dtype=torch.float16, page_size_padded=common_page
+    )
+    draft_swa = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=4096,
+        page_size_padded=common_page,
+    )
+    state = MambaSpec(block_size=4096, shapes=((16, 128, 128),), dtypes=(torch.float16,), page_size_padded=common_page)
+    groups = [
+        KVCacheGroupSpec(["target.attn"], target),
+        KVCacheGroupSpec(["draft.attn"], draft_swa),
+        KVCacheGroupSpec(["target.linear_attn"], state),
+    ]
+
+    assert get_310p_dflash_private_page_bytes(config, groups) == [640 * 1024, 128 * 1024, 512 * 1024]
+    assert [group.kv_cache_spec.block_size for group in groups] == [640, 128, 4096]
+    assert [group.kv_cache_spec.page_size_bytes for group in groups] == [common_page] * 3
+    config.speculative_config.method = "mtp"
+    assert get_310p_dflash_private_page_bytes(config, groups) is None

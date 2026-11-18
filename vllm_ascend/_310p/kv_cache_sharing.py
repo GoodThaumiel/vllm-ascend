@@ -1,7 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
+
+
+def get_310p_dflash_private_page_bytes(vllm_config, groups) -> list[int] | None:
+    """Return per-layer backing bytes for each group in the 310P DFlash MRv1 pilot."""
+    spec_config = vllm_config.speculative_config
+    if (
+        spec_config is None
+        or spec_config.method != "dflash"
+        or spec_config.num_speculative_tokens != 7
+        or vllm_config.use_v2_model_runner
+        or vllm_config.parallel_config.tensor_parallel_size != 2
+        # The pilot uses one state group and separate attention groups. The
+        # existing allocator can share state storage in other group layouts.
+        or len(groups) < 3
+        or sum(isinstance(group.kv_cache_spec, MambaSpec) for group in groups) != 1
+    ):
+        return None
+
+    pages = []
+    for group in groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            pages.append(spec.real_page_size_bytes)
+        elif type(spec) in (FullAttentionSpec, SlidingWindowSpec) and (
+            spec.head_size == spec.head_size_v
+            and spec.num_heads == spec.num_kv_heads
+            and spec.tokens_per_state == 1
+            and spec.state_content_bytes is None
+            and spec.block_size % 64 == 0
+            and spec.num_kv_heads * spec.head_size % 16 == 0
+        ):
+            # 310P allocates independent NZ K/V tensors of this size. Splitting
+            # a manager block into 64/128-token kernel pages preserves its bytes.
+            pages.append(spec.real_page_size_bytes)
+        else:
+            return None
+    return pages
 
 
 def get_310p_shared_cache_slots(kv_cache_groups, layout) -> dict[str, int]:

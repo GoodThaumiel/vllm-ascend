@@ -120,3 +120,15 @@ ASCEND_RT_VISIBLE_DEVICES="$CARD" python3 -m experimental.dflash_310p_ascendc.pr
 ```
 
 若某个长度失败，在健康空闲卡上用相同长度加 `--source cpu` 做拷贝对照，并在另一张空闲卡上复测同一 NPU 用例。保留两次 `device_sync`、`range_begin/end`、`readback_begin` 边界和首个 CANN 故障日志。独立 Range 与 CPU 拷贝都通过后，用同一启动参数在一对空闲卡上启动服务。若仍报同一内核，只在下一次启动诊断设置 `ASCEND_LAUNCH_BLOCKING=1`，获取实际提交 Range 的 Python 调用栈。服务启动通过后，去掉该环境变量，继续 §4 的 C48 定位。
+
+## 6. C48 KV 计费与容量对照
+
+Python-only，沿用当前已验证的 `.so`。用同一对卡、权重、请求文件、输入/输出长度和显存利用率，比较修复前后的 TP2/K7 服务。保留 C48 的 `max-num-seqs=48`、`max-num-batched-tokens=8192` 和 capture sizes。服务达到 `/health` 200 后先用相同 prompt 跑 C1，再跑 C48，记录峰值 running/waiting、抢占次数和吞吐。
+
+```bash
+grep -E '310P DFlash (KV buckets|KV budget|KV allocation|MRv1 draft KV groups)|Available KV cache memory|Maximum concurrency|KV cache usage|[Pp]reempt' \
+  "$RESULTS/c48.log"
+npu-smi info
+```
+
+`KV budget` 给出每个池 block 的旧计费字节数和当前物理字节数，以及同预算下的两种 block 数。`KV allocation` 给出实际 `pool_blocks` 和各组的 `block_tokens`、`planner_page_bytes`、`backing_page_bytes`、`speculative_blocks`。按 gid 与 `MRv1 draft KV groups` 对照即可单独计算 draft 全注意力和滑窗的 padding 差额。记录两个 rank 的这些日志，以及服务启动后的每卡显存。`NPU KV cache usage` 表示调度器共享 block ID 的占用率，可以结合 running 数判断容量。HBM 分配以卡上读数和各组 backing bytes 为准。

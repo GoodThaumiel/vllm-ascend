@@ -25,7 +25,7 @@ from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
-from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
+from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
 from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.utils import is_rc_device
@@ -38,6 +38,24 @@ class NPUWorker310(NPUWorker):
         layout_resolver = getattr(self.vllm_config.cache_config, "get_resolved_kv_cache_layout", None)
         if isinstance(kv_cache_spec, dict) and callable(layout_resolver):
             groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+            private_pages = get_310p_dflash_private_page_bytes(self.vllm_config, groups)
+            if private_pages is not None:
+                logical_group_bytes = [len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups]
+                physical_bytes = sum(len(group.layer_names) * page for group, page in zip(groups, private_pages))
+                # The upstream planner divides the reported budget by the
+                # largest logical group. Translate the physical budget so its
+                # block count fits the 310P runner's private layer buffers.
+                num_blocks = available_memory // physical_bytes
+                logger.info(
+                    "310P DFlash KV budget: physical_budget_bytes=%d old_bytes_per_pool_block=%d "
+                    "physical_bytes_per_pool_block=%d blocks_from_budget=%d old_blocks_from_budget=%d",
+                    available_memory,
+                    sum(logical_group_bytes),
+                    physical_bytes,
+                    num_blocks,
+                    available_memory // sum(logical_group_bytes),
+                )
+                return num_blocks * max(logical_group_bytes)
             share_slots = get_310p_shared_cache_slots(groups, layout_resolver()) if groups else {}
         else:
             share_slots = {}
