@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -805,6 +806,38 @@ def test_kimi_k3_mixed_attention_still_requires_same_block_size() -> None:
     name = "model.layers.93.self_attn.attn"
     specs[name] = replace(specs[name], block_size=192)
     assert _get_kimi_k3_dspark_mixed_kv_cache_groups(specs) is None
+
+
+def test_310p_dflash_grouping_grows_existing_page_padding_without_scaling_tokens() -> None:
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="dflash", num_speculative_tokens=7, use_eagle_block_drop=lambda: False
+        ),
+        use_v2_model_runner=False,
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    target = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.float16, page_size_padded=131072
+    )
+    draft = FullAttentionSpec(block_size=128, num_kv_heads=4, head_size=128, dtype=torch.float16)
+    sliding = SlidingWindowSpec(block_size=128, num_kv_heads=4, head_size=128, dtype=torch.float16, sliding_window=4096)
+    mamba = MambaSpec(block_size=4096, shapes=((512, 128),), dtypes=(torch.float16,))
+    specs = {"target.0": target, "target.1": target, "draft.full": draft, "draft.sliding": sliding, "state": mamba}
+
+    with patch.object(kv_cache_utils_patch, "get_current_hardware_profile") as hardware:
+        hardware.return_value.supports.return_value = True
+        groups = kv_cache_utils_patch._get_dflash_bucket_kv_cache_groups(config, specs)
+
+    assert groups is not None
+    assert [group.layer_names for group in groups] == [
+        ["target.0", "target.1"],
+        ["draft.full"],
+        ["draft.sliding"],
+        ["state"],
+    ]
+    assert [group.kv_cache_spec.block_size for group in groups] == [128, 128, 128, 4096]
+    assert all(group.kv_cache_spec.page_size_bytes == draft.page_size_bytes for group in groups)
+    assert target.page_size_padded == 131072
 
 
 def test_kimi_k3_gqa_mixed_grouping_falls_back_on_unrecognized_layer() -> None:

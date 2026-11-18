@@ -10,6 +10,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -604,13 +605,40 @@ def _get_dflash_bucket_kv_cache_groups(
     ):
         return None
     cache_utils = vllm.v1.core.kv_cache_utils
-    aligned_specs = cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+    common_page_size = max(layer_spec.page_size_bytes for layer_spec in kv_cache_spec.values())
+    # The runner may already have padded target attention to the Mamba page.
+    # Upstream may scale block_size using that padded size, but the old
+    # page_size_padded would still override the resulting page size. Keep the
+    # token geometry of these specs and grow their physical padding directly.
+    prealigned_specs = {
+        name: replace(layer_spec, page_size_padded=common_page_size)
+        if (
+            isinstance(layer_spec, AttentionSpec)
+            and not isinstance(layer_spec, MLAAttentionSpec)
+            and layer_spec.page_size_padded is not None
+            and layer_spec.page_size_bytes < common_page_size
+        )
+        else layer_spec
+        for name, layer_spec in kv_cache_spec.items()
+    }
+    aligned_specs = cache_utils.unify_kv_cache_spec_page_size(prealigned_specs)
     buckets: dict[KVCacheSpec, list[str]] = defaultdict(list)
     for layer_name, layer_spec in aligned_specs.items():
         buckets[layer_spec].append(layer_name)
     groups = cache_utils.create_kv_cache_group_specs(aligned_specs, list(buckets.values()))
     cache_utils._annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
-    logger.info("310P DFlash KV buckets: %s", [(type(g.kv_cache_spec).__name__, len(g.layer_names)) for g in groups])
+    logger.info(
+        "310P DFlash KV buckets (spec, layers, block_tokens, page_bytes): %s",
+        [
+            (
+                type(group.kv_cache_spec).__name__,
+                len(group.layer_names),
+                group.kv_cache_spec.block_size,
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in groups
+        ],
+    )
     return groups
 
 

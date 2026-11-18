@@ -78,6 +78,8 @@ C1 要求每个 TP rank 都出现 `component=target` 和 `component=draft` 的 8
 
 ## 4. C48 首轮挂起定位
 
+先用 C48 配置确认服务启动，`/health` 返回 200。保留 `310P DFlash KV buckets` 日志中的 `block_tokens` 和 `page_bytes`，用来核对组间页大小与原有 token 布局。若两个 rank 停在启动阶段的 KV 分组，直接回传 `determine_available_memory` 的首个堆栈和对应 rank，暂不发送压测请求。该阶段早于图捕获。
+
 保持两个 checkpoint、请求文件、卡对和其他服务参数一致。以下对照只比较是否完成及首个停滞阶段。
 
 1. 复现原配置 `--max-num-seqs 48 --max-num-batched-tokens 8192` 和 C48。启动前设置 `VLLM_ASCEND_310P_DFLASH_STAGE_TRACE=8`，记录最早 8 个调度步的两个 TP rank 日志。若原图配置需要缩小，可先测 `[8,32,64,128,256,384]`，并写清实际配置。
