@@ -12,14 +12,40 @@
 #include "aclrtlaunch_rgdr_v310_cube_fp16.h"
 #include "aclrtlaunch_rgdr_v310_cube_grouped_fp16.h"
 #include "aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16.h"
+#include "aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_batch_pack.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_batch_pack_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_state_store.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_state_store_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_gate_scale.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_gate_scale_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_broadcast.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_broadcast_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_mul.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_mul_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_add.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_add_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_brcb16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_brcb16_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16_interleave.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16_interleave_h16.h"
 
 namespace {
 void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                const at::Tensor& beta, const at::Tensor& gate, const at::Tensor& state,
                const at::Tensor& indices, const at::Tensor& accepted, const at::Tensor& out,
                double scale, bool deq, int64_t cores, bool grouped,
-               const std::optional<at::Tensor>& row_offsets) {
+               const std::optional<at::Tensor>& row_offsets, int64_t probe) {
   TORCH_CHECK(!grouped || !deq, "grouped RGDR uses one L0C drain and scales in UB");
+  TORCH_CHECK(probe >= 0 && probe <= 11, "Unsupported RGDR probe ID (expected 0..11)");
+  TORCH_CHECK(probe == 0 || (grouped && row_offsets),
+              "RGDR probes require packed grouped inputs");
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& tensor : {q, k, v, beta, gate, indices, accepted, out}) {
     TORCH_CHECK(tensor.device() == q.device() && tensor.is_contiguous(),
@@ -31,8 +57,12 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   const int64_t batch = accepted.numel();
   TORCH_CHECK(accepted.dim() == 1 && batch > 0 && batch <= 1024 &&
                   accepted.scalar_type() == at::kInt, "accepted must be int32[B]");
-  TORCH_CHECK(q.dim() == 3 && q.size(1) == 8 && q.size(2) == 128 &&
-                  q.sizes() == k.sizes(), "q/k must be [T,8,128]");
+  TORCH_CHECK(q.dim() == 3 && q.size(2) == 128 && q.sizes() == k.sizes(),
+              "q/k must be [T,H,128]");
+  const int64_t key_heads = q.size(1);
+  TORCH_CHECK(key_heads == 8 || (row_offsets && key_heads == 16),
+              "q/k require 8 heads, or 16 heads for packed grouped RGDR");
+  const int64_t value_heads = 2 * key_heads;
   const int64_t tokens = q.size(0);
   int64_t window;
   if (row_offsets) {
@@ -48,23 +78,23 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     TORCH_CHECK(grouped || window == 4 || window == 8, "legacy Cube variants require MTP3/7");
   }
   TORCH_CHECK(window >= 1 && window <= 8, "Cube window must be in [1,8]");
-  TORCH_CHECK(v.sizes() == at::IntArrayRef({tokens, 16, 128}) &&
-                  v.sizes() == out.sizes(), "v/out must be [T,16,128]");
-  TORCH_CHECK(beta.sizes() == at::IntArrayRef({tokens, 16}) && gate.sizes() == beta.sizes(),
-              "beta/gate must be [T,16]");
+  TORCH_CHECK(v.sizes() == at::IntArrayRef({tokens, value_heads, 128}) &&
+                  v.sizes() == out.sizes(), "v/out must be [T,2H,128]");
+  TORCH_CHECK(beta.sizes() == at::IntArrayRef({tokens, value_heads}) && gate.sizes() == beta.sizes(),
+              "beta/gate must be [T,2H]");
   TORCH_CHECK(indices.scalar_type() == at::kInt &&
                   (row_offsets || (indices.dim() == 1 && indices.numel() == tokens)),
               "indices must be int32[T] for uniform or int32[B,W] for packed");
   TORCH_CHECK(state.dim() == 4 && state.size(0) > 1 &&
-                  state.size(0) <= std::numeric_limits<int32_t>::max() && state.size(1) == 16 &&
+                  state.size(0) <= std::numeric_limits<int32_t>::max() && state.size(1) == value_heads &&
                   state.size(2) == 128 && state.size(3) == 128 &&
                   state.device() == q.device(), "invalid state geometry or device");
   TORCH_CHECK(state.stride(3) == 1 && state.stride(2) == 128 && state.stride(1) == 128 * 128 &&
-                  state.stride(0) >= 16 * 128 * 128 && state.stride(0) % 16 == 0 &&
+                  state.stride(0) >= value_heads * 128 * 128 && state.stride(0) % 16 == 0 &&
                   state.storage_offset() % 16 == 0, "state pages must be 32-byte aligned with contiguous inner axes");
   TORCH_CHECK(row_offsets || state.is_contiguous(), "uniform Cube RGDR requires contiguous state");
-  TORCH_CHECK(cores >= 1 && cores <= 7 && std::isfinite(scale) && scale > 0 && scale <= 1,
-              "cores must be in [1,7] and scale in (0,1]");
+  TORCH_CHECK(cores >= 1 && cores <= 8 && std::isfinite(scale) && scale > 0 && scale <= 1,
+              "cores must be in [1,8] and scale in (0,1]");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
 #define RGDR_ARGS \
@@ -74,7 +104,37 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       static_cast<uint32_t>(window), static_cast<uint32_t>(state.size(0)), \
       static_cast<float>(scale)
   aclError result;
-  if (row_offsets) {
+#define RGDR_PACKED_ARGS \
+  RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens), \
+      static_cast<uint64_t>(state.stride(0))
+  if (probe != 0) {
+    switch (probe) {
+#define RGDR_PROBE_CASE(ID, NAME) \
+      case ID: \
+        result = key_heads == 16 \
+            ? aclrtlaunch_rgdr_v310_cube_probe_##NAME##_h16(RGDR_PACKED_ARGS) \
+            : aclrtlaunch_rgdr_v310_cube_probe_##NAME(RGDR_PACKED_ARGS); \
+        break
+      RGDR_PROBE_CASE(1, batch_pack);
+      RGDR_PROBE_CASE(2, defer_write_wait);
+      RGDR_PROBE_CASE(3, no_state_store);
+      RGDR_PROBE_CASE(4, no_gate_scale);
+      RGDR_PROBE_CASE(5, no_rank1);
+      RGDR_PROBE_CASE(6, no_rank1_broadcast);
+      RGDR_PROBE_CASE(7, no_rank1_mul);
+      RGDR_PROBE_CASE(8, no_rank1_add);
+      RGDR_PROBE_CASE(9, rank1_brcb16);
+      RGDR_PROBE_CASE(10, rank1_gather16);
+      RGDR_PROBE_CASE(11, rank1_gather16_interleave);
+#undef RGDR_PROBE_CASE
+      default:
+        TORCH_CHECK(false, "Unsupported RGDR probe ID");
+    }
+  } else if (row_offsets && key_heads == 16) {
+    result = aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16_h16(
+        RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens),
+        static_cast<uint64_t>(state.stride(0)));
+  } else if (row_offsets) {
     result = aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16(
         RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens),
         static_cast<uint64_t>(state.stride(0)));
@@ -83,6 +143,7 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   } else {
     result = aclrtlaunch_rgdr_v310_cube_fp16(RGDR_ARGS, static_cast<uint32_t>(deq));
   }
+#undef RGDR_PACKED_ARGS
 #undef RGDR_ARGS
   TORCH_CHECK(result == ACL_SUCCESS, "FP16 Cube RGDR launch failed: ", result);
 }
@@ -90,8 +151,8 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
 
 TORCH_LIBRARY(rgdr_v310_cube_fp16, m) {
   m.def("run_(Tensor q, Tensor k, Tensor v, Tensor beta, Tensor gate, Tensor(a!) state, "
-        "Tensor indices, Tensor accepted, Tensor(b!) out, float scale, bool deq, int cores=7, "
-        "bool grouped=False, Tensor? row_offsets=None) -> ()");
+        "Tensor indices, Tensor accepted, Tensor(b!) out, float scale, bool deq, int cores=8, "
+        "bool grouped=False, Tensor? row_offsets=None, int probe=0) -> ()");
 }
 TORCH_LIBRARY_IMPL(rgdr_v310_cube_fp16, PrivateUse1, m) {
   m.impl("run_", &cube_fp16);
@@ -100,5 +161,5 @@ TORCH_LIBRARY_IMPL(rgdr_v310_cube_fp16, Meta, m) {
   m.impl("run_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                     double, bool, int64_t, bool, const std::optional<at::Tensor>&) {});
+                     double, bool, int64_t, bool, const std::optional<at::Tensor>&, int64_t) {});
 }

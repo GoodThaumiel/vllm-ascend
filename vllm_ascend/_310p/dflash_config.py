@@ -4,6 +4,9 @@
 from contextvars import ContextVar
 
 DFLASH_MRV1_LOADING: ContextVar[bool] = ContextVar("dflash_mrv1_loading", default=False)
+DFLASH_MAX_DRAFT_TOKENS = 7
+# prepare_ copies a full 32-byte block per int32 field even for smaller K.
+DFLASH_QUERY_DMA_LANES = 8
 
 
 def dflash_layer_attention(config, layer_index, upstream, layer_causal):
@@ -24,6 +27,11 @@ def usable_decode_sizes(capture_sizes, max_requests: int, max_tokens: int, width
     """Select exact, unpadded DFlash decode shapes from the configured sizes."""
     limit = min(max_requests * width, max_tokens)
     return frozenset(size for size in capture_sizes or () if 0 < size <= limit and size % width == 0)
+
+
+def pack_query_lanes(field, width: int):
+    """Pack the live lanes of each row from the prepare operator's DMA layout."""
+    return field[:, :width].reshape(-1)
 
 
 def retained_page_range(length: int, width: int, page_size: int, window: int | None) -> tuple[int, int]:

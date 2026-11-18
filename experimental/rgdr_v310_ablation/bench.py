@@ -17,7 +17,9 @@ ROOT = Path(__file__).resolve().parents[2]
 HEADS_K = 8
 HEADS_V = 16
 DIM = 128
-CUBE_VARIANTS = ("cube-fp16", "cube-deq", "cube-grouped")
+INTERLEAVED_CUBE = "rank1-gather16-interleave"
+GROUPED_CUBE_VARIANTS = ("cube-grouped", INTERLEAVED_CUBE)
+CUBE_VARIANTS = ("cube-fp16", "cube-deq", *GROUPED_CUBE_VARIANTS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp", type=int, choices=range(1, 8), required=True)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--ragged", action="store_true", help="vary the actual window length per request")
-    parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
+    parser.add_argument("--cores", type=int, choices=range(1, 9), default=7)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
@@ -42,7 +44,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not 1 <= args.batch <= 1024:
         parser.error("--batch must be in [1,1024]")
-    if (args.ragged or args.mtp not in (3, 7)) and args.variant not in ("native", "cube-grouped"):
+    if args.cores == 8 and args.variant not in ("native", *CUBE_VARIANTS):
+        parser.error("eight cores are available for Cube variants")
+    if (args.ragged or args.mtp not in (3, 7)) and args.variant not in ("native", *GROUPED_CUBE_VARIANTS):
         parser.error("extended window geometries require native or cube-grouped")
     if args.warmup < 0 or args.iterations < 1:
         parser.error("--warmup must be non-negative and --iterations must be positive")
@@ -130,6 +134,8 @@ def compare_native(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, fl
 
 
 def call_fp16_cube(inp: dict[str, torch.Tensor], out: torch.Tensor, scale: float, variant: str, cores: int) -> None:
+    grouped = variant in GROUPED_CUBE_VARIANTS
+    probe_args = (11,) if variant == INTERLEAVED_CUBE else ()
     torch.ops.rgdr_v310_cube_fp16.run_(
         inp["q"],
         inp["k"],
@@ -137,14 +143,15 @@ def call_fp16_cube(inp: dict[str, torch.Tensor], out: torch.Tensor, scale: float
         inp["beta"],
         inp["g"],
         inp["state"],
-        inp["slot_table"] if variant == "cube-grouped" else inp["indices"],
+        inp["slot_table"] if grouped else inp["indices"],
         inp["accepted"],
         out,
         scale,
         variant == "cube-deq",
         cores,
-        variant == "cube-grouped",
-        inp["offsets"] if variant == "cube-grouped" else None,
+        grouped,
+        inp["offsets"] if grouped else None,
+        *probe_args,
     )
 
 
@@ -180,7 +187,7 @@ def check_fp16_cube_route(window: int, device: torch.device, variant: str) -> No
     torch.testing.assert_close(out[0].cpu(), expected, atol=0, rtol=0)
     state[1, :, :, 2] = expected
     torch.testing.assert_close(inp["state"][1].cpu(), state[1], atol=0, rtol=0)
-    if variant == "cube-grouped":
+    if variant in GROUPED_CUBE_VARIANTS:
         # Replay a short window after accepting the last slot of a wider
         # window. A padded row and token tail must not touch the cache.
         inp["offsets"] = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
@@ -332,7 +339,7 @@ def run(args: argparse.Namespace) -> dict:
         result["route_smoke"] = "PASSED"
     if args.native_golden:
         native = torch.load(args.native_golden, map_location="cpu", weights_only=True)
-        compare_result = compare if cube and args.variant != "cube-grouped" else compare_native
+        compare_result = compare if cube and args.variant not in GROUPED_CUBE_VARIANTS else compare_native
         result["native_correctness"] = {
             "output": compare_result(actual_output, native["output"]),
             "state": compare_result(actual_state, native["state"]),
@@ -345,7 +352,7 @@ def run(args: argparse.Namespace) -> dict:
         }
         if any(value["exact_mismatch_count"] for value in result["correctness"].values()):
             raise AssertionError(
-                f"variant {args.variant} differs bitwise from vector variant 0: {result['correctness']}"
+                f"variant {args.variant} differs bitwise from the supplied golden: {result['correctness']}"
             )
     if args.write_golden:
         args.write_golden.parent.mkdir(parents=True, exist_ok=True)

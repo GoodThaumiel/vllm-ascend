@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -182,6 +183,14 @@ def test_310p_dflash_grouping_reuses_slots_and_preserves_draft_attention(monkeyp
     for group in groups:
         slots = layout.state_slots if isinstance(group.kv_cache_spec, MambaSpec) else layout.attention_slots
         assert len({slots[name] for name in group.layer_names}) == len(group.layer_names)
+    config.speculative_config.num_speculative_tokens = 5
+    specs = {
+        name: replace(spec, num_speculative_blocks=5) if isinstance(spec, MambaSpec) else spec
+        for name, spec in specs.items()
+    }
+    groups = make_dflash_shared_kv_groups(config, specs)
+    assert groups is not None and dflash_shared_kv_layout(config, groups) is not None
+    assert dflash_blocks_per_request(groups, 2453) == 52
     monkeypatch.setenv("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "0")
     assert make_dflash_shared_kv_groups(config, specs) is None
     assert dflash_shared_kv_layout(config, groups) is None

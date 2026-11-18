@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend._310p.dflash_config import DFLASH_MAX_DRAFT_TOKENS
 from vllm_ascend._310p.dflash_kv_layout import make_dflash_shared_kv_groups
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -598,7 +599,7 @@ def _get_dflash_bucket_kv_cache_groups(
     if (
         spec is None
         or spec.method != "dflash"
-        or spec.num_speculative_tokens != 7
+        or not 1 <= spec.num_speculative_tokens <= DFLASH_MAX_DRAFT_TOKENS
         or vllm_config.use_v2_model_runner
         or vllm_config.parallel_config.tensor_parallel_size != 2
         or not any(isinstance(layer_spec, MambaSpec) for layer_spec in kv_cache_spec.values())

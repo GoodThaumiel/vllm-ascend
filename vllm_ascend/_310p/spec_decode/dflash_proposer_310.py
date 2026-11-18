@@ -13,10 +13,12 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-from vllm_ascend import envs
 from vllm_ascend._310p.attention.dflash_splitfuse import DFlashSplitFuse310, draft_kv_group_order
 from vllm_ascend._310p.dflash_config import (
+    DFLASH_MAX_DRAFT_TOKENS,
     DFLASH_MRV1_LOADING,
+    DFLASH_QUERY_DMA_LANES,
+    pack_query_lanes,
     retained_page_range,
     usable_decode_sizes,
     validate_packed_context,
@@ -27,8 +29,6 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 
-DRAFT_TOKENS = 7
-WIDTH = DRAFT_TOKENS + 1
 QUERY_FIELDS = 6
 REQUEST_INFO = 5
 
@@ -77,7 +77,7 @@ class DFlashRotary310(nn.Module):
 
 
 class AscendDFlashProposer310(AscendDflashProposer):
-    """The 35B TP2 K=7 pilot using the native RGDR target path."""
+    """The 35B TP2 pilot with a per-service DFlash proposal width."""
 
     def __init__(self, vllm_config, device, runner):
         super().__init__(vllm_config, device, runner)
@@ -86,7 +86,7 @@ class AscendDFlashProposer310(AscendDflashProposer):
         cache = vllm_config.cache_config
         mode = vllm_config.compilation_config.cudagraph_mode
         if (
-            spec.num_speculative_tokens != DRAFT_TOKENS
+            not 1 <= spec.num_speculative_tokens <= DFLASH_MAX_DRAFT_TOKENS
             or spec.draft_sample_method != "greedy"
             or spec.disable_padded_drafter_batch
             or spec.draft_tensor_parallel_size != 2
@@ -103,11 +103,11 @@ class AscendDFlashProposer310(AscendDflashProposer):
             or self.dtype != torch.float16
             or replayssm_sd_enabled(vllm_config)
             or cache.use_replayssm
-            or envs.VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY
             or mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY)
             or (mode == CUDAGraphMode.FULL_DECODE_ONLY and not self.use_cuda_graph)
         ):
-            raise ValueError("310P DFlash L2 requires text FP16, K=7, greedy, TP2, native RGDR and MRv1; see LEVEL2.md")
+            raise ValueError("310P DFlash L2 requires text FP16, K=1–7, greedy, TP2 and MRv1; see LEVEL2.md")
+        self.query_width = self.num_speculative_tokens + 1
         self._groups: tuple[DraftKVGroup, ...] = ()
         self._batch_buffers = {}
         self._rope = None
@@ -171,10 +171,12 @@ class AscendDFlashProposer310(AscendDflashProposer):
                 self.vllm_config.compilation_config.cudagraph_capture_sizes,
                 self.max_batch_size,
                 self.max_num_tokens,
-                WIDTH,
+                self.query_width,
             )
             if not sizes:
-                raise ValueError("310P DFlash FULL_DECODE_ONLY needs a usable capture size divisible by 8")
+                raise ValueError(
+                    f"310P DFlash FULL_DECODE_ONLY needs a usable capture size divisible by {self.query_width}"
+                )
             logger.info("310P DFlash exact capture token sizes: %s", sorted(sizes))
         if not hasattr(torch.ops.dflash_310p, "prepare_"):
             root = Path(__file__).resolve().parents[3]
@@ -204,15 +206,15 @@ class AscendDFlashProposer310(AscendDflashProposer):
             for group in self._groups:
                 attention = DFlashSplitFuse310(
                     rows=rows,
-                    query_width=WIDTH,
+                    query_width=self.query_width,
                     table_width=group.table_width,
                     page_size=group.page_size,
                     device=self.device,
                     causal=group.causal,
                     window=group.window,
                 )
-                slots = torch.empty(rows * WIDTH, dtype=torch.int32, device=self.device)
-                metadata = AscendMetadata(num_actual_tokens=rows * WIDTH, slot_mapping=slots)
+                slots = torch.empty(rows * self.query_width, dtype=torch.int32, device=self.device)
+                metadata = AscendMetadata(num_actual_tokens=rows * self.query_width, slot_mapping=slots)
                 metadata.dflash_splitfuse = attention
                 caches.append(metadata)
             metadata_by_layer = {
@@ -220,7 +222,8 @@ class AscendDFlashProposer310(AscendDflashProposer):
                 for name, index in zip(self.model.get_draft_kv_cache_layer_names(), self._layer_group_indices)
             }
             rope_tables = tuple(
-                torch.empty((1, rows * WIDTH, 1, 128), dtype=self.dtype, device=self.device) for _ in range(2)
+                torch.empty((1, rows * self.query_width, 1, 128), dtype=self.dtype, device=self.device)
+                for _ in range(2)
             )
             self._batch_buffers[rows] = caches, metadata_by_layer, rope_tables
         return self._batch_buffers[rows]
@@ -266,7 +269,9 @@ class AscendDFlashProposer310(AscendDflashProposer):
         width = max(table.shape[1] for table in tables)
         padded = [torch.nn.functional.pad(table, (0, width - table.shape[1]), value=-1) for table in tables]
         block_tables = torch.stack(padded).to(self.device)
-        query = torch.empty((len(tables), rows, QUERY_FIELDS, WIDTH), dtype=torch.int32, device=self.device)
+        query = torch.empty(
+            (len(tables), rows, QUERY_FIELDS, DFLASH_QUERY_DMA_LANES), dtype=torch.int32, device=self.device
+        )
         torch.ops.dflash_310p.prepare_(
             request,
             self._positions_in,
@@ -274,7 +279,7 @@ class AscendDFlashProposer310(AscendDflashProposer):
             self._group_info,
             query,
             self._context_out,
-            DRAFT_TOKENS,
+            self.num_speculative_tokens,
             self.max_model_len,
             self.parallel_drafting_token_id,
             False,
@@ -288,16 +293,16 @@ class AscendDFlashProposer310(AscendDflashProposer):
 
     def _stage(self, prepared, tables):
         rows = prepared.shape[1]
-        total = rows * WIDTH
+        total = rows * self.query_width
         caches, _, rope_tables = self._buffers(rows)
-        self.input_ids[:total].copy_(prepared[0, :, 0, :].reshape(-1))
-        self.positions[:total].copy_(prepared[0, :, 1, :].reshape(-1))
+        self.input_ids[:total].copy_(pack_query_lanes(prepared[0, :, 0], self.query_width))
+        self.positions[:total].copy_(pack_query_lanes(prepared[0, :, 1], self.query_width))
         for index, metadata in enumerate(caches):
             group = self._groups[index]
             lengths = prepared[index, :, REQUEST_INFO, 2].contiguous()
             table = tables[index].clone()
             for row, length in enumerate(lengths.tolist()):
-                earliest, latest = retained_page_range(length, WIDTH, group.page_size, group.window)
+                earliest, latest = retained_page_range(length, self.query_width, group.page_size, group.window)
                 retained = table[row, earliest:latest].clone()
                 if (
                     retained.numel() != latest - earliest
@@ -308,7 +313,7 @@ class AscendDFlashProposer310(AscendDflashProposer):
                 table[row].zero_()
                 table[row, : retained.numel()].copy_(retained)
                 lengths[row] -= earliest * group.page_size
-            metadata.slot_mapping.copy_(prepared[index, :, 2, :].reshape(-1))
+            metadata.slot_mapping.copy_(pack_query_lanes(prepared[index, :, 2], self.query_width))
             metadata.dflash_splitfuse.refresh(lengths, table)
         for target, source in zip(rope_tables, self._rope.tables(self.positions[:total], self.dtype)):
             target.copy_(source)
@@ -327,8 +332,8 @@ class AscendDFlashProposer310(AscendDflashProposer):
         with set_ascend_forward_context(
             metadata,
             self.vllm_config,
-            num_tokens=rows * WIDTH,
-            num_actual_tokens=rows * WIDTH,
+            num_tokens=rows * self.query_width,
+            num_actual_tokens=rows * self.query_width,
             batch_descriptor=descriptor,
             aclgraph_runtime_mode=mode,
             is_draft_model=True,
@@ -337,7 +342,7 @@ class AscendDFlashProposer310(AscendDflashProposer):
         ):
             self._rope.query_tables = rope_tables
             try:
-                return self._runnable(rows * WIDTH)
+                return self._runnable(rows * self.query_width)
             finally:
                 self._rope.query_tables = None
 
@@ -358,8 +363,8 @@ class AscendDFlashProposer310(AscendDflashProposer):
         self._last_draft_probs = None
         if num_speculative_tokens == 0:
             return torch.empty((common_attn_metadata.num_reqs, 0), dtype=torch.long, device=self.device)
-        if num_speculative_tokens != DRAFT_TOKENS:
-            raise ValueError("310P DFlash L2 uses a fixed K=7")
+        if num_speculative_tokens != self.num_speculative_tokens:
+            raise ValueError(f"310P DFlash expects the configured K={self.num_speculative_tokens}")
         scheduler_output = kwargs.get("scheduler_output")
         if scheduler_output is not None and scheduler_output.scheduled_encoder_inputs:
             raise ValueError("310P DFlash L2 accepts text requests only")
@@ -392,12 +397,12 @@ class AscendDFlashProposer310(AscendDflashProposer):
         if mode == CUDAGraphMode.FULL:
             if (
                 descriptor != target_model_batch_desc
-                or descriptor.num_tokens != rows * WIDTH
+                or descriptor.num_tokens != rows * self.query_width
                 or not isinstance(self._runnable, ACLGraphWrapper)
                 or descriptor not in self._runnable.concrete_aclgraph_entries
             ):
                 raise RuntimeError(f"Missing matching 310P DFlash draft graph for {descriptor}")
-        self.runner._trace_dflash("draft_forward_begin", mode=mode.name, tokens=rows * WIDTH)
+        self.runner._trace_dflash("draft_forward_begin", mode=mode.name, tokens=rows * self.query_width)
         hidden = self._forward(rows, mode, descriptor)
         self.runner._trace_dflash("draft_forward_enqueued")
         if mode == CUDAGraphMode.FULL and rows not in self._draft_route_logged:
@@ -405,13 +410,13 @@ class AscendDFlashProposer310(AscendDflashProposer):
             logger.info(
                 "310P DFlash graph replay component=draft rank=%d tokens=%d",
                 get_tensor_model_parallel_rank(),
-                rows * WIDTH,
+                rows * self.query_width,
             )
-        indices = prepared[0, :, 3, :DRAFT_TOKENS].reshape(-1).to(self.device)
+        indices = pack_query_lanes(prepared[0, :, 3], self.num_speculative_tokens).to(self.device)
         self.runner._trace_dflash("draft_sample_begin")
         draft_ids, _ = self.compute_draft_token_ids(hidden.index_select(0, indices), None)
         self.runner._trace_dflash("draft_sample_end")
-        return draft_ids.view(rows, DRAFT_TOKENS)
+        return draft_ids.view(rows, self.num_speculative_tokens)
 
     def dummy_run(
         self,
@@ -426,18 +431,19 @@ class AscendDFlashProposer310(AscendDflashProposer):
     ):
         rows = min(max(num_reqs, 1), self.max_batch_size)
         if self._groups:
-            prepared = torch.zeros((len(self._groups), rows, QUERY_FIELDS, WIDTH), dtype=torch.int32)
-            prepared[:, :, 1, :] = torch.arange(WIDTH, dtype=torch.int32)
-            prepared[:, :, REQUEST_INFO, 2] = WIDTH
+            prepared = torch.zeros((len(self._groups), rows, QUERY_FIELDS, DFLASH_QUERY_DMA_LANES), dtype=torch.int32)
+            query_lanes = torch.arange(self.query_width, dtype=torch.int32)
+            prepared[:, :, 1, : self.query_width] = query_lanes
+            prepared[:, :, REQUEST_INFO, 2] = self.query_width
             tables = []
             for index, group in enumerate(self._groups):
                 first_pages = torch.arange(group.null_pages, group.null_pages + rows, dtype=torch.int32)
-                if group.page_count < group.null_pages + rows or group.page_size < WIDTH:
+                if group.page_count < group.null_pages + rows or group.page_size < self.query_width:
                     raise ValueError("310P DFlash graph dummy rows do not fit in allocated draft cache")
                 table = torch.zeros((rows, group.table_width), dtype=torch.int32)
                 table[:, 0] = first_pages
                 tables.append(table)
-                prepared[index, :, 2, :] = first_pages[:, None] * group.page_size + torch.arange(WIDTH)
+                prepared[index, :, 2, : self.query_width] = first_pages[:, None] * group.page_size + query_lanes
             self._stage(prepared, tables)
         elif is_profile:
             count = min(num_tokens, self.max_num_tokens)
@@ -454,5 +460,5 @@ class AscendDFlashProposer310(AscendDflashProposer):
             logger.info(
                 "310P DFlash graph ready component=draft rank=%d tokens=%d",
                 get_tensor_model_parallel_rank(),
-                rows * WIDTH,
+                rows * self.query_width,
             )

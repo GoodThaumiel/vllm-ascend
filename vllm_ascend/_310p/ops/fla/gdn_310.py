@@ -30,6 +30,7 @@ from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 from vllm_ascend._310p.ops.replayssm_sd import replayssm_sd_310p_decode
 from vllm_ascend._310p.ops.replayssm_sd_trace import active_trace
+from vllm_ascend._310p.ops.rgdr_grouped import grouped_rgdr_launch_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
@@ -126,6 +127,8 @@ def npu_recurrent_gated_delta_rule_310(
     if use_grouped and total_tokens:
         if g is None or num_accepted_tokens is None or ssm_state_indices.ndim != 2:
             raise ValueError("310P grouped RGDR requires gate, previous acceptance and a per-row candidate slot table")
+        cores, probe = grouped_rgdr_launch_config()
+        probe_args = (probe,) if probe is not None else ()
         out = torch.empty_like(v, dtype=torch.float16, memory_format=torch.contiguous_format)
         torch.ops.rgdr_v310_cube_fp16.run_(
             q.squeeze(0).to(torch.float16).contiguous(),
@@ -139,9 +142,10 @@ def npu_recurrent_gated_delta_rule_310(
             out.squeeze(0),
             k.shape[-1] ** -0.5,
             False,
-            7,
+            cores,
             True,
             cu_seqlens.to(torch.int32).contiguous(),
+            *probe_args,
         )
         return out
     flat_state_indices = _flatten_state_indices(ssm_state_indices, cu_seqlens, total_tokens)

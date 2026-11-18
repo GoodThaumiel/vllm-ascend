@@ -11,6 +11,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, SlidingWindowSpec
 
 from vllm_ascend import envs
+from vllm_ascend._310p.dflash_config import DFLASH_MAX_DRAFT_TOKENS
 
 
 def dflash_shared_kv_enabled(config) -> bool:
@@ -19,7 +20,7 @@ def dflash_shared_kv_enabled(config) -> bool:
         envs.VLLM_ASCEND_310P_DFLASH_SHARED_KV
         and spec is not None
         and spec.method == "dflash"
-        and spec.num_speculative_tokens == 7
+        and 1 <= spec.num_speculative_tokens <= DFLASH_MAX_DRAFT_TOKENS
         and not config.use_v2_model_runner
         and config.parallel_config.tensor_parallel_size == 2
         and config.parallel_config.pipeline_parallel_size == 1

@@ -59,6 +59,7 @@ from vllm_ascend._310p.ops.replayssm_sd import (
     load_replayssm_sd_310p_ops,
 )
 from vllm_ascend._310p.ops.replayssm_sd_trace import ReplaySSM310Trace
+from vllm_ascend._310p.ops.rgdr_grouped import grouped_rgdr_launch_config
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
@@ -120,20 +121,31 @@ class NPUModelRunner310(NPUModelRunner):
                 raise ValueError("310P grouped RGDR uses the native cache lifecycle. Disable ReplaySSM and trace.")
             if (
                 self.speculative_config is None
-                or self.speculative_config.method != "mtp"
+                or self.speculative_config.method not in ("mtp", "dflash")
                 or not 1 <= self.num_spec_tokens <= 7
                 or self.parallel_config.tensor_parallel_size != 2
                 or self.cache_config.mamba_cache_mode != "none"
             ):
-                raise ValueError("310P grouped RGDR pilot requires TP2, MTP1–7 and --mamba-cache-mode none")
+                raise ValueError(
+                    "310P grouped RGDR requires TP2, MTP or DFlash with K=1–7, and --mamba-cache-mode none"
+                )
             library = Path(grouped_library).expanduser()
             if not library.is_absolute() or not library.is_file():
                 raise ValueError("VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY must be an absolute path to the built .so")
             torch.ops.load_library(str(library))
-            op = getattr(torch.ops.rgdr_v310_cube_fp16, "run_", None)
-            if op is None or not any(arg.name == "row_offsets" for arg in op.default._schema.arguments):
-                raise RuntimeError("Rebuild the 310P grouped RGDR library with packed row support")
-            logger.info("310P grouped FP16 RGDR enabled for MTP%d (%s)", self.num_spec_tokens, library)
+            cores, probe = grouped_rgdr_launch_config()
+            method = self.speculative_config.method
+            if method == "dflash" and probe is None:
+                raise RuntimeError("Rebuild the 310P grouped RGDR library with rank1-gather16-interleave for DFlash")
+            logger.info(
+                "310P grouped FP16 RGDR enabled rank=%d method=%s K=%d variant=%s cores=%d library=%s",
+                get_tensor_model_parallel_rank(),
+                method,
+                self.num_spec_tokens,
+                "rank1-gather16-interleave" if probe is not None else "legacy-grouped",
+                cores,
+                library,
+            )
         if self._replayssm_sd_ring_slots is not None:
             load_replayssm_sd_310p_ops()
             logger.info(
@@ -1056,8 +1068,8 @@ class NPUModelRunner310(NPUModelRunner):
                 layer_names.add(layer_name)
         assert layer_names == set(kv_cache.keys()), "Some layers are not correctly initialized"
         if shared is not None:
-            # 2048 input + 400 output + K=7 lookahead, capped by model length.
-            workload_length = min(2455, self.max_model_len)
+            # The 2k/400 comparison includes the configured lookahead.
+            workload_length = min(2048 + 400 + self.num_spec_tokens, self.max_model_len)
             blocks = dflash_blocks_per_request(groups, workload_length)
             logger.info(
                 "310P DFlash shared KV allocation rank=%d pool_blocks=%d physical_bytes_per_pool_block=%d "

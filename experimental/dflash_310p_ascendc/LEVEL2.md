@@ -156,3 +156,68 @@ npu-smi info
 显式值优先于环境变量。该值按每 rank 计，profile 仍执行，输入不得超过 profile 后实测空闲内存。先复用默认轮的 `planned_backing_bytes` 校验显式路径的 block 数，再结合实际 workspace/graph 余量选需要对比的预算。v24 模式沿用当前 0.30 分组，按 v24 的逻辑计费方式定容。不同分组会产生不同的倍数。
 
 每轮先检查 `/health` 和 C1 双图，再跑 C10 补入、C48 2k/400。回传两 rank 的 `310P DFlash KV memory after profiling`、`shared KV budget`、`shared KV allocation`、图内存日志、启动后每卡显存、实际持续 running 和抢占次数。缓存分配早于图捕获。若扩大预算后捕获或补入 OOM，记录首个失败阶段，改用较低的显式物理预算验证容量曲线。测 52 的上限时，需把 `max-num-seqs` 和施压并发都设在 52 以上。
+
+## 9. K=1–7 与 8 核 grouped RGDR
+
+本级使用 vLLM/vLLM-Ascend 0.30.0、310P3 TP2、CANN 9.2.1、torch_npu 2.10.0.post7 和同一对 35B W8A8 target/drafter 权重。每次启动固定一个 K。保持 greedy、`temperature=0`、FP16 state、`--mamba-cache-mode none`，并关闭 prefix cache、async scheduling、ReplaySSM 和外置 0.23 monkey patch。DFlash prepare 沿用 LEVEL1 `.so`。Grouped RGDR 使用 `ascend310p-rgdr-patch` 提交 `c98759c` 的计算内核和 Torch binding，服务分派到 `rank1-gather16-interleave`，8 核。
+
+### 9.1 构建与单算子回归
+
+在仓库根目录运行。只构建 RGDR Torch 扩展，沿用当前安装的 vLLM-Ascend。
+
+```bash
+export RGDR_BUILD="$PWD/experimental/rgdr_v310_ablation/build-c921"
+cmake -S experimental/rgdr_v310_ablation -B "$RGDR_BUILD" \
+  -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION=Ascend310P3 \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build "$RGDR_BUILD" --target rgdr_v310_cube_fp16_torch -j8
+export RGDR_SO="$RGDR_BUILD/librgdr_v310_cube_fp16_torch.so"
+readelf -d "$RGDR_SO" | grep -E 'RUNPATH|RPATH'
+```
+
+确认 RUNPATH 包含 `$ORIGIN/lib`。用空闲单卡分别测 K=2/3/5/7，覆盖奇数 query 宽度与目标 K=5 容量场景。Grouped RGDR 对照都用相同的输入种子，并覆盖 ragged 窗口、非零 storage offset、保留槽和图重放。
+
+```bash
+for k in 2 3 5 7; do
+  python3 -m experimental.dflash_310p_ascendc.probe_attention --stage graph --k "$k" --device 0 \
+    --output "$RESULTS/attention-k${k}.json" || break
+  common=(--mtp "$k" --batch 32 --cores 8 --ragged --device 0 --library "$RGDR_SO")
+  python3 -m experimental.rgdr_v310_ablation.bench "${common[@]}" --variant cube-grouped \
+    --write-golden "$RESULTS/grouped-k${k}.pt" --output "$RESULTS/grouped-k${k}.json" || break
+  python3 -m experimental.rgdr_v310_ablation.bench "${common[@]}" --variant rank1-gather16-interleave \
+    --golden "$RESULTS/grouped-k${k}.pt" --output "$RESULTS/interleave-k${k}.json" || break
+done
+```
+
+### 9.2 `vllm serve` 双图与 2k/400
+
+用 §2 的 `COMMON`，从中移除原有 `--speculative-config "$SPEC"`，并设置 `--max-model-len 4096 --max-num-batched-tokens 8192 --max-num-seqs 48 --mamba-cache-mode none --language-model-only`。每次服务启动前设置 K，下面以 K=5 为例。命令使用 §8 的 v24 自动预算复现上一轮约 34 条 running 的配置。若上一轮有显式预算，保留原值并在两条路径使用同一个预算。
+
+```bash
+export K=5
+export VLLM_ASCEND_310P_DFLASH_V24_KV_BUDGET=1
+SPEC=$(python3 -c 'import json,os; print(json.dumps(dict(method="dflash", model=os.environ["DRAFT"], num_speculative_tokens=int(os.environ["K"]), draft_tensor_parallel_size=2, draft_sample_method="greedy")))')
+COMP=$(python3 -c 'import json,os; w=int(os.environ["K"])+1; print(json.dumps(dict(cudagraph_mode="FULL_DECODE_ONLY", cudagraph_capture_sizes=[w*n for n in (1,4,8,10,16,24,28,32,34,36,40,48)])))')
+unset VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY
+vllm serve "${COMMON[@]}" --speculative-config "$SPEC" --compilation-config "$COMP" \
+  2>&1 | tee "$RESULTS/native-k${K}.log"
+# 测完并停止原生服务后，再启动 grouped 路径。
+VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY="$RGDR_SO" \
+  vllm serve "${COMMON[@]}" --speculative-config "$SPEC" --compilation-config "$COMP" \
+  2>&1 | tee "$RESULTS/grouped-k${K}.log"
+```
+
+使用 §2/§3 的 HTTP 验证工具。先以原生 RGDR 测 K=2、3、5、7 的 C1 和 C10 持续补入，再对相同 K 启用 grouped RGDR 重跑。K=1、4、6 至少跑双路径 C1，补齐宽度覆盖。最大 capture token 数应为 `max-num-seqs × (K+1)` 或更小。若当前负载的实际 running 批大小未捕获，实测会走 eager。做吞吐对照时两条路径使用相同的 capture sizes，并从日志核对命中率。
+
+
+C48 使用上一轮的约 2048-token prompt 文件。在另一终端分别为两种服务设置 `ROUTE=native` 或 `ROUTE=grouped`，输出写到不同文件。
+
+```bash
+export K=5 ROUTE=native
+python3 scripts/replayssm/validate_sd_serve.py --model dflash310 \
+  --prompt-file "$RESULTS/2k.txt" --max-tokens 400 --concurrency 48 \
+  --timeout 1200 --output "$RESULTS/${ROUTE}-k${K}-c48.json"
+```
+
+回传每 rank 的 `310P grouped FP16 RGDR enabled`、target/draft graph replay、首分叉与 logprobs、acceptance、实际 running、TPOT 和总吞吐。Grouped 版的 target verify 在 msprof 中应出现 `rgdr_v310_cube_probe_rank1_gather16_interleave` 或 `_h16`，blockDim=8。单 token 非投机分支仍可能出现原生 RGDR。优先测 K=5、7 的 C48 2k/400，核对 K=7 的约 34 条运行基线和 K=5 的 `estimated_concurrency`。K=2/4/6 若出现图错误，保留同 K eager 对照和首个 SplitFuse 或 GDN 错误。

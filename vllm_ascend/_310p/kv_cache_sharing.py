@@ -9,6 +9,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend._310p.dflash_config import DFLASH_MAX_DRAFT_TOKENS
+
 
 def get_310p_dflash_private_page_bytes(vllm_config, groups) -> list[int] | None:
     """Return per-layer backing bytes for each group in the 310P DFlash MRv1 pilot."""
@@ -16,7 +18,7 @@ def get_310p_dflash_private_page_bytes(vllm_config, groups) -> list[int] | None:
     if (
         spec_config is None
         or spec_config.method != "dflash"
-        or spec_config.num_speculative_tokens != 7
+        or not 1 <= spec_config.num_speculative_tokens <= DFLASH_MAX_DRAFT_TOKENS
         or vllm_config.use_v2_model_runner
         or vllm_config.parallel_config.tensor_parallel_size != 2
         # The pilot uses one state group and separate attention groups. The
