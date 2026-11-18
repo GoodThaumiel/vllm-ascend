@@ -105,3 +105,18 @@ npu-smi info
 - `target_forward_begin` 的 `mode` 为 `NONE`，且此前读到的是 prefill 时，若没有 `target_forward_enqueued`，优先定位 target prefill 内的算子和 TP 通信。
 - `draft_prepare_readback_begin` 或 `draft_prior_stream_wait_begin` 后无对应结束时，记录前面最后完成的边界。这些等待会暴露更早的异步算子失败。
 - 只有 trace 先出现 `mode` 为 `FULL`，才把 ACLGraph replay 列为当前卡点。日志里的 `enqueued` 表示主机已返回，设备工作可能仍在执行。
+
+## 5. Worker 初始化时 `Range_int32` 超时
+
+如果日志在 `MinTokensLogitsProcessor` 初始化报 507014，并且 CANN 指出的故障内核是 `Range_int32_double_high_performance__kernel0`，先隔离 Range。这里还在构造 worker 的 model runner，早于 KV 定容、图捕获和请求处理。固定 `K=7`、48 sequences、8192 batched tokens、最大图尺寸 384 时，上游 MRv1 DFlash 初始化有两次 int32 `arange`，长度分别为 `8192`（基类索引）和 `8577`（context + query positions + 1）。
+
+先用 `npu-smi info` 核对物理卡映射和占用。在确认空闲的卡上，每条命令使用独立进程，设置 `CARD` 为对应的可见卡编号。探针只用 PyTorch/torch_npu，无需启动服务或重编译库。
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES="$CARD" python3 -m experimental.dflash_310p_ascendc.probe_startup_range \
+  --device 0 --length 8192
+ASCEND_RT_VISIBLE_DEVICES="$CARD" python3 -m experimental.dflash_310p_ascendc.probe_startup_range \
+  --device 0 --length 8577
+```
+
+若某个长度失败，在健康空闲卡上用相同长度加 `--source cpu` 做拷贝对照，并在另一张空闲卡上复测同一 NPU 用例。保留两次 `device_sync`、`range_begin/end`、`readback_begin` 边界和首个 CANN 故障日志。独立 Range 与 CPU 拷贝都通过后，用同一启动参数在一对空闲卡上启动服务。若仍报同一内核，只在下一次启动诊断设置 `ASCEND_LAUNCH_BLOCKING=1`，获取实际提交 Range 的 Python 调用栈。服务启动通过后，去掉该环境变量，继续 §4 的 C48 定位。
