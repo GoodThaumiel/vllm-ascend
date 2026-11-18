@@ -25,6 +25,7 @@ from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
+from vllm_ascend._310p.dflash_kv_layout import dflash_shared_kv_layout
 from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
 from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
@@ -38,6 +39,17 @@ class NPUWorker310(NPUWorker):
         layout_resolver = getattr(self.vllm_config.cache_config, "get_resolved_kv_cache_layout", None)
         if isinstance(kv_cache_spec, dict) and callable(layout_resolver):
             groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+            if layout := dflash_shared_kv_layout(self.vllm_config, groups):
+                planner_bytes = max(len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups)
+                num_blocks = available_memory // layout.bytes_per_pool_block
+                logger.info(
+                    "310P DFlash shared KV budget: physical_budget_bytes=%d physical_bytes_per_pool_block=%d "
+                    "blocks_from_budget=%d",
+                    available_memory,
+                    layout.bytes_per_pool_block,
+                    num_blocks,
+                )
+                return num_blocks * planner_bytes
             private_pages = get_310p_dflash_private_page_bytes(self.vllm_config, groups)
             if private_pages is not None:
                 logical_group_bytes = [len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups]

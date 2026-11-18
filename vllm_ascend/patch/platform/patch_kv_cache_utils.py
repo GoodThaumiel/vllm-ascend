@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend._310p.dflash_kv_layout import make_dflash_shared_kv_groups
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.deepseek_v41.cache_config import (
@@ -605,6 +606,9 @@ def _get_dflash_bucket_kv_cache_groups(
     ):
         return None
     cache_utils = vllm.v1.core.kv_cache_utils
+    if shared_groups := make_dflash_shared_kv_groups(vllm_config, kv_cache_spec):
+        cache_utils._annotate_eagle_groups(vllm_config, kv_cache_spec, shared_groups)
+        return shared_groups
     common_page_size = max(layer_spec.page_size_bytes for layer_spec in kv_cache_spec.values())
     # The runner may already have padded target attention to the Mamba page.
     # Upstream may scale block_size using that padded size, but the old

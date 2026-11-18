@@ -48,6 +48,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
+from vllm_ascend._310p.dflash_kv_layout import dflash_blocks_per_request, dflash_shared_kv_layout
 from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
 from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
@@ -929,14 +930,14 @@ class NPUModelRunner310(NPUModelRunner):
         # init kv cache tensors
         kv_cache: dict[str, list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]] = {}
         groups = kv_cache_config.kv_cache_groups
-        private_pages = get_310p_dflash_private_page_bytes(self.vllm_config, groups)
+        shared = dflash_shared_kv_layout(self.vllm_config, groups)
+        private_pages = get_310p_dflash_private_page_bytes(self.vllm_config, groups) if shared is None else None
         layout_resolver = getattr(self.cache_config, "get_resolved_kv_cache_layout", None)
-        share_slots = (
-            get_310p_shared_cache_slots(groups, layout_resolver())
-            if private_pages is None and callable(layout_resolver)
-            else {}
-        )
+        share_slots = shared.state_slots if shared is not None else {}
+        if shared is None and private_pages is None and callable(layout_resolver):
+            share_slots = get_310p_shared_cache_slots(groups, layout_resolver())
         mamba_slot_caches: dict[int, list[torch.Tensor]] = {}
+        attention_slot_caches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # get kv cache spec for each layer
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
         for group_kv_cache_spec in kv_cache_config.kv_cache_groups:
@@ -957,7 +958,9 @@ class NPUModelRunner310(NPUModelRunner):
                     # it is the per-layer byte count (matching v0.28.0's size).
                     num_blocks = kv_cache_config.num_blocks
                     page_bytes = (
-                        cache_spec.real_page_size_bytes if private_pages is not None else cache_spec.page_size_bytes
+                        cache_spec.real_page_size_bytes
+                        if shared is not None or private_pages is not None
+                        else cache_spec.page_size_bytes
                     )
                     per_layer_size = num_blocks * page_bytes
                     # Standardized descriptors name each layer separately.
@@ -1013,11 +1016,28 @@ class NPUModelRunner310(NPUModelRunner):
                     k_shape = kv_cache_shape[1:]
                     v_shape = k_shape
                     dtype = kv_cache_spec.dtype
-                    # main: every layer owns its own region; give each layer a
-                    # private (k, v) so block indices don't collide across layers.
                     for layer_name_inner in shared_names:
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            kv_cache[layer_name_inner] = (
+                            slot = shared.attention_slots[layer_name_inner] if shared is not None else None
+                            if slot is not None and slot in attention_slot_caches:
+                                key, value = attention_slot_caches[slot]
+                                # The global pool assigns an ID to only one group
+                                # at a time. Equal bytes per ID keep NZ views disjoint
+                                # across groups even when kernel page sizes differ.
+                                assert key.numel() == math.prod(k_shape) and key.dtype == dtype
+                                key_view, value_view = key.view(k_shape), value.view(v_shape)
+                                if (
+                                    key_view.data_ptr() != key.data_ptr()
+                                    or value_view.data_ptr() != value.data_ptr()
+                                    or torch_npu.get_npu_format(key_view) != self._acl_format
+                                    or torch_npu.get_npu_format(value_view) != self._acl_format
+                                ):
+                                    raise RuntimeError(
+                                        f"310P DFlash shared KV lost its NZ backing for {layer_name_inner}"
+                                    )
+                                kv_cache[layer_name_inner] = (key_view, value_view)
+                                continue
+                            pair = (
                                 torch_npu.empty_with_format(
                                     size=k_shape, dtype=dtype, device=self.device, acl_format=self._acl_format
                                 ),
@@ -1025,6 +1045,9 @@ class NPUModelRunner310(NPUModelRunner):
                                     size=v_shape, dtype=dtype, device=self.device, acl_format=self._acl_format
                                 ),
                             )
+                            kv_cache[layer_name_inner] = pair
+                            if slot is not None:
+                                attention_slot_caches[slot] = pair
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
@@ -1032,7 +1055,34 @@ class NPUModelRunner310(NPUModelRunner):
                     continue
                 layer_names.add(layer_name)
         assert layer_names == set(kv_cache.keys()), "Some layers are not correctly initialized"
-        if private_pages is not None:
+        if shared is not None:
+            # 2048 input + 400 output + K=7 lookahead, capped by model length.
+            workload_length = min(2455, self.max_model_len)
+            blocks = dflash_blocks_per_request(groups, workload_length)
+            logger.info(
+                "310P DFlash shared KV allocation rank=%d pool_blocks=%d physical_bytes_per_pool_block=%d "
+                "state_slots=%d attention_slots=%d workload_tokens=%d blocks_per_request=%d estimated_concurrency=%d "
+                "groups(gid, type, layers, block_tokens, real_page_bytes)=%s",
+                get_tensor_model_parallel_rank(),
+                kv_cache_config.num_blocks,
+                shared.bytes_per_pool_block,
+                len(mamba_slot_caches),
+                len(attention_slot_caches),
+                workload_length,
+                blocks,
+                (kv_cache_config.num_blocks - 1) // blocks,
+                [
+                    (
+                        gid,
+                        type(group.kv_cache_spec).__name__,
+                        len(group.layer_names),
+                        group.kv_cache_spec.block_size,
+                        group.kv_cache_spec.real_page_size_bytes,
+                    )
+                    for gid, group in enumerate(groups)
+                ],
+            )
+        elif private_pages is not None:
             logger.info(
                 "310P DFlash KV allocation rank=%d pool_blocks=%d groups "
                 "(gid, type, layers, block_tokens, planner_page_bytes, backing_page_bytes, speculative_blocks)=%s",

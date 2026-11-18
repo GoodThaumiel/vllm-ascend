@@ -92,6 +92,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Absolute path to the experimental 310P3 grouped RGDR Torch library.
     # Unset uses native V310. The path is local and is not sensitive.
     "VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY": lambda: os.getenv("VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY"),
+    # Use shared backing across compatible 310P DFlash MRv1 KV groups.
+    "VLLM_ASCEND_310P_DFLASH_SHARED_KV": lambda: _strict_binary_env("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "1"),
     # Number of initial 310P DFlash scheduler steps to log per TP rank.
     # Default 0; valid values >=0. Diagnostic only and not sensitive.
     "VLLM_ASCEND_310P_DFLASH_STAGE_TRACE": lambda: int(os.getenv("VLLM_ASCEND_310P_DFLASH_STAGE_TRACE") or 0),

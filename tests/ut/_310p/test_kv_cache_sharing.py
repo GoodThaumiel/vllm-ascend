@@ -14,6 +14,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_ascend._310p.dflash_kv_layout import (
+    dflash_blocks_per_request,
+    dflash_shared_kv_layout,
+    make_dflash_shared_kv_groups,
+)
 from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 
 
@@ -126,3 +131,57 @@ def test_dflash_private_pages_charge_backing_bytes_without_changing_cache_geomet
     assert [group.kv_cache_spec.page_size_bytes for group in groups] == [common_page] * 3
     config.speculative_config.method = "mtp"
     assert get_310p_dflash_private_page_bytes(config, groups) is None
+
+
+def test_310p_dflash_grouping_reuses_slots_and_preserves_draft_attention(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "1")
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash", num_speculative_tokens=7),
+        use_v2_model_runner=False,
+        parallel_config=SimpleNamespace(tensor_parallel_size=2, pipeline_parallel_size=1),
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 40,
+            max_model_len=4096,
+            original_max_model_len=4096,
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        kv_transfer_config=None,
+    )
+    target = FullAttentionSpec(block_size=640, num_kv_heads=1, head_size=256, dtype=torch.float16)
+    draft = FullAttentionSpec(block_size=640, num_kv_heads=4, head_size=128, dtype=torch.float16, non_causal=True)
+    sliding = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=4096,
+    )
+    state = MambaSpec(
+        block_size=4096,
+        shapes=((10, 2560), (16, 128, 128)),
+        dtypes=(torch.float16, torch.float16),
+        num_speculative_blocks=7,
+    )
+    specs = {f"model.layers.{idx}.linear_attn": state for idx in range(30)}
+    specs.update({f"model.layers.{idx}.self_attn.attn": target for idx in range(30, 40)})
+    specs.update({f"model.layers.{idx}.self_attn.attn": sliding for idx in range(40, 45)})
+    specs["model.layers.45.self_attn.attn"] = draft
+
+    groups = make_dflash_shared_kv_groups(config, specs)
+    assert groups is not None
+    assert sorted(name for group in groups for name in group.layer_names) == sorted(specs)
+    assert [len(group.layer_names) for group in groups] == [6] * 5 + [5, 5, 5, 1]
+    assert [group.kv_cache_spec.block_size for group in groups] == [4096] * 5 + [768, 768, 384, 384]
+    assert groups[-2].kv_cache_spec.sliding_window == 4096
+    assert groups[-1].kv_cache_spec.non_causal
+    assert sliding.block_size == 128 and draft.block_size == 640
+    layout = dflash_shared_kv_layout(config, groups)
+    assert layout is not None
+    assert layout.bytes_per_pool_block == 6 * state.real_page_size_bytes + 5 * 768 * 1024
+    assert dflash_blocks_per_request(groups, 2455) == 62
+    for group in groups:
+        slots = layout.state_slots if isinstance(group.kv_cache_spec, MambaSpec) else layout.attention_slots
+        assert len({slots[name] for name in group.layer_names}) == len(group.layer_names)
+    monkeypatch.setenv("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "0")
+    assert make_dflash_shared_kv_groups(config, specs) is None
+    assert dflash_shared_kv_layout(config, groups) is None

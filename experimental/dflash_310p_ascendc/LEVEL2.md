@@ -132,3 +132,13 @@ npu-smi info
 ```
 
 `KV budget` 给出每个池 block 的旧计费字节数和当前物理字节数，以及同预算下的两种 block 数。`KV allocation` 给出实际 `pool_blocks` 和各组的 `block_tokens`、`planner_page_bytes`、`backing_page_bytes`、`speculative_blocks`。按 gid 与 `MRv1 draft KV groups` 对照即可单独计算 draft 全注意力和滑窗的 padding 差额。记录两个 rank 的这些日志，以及服务启动后的每卡显存。`NPU KV cache usage` 表示调度器共享 block ID 的占用率，可以结合 running 数判断容量。HBM 分配以卡上读数和各组 backing bytes 为准。
+
+## 7. v24 式共享 backing 对照
+
+本轮只改 Python。保持 TP2、K7、FP16 state、原生 RGDR、相同权重、设备、图尺寸和显存预算。使用同一份 2048-token 输入和 400-token 输出的请求集。先关闭外置 `dflash_kv_fix`，用 `VLLM_ASCEND_310P_DFLASH_SHARED_KV=0` 跑私有 backing 对照，再设 `=1` 跑共享版。该变量在启动 `vllm serve` 前设置，默认值为 `1`。
+
+1. 共享版启动后核对两个 rank 都打印 `310P DFlash shared KV budget` 和 `310P DFlash shared KV allocation`，且 draft 仍有原来的滑窗和全注意力组。日志列出物理 bytes/block、实际 `pool_blocks`、各组逻辑 block 大小，以及 2048+400+7 token 的并发估计。如果出现 `310P DFlash KV allocation` 而无 `shared KV allocation`，回传分组和配置，表示该布局未选中共享路径。
+2. 先跑 eager C1，再跑 graph C1/C10。用同一 prompt 对照私有 backing，记录首分叉和 logprobs。C10 使用长短混合及持续补入，覆盖 block ID 在不同请求和 group 间回收，检查双 rank target/draft replay、无非法 slot、无 507014/507015。若换布局后出现稳定分叉，保留相同输入、两种布局的首个分叉及对应 group 日志。
+3. 跑 C48 的 2k/400，记录峰值和持续 running、waiting、preemption、吞吐，以及每 rank 服务稳定后的 HBM。`estimated_concurrency` 按完整 2k/400 序列和一个保留 ID 计算，调度分块及请求长度变化会影响实测值。
+
+以 30 个 GDN 层、10 个 target attention 层、5 个 draft SWA 层和 1 个 draft full 层为例，假设 target 每 rank 一个 256 维 KV head、draft 每 rank 四个 128 维 KV head，max-model-len 4096。共享版使用 6 个 GDN backing 槽、5 对 K/V 槽。Target/draft 调度页分别为 768/384 token，底层仍按 64/128 token 的 kernel 页访问。即使每个请求需要的全局 ID 从约 36 增到 62，ID 的物理成本也从约 25.2 MiB 降到 7.0 MiB。如果旧版持续 7 条请求对应 253–288 个总 block，且两次 `physical_budget_bytes` 相同，新版预计持续 14–16 条。实际模型以日志中的池大小和每请求 ID 数为准。

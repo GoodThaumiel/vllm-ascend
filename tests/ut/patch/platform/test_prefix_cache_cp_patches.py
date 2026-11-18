@@ -808,7 +808,8 @@ def test_kimi_k3_mixed_attention_still_requires_same_block_size() -> None:
     assert _get_kimi_k3_dspark_mixed_kv_cache_groups(specs) is None
 
 
-def test_310p_dflash_grouping_grows_existing_page_padding_without_scaling_tokens() -> None:
+def test_310p_dflash_grouping_grows_existing_page_padding_without_scaling_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "0")
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
             method="dflash", num_speculative_tokens=7, use_eagle_block_drop=lambda: False
