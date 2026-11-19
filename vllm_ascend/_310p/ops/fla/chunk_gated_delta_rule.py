@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vllm_ascend._310p.ops.compute_wy import compute_wy_for_prefill
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 
 CHUNK_SIZE = 64
@@ -482,9 +483,8 @@ def chunk_gated_delta_rule_310(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """310P chunk GDN path backed by AscendC fwd_h/fwd_o kernels.
 
-    Triton is unavailable on 310P, so the local WY preparation is done with
-    torch ops and the inter-chunk state/output matmuls are delegated to the
-    custom AscendC kernels.
+    Local WY preparation uses Torch or the optional AscendC compute WY library.
+    Custom AscendC kernels perform the inter-chunk state/output matmuls.
     """
     if head_first:
         raise DeprecationWarning("head_first=True is not supported in 310P chunk path.")
@@ -532,9 +532,10 @@ def chunk_gated_delta_rule_310(
         return empty_out, final_state
 
     scale = k.shape[-1] ** -0.5 if scale is None else scale
-    q_kernel, k_kernel, w_kernel, u_kernel, g_kernel = _compute_kernel_inputs_from_torch_wy(
-        q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE
-    )
+    wy = compute_wy_for_prefill(q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE)
+    if wy is None:
+        wy = _compute_kernel_inputs_from_torch_wy(q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE)
+    q_kernel, k_kernel, w_kernel, u_kernel, g_kernel = wy
 
     if initial_state is None:
         state = torch.zeros(

@@ -29,6 +29,7 @@ from vllm_ascend import envs
 from vllm_ascend._310p.dflash_kv_layout import dflash_shared_kv_layout
 from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend._310p.ops.compute_wy import load_compute_wy_library
 from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.utils import is_rc_device
 from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
@@ -108,6 +109,8 @@ class NPUWorker310(NPUWorker):
     def init_device(self):
         self.device = self._init_device()
         torch_npu.npu.set_compile_mode(jit_compile=False)
+        if (compute_wy_library := load_compute_wy_library()) is not None:
+            logger.info("310P AscendC compute WY enabled rank=%d library=%s", self.rank, compute_wy_library)
 
         init_workspace_manager(self.device, num_ubatches=1)
         self.model_runner = self._create_model_runner()

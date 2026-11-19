@@ -92,6 +92,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Absolute path to the experimental 310P3 grouped RGDR Torch library.
     # Unset uses native V310. The path is local and is not sensitive.
     "VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY": lambda: os.getenv("VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY"),
+    # Absolute path to the experimental 310P MRv1 prefill compute WY Torch library.
+    # Unset uses Torch WY. The path is local and is not sensitive.
+    "VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY": lambda: os.getenv("VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY"),
     # Use shared backing across compatible 310P DFlash MRv1 KV groups.
     "VLLM_ASCEND_310P_DFLASH_SHARED_KV": lambda: _strict_binary_env("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "1"),
     # Size the shared DFlash pool using v24's logical bytes per block.
