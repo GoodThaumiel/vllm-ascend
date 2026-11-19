@@ -210,7 +210,6 @@ VLLM_ASCEND_310P_GROUPED_RGDR_LIBRARY="$RGDR_SO" \
 
 使用 §2/§3 的 HTTP 验证工具。先以原生 RGDR 测 K=2、3、5、7 的 C1 和 C10 持续补入，再对相同 K 启用 grouped RGDR 重跑。K=1、4、6 至少跑双路径 C1，补齐宽度覆盖。最大 capture token 数应为 `max-num-seqs × (K+1)` 或更小。若当前负载的实际 running 批大小未捕获，实测会走 eager。做吞吐对照时两条路径使用相同的 capture sizes，并从日志核对命中率。
 
-
 C48 使用上一轮的约 2048-token prompt 文件。在另一终端分别为两种服务设置 `ROUTE=native` 或 `ROUTE=grouped`，输出写到不同文件。
 
 ```bash
@@ -221,3 +220,17 @@ python3 scripts/replayssm/validate_sd_serve.py --model dflash310 \
 ```
 
 回传每 rank 的 `310P grouped FP16 RGDR enabled`、target/draft graph replay、首分叉与 logprobs、acceptance、实际 running、TPOT 和总吞吐。Grouped 版的 target verify 在 msprof 中应出现 `rgdr_v310_cube_probe_rank1_gather16_interleave` 或 `_h16`，blockDim=8。单 token 非投机分支仍可能出现原生 RGDR。优先测 K=5、7 的 C48 2k/400，核对 K=7 的约 34 条运行基线和 K=5 的 `estimated_concurrency`。K=2/4/6 若出现图错误，保留同 K eager 对照和首个 SplitFuse 或 GDN 错误。
+
+## 10. K<7 的 MRv1 配置入口修复
+
+若 `e0f1556` 在 `VllmConfig` 构造阶段报 `Model Runner V1 does not support: mixed sliding/full dflash drafts`，原因是平台校验补丁遗漏了 K=7 的固定判断。修复后该入口使用与 proposer、KV 分组一致的 K=1–7 范围。此处错误发生在 worker 初始化前，和当前 RGDR 库的设备执行无关。
+
+本次为 Python 修改，复用 §9 已构建的 `.so`。更新代码后运行以下 CPU 回归，覆盖全部 K 的配置校验入口，并确认不支持的 K、TP 配置、硬件与 DFlash2 仍保留混合 KV 校验限制。
+
+```bash
+git pull --ff-only origin replayssm-310-dflash
+python3 -m unittest tests.ut.replayssm.test_dflash_310p_service_contract
+export VLLM_USE_V2_MODEL_RUNNER=0
+```
+
+随后用原来失败的 K 和服务参数重启，图尺寸继续使用 `K+1` 的倍数。先确认 `/health` 返回 200，再跑 §9 的 C1、C10 和 C48。回传本次 commit、K、完整启动命令、各 rank 的 draft KV group 与 target/draft replay 日志；若仍有错误，保留首次完整堆栈。

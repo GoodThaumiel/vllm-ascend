@@ -1,6 +1,7 @@
 import vllm.envs as envs
 from vllm.config.vllm import VllmConfig
 
+from vllm_ascend._310p.dflash_config import DFLASH_MAX_DRAFT_TOKENS
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
 
@@ -63,7 +64,7 @@ def _patched_get_v1_model_runner_unsupported_features(self) -> list[str]:
         mixed_dflash in unsupported
         and spec is not None
         and spec.method == "dflash"
-        and spec.num_speculative_tokens == 7
+        and 1 <= spec.num_speculative_tokens <= DFLASH_MAX_DRAFT_TOKENS
         and self.parallel_config.tensor_parallel_size == 2
         and not self._is_dflash2_draft()
         and get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY)

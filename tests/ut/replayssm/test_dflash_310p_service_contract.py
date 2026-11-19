@@ -2,7 +2,7 @@
 import unittest
 from pathlib import Path
 from runpy import run_path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -13,6 +13,55 @@ RGDR = run_path(str(ROOT / "vllm_ascend/_310p/ops/rgdr_grouped.py"))
 
 
 class DFlash310PServiceContractTest(unittest.TestCase):
+    def test_mrv1_config_patch_accepts_every_supported_k(self):
+        mixed_dflash = "mixed sliding/full dflash drafts"
+
+        class Config:
+            _validate_v2_model_runner = lambda self: None
+            _get_v2_model_runner_unsupported_features = lambda self: []
+            _get_v1_model_runner_unsupported_features = lambda self: [mixed_dflash, "adaptive draft verification"]
+
+        hardware = SimpleNamespace(supports=lambda capability: True)
+        modules = {
+            name: ModuleType(name)
+            for name in (
+                "vllm",
+                "vllm.envs",
+                "vllm.config.vllm",
+                "vllm_ascend._310p.dflash_config",
+                "vllm_ascend.device.hardware_profile",
+                "vllm_ascend.worker.v2.pp_transport",
+            )
+        }
+        modules["vllm"].envs = modules["vllm.envs"]
+        modules["vllm.config.vllm"].VllmConfig = Config
+        modules["vllm_ascend._310p.dflash_config"].DFLASH_MAX_DRAFT_TOKENS = CONTRACT["DFLASH_MAX_DRAFT_TOKENS"]
+        modules["vllm_ascend.device.hardware_profile"].HardwareCapability = SimpleNamespace(GDN_COMPATIBILITY="gdn")
+        modules["vllm_ascend.device.hardware_profile"].get_current_hardware_profile = lambda: hardware
+        modules["vllm_ascend.worker.v2.pp_transport"].resolve_spec_pp_support = lambda config: None
+        with patch.dict("sys.modules", modules):
+            run_path(str(ROOT / "vllm_ascend/patch/platform/patch_use_v2_model_runner.py"))
+        config = Config()
+        config.speculative_config = SimpleNamespace(method="dflash", num_speculative_tokens=7)
+        config.parallel_config = SimpleNamespace(tensor_parallel_size=2)
+        config._is_dflash2_draft = lambda: False
+        for k in range(1, 8):
+            with self.subTest(k=k):
+                config.speculative_config.num_speculative_tokens = k
+                self.assertEqual(config._get_v1_model_runner_unsupported_features(), ["adaptive draft verification"])
+        for k in (0, 8):
+            config.speculative_config.num_speculative_tokens = k
+            self.assertIn(mixed_dflash, config._get_v1_model_runner_unsupported_features())
+        config.speculative_config.num_speculative_tokens = 5
+        config.parallel_config.tensor_parallel_size = 1
+        self.assertIn(mixed_dflash, config._get_v1_model_runner_unsupported_features())
+        config.parallel_config.tensor_parallel_size = 2
+        hardware.supports = lambda capability: False
+        self.assertIn(mixed_dflash, config._get_v1_model_runner_unsupported_features())
+        hardware.supports = lambda capability: True
+        config._is_dflash2_draft = lambda: True
+        self.assertIn(mixed_dflash, config._get_v1_model_runner_unsupported_features())
+
     def test_mixed_layer_bypass_is_scoped_and_retains_each_layer(self):
         resolve = CONTRACT["dflash_layer_attention"]
         loading = CONTRACT["DFLASH_MRV1_LOADING"]
