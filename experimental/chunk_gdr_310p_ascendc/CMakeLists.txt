@@ -60,5 +60,11 @@ target_link_libraries(replayssm_310p_compute_wy PRIVATE
   replayssm_310p_compute_wy_kernel ${TORCH_LIBRARIES} "${TORCH_NPU_LIB}" "${ASCENDCL_LIB}"
   "${TILING_API_LIB}" "${PLATFORM_LIB}" "${REGISTER_LIB}" "${ASCENDALOG_LIB}")
 set_target_properties(replayssm_310p_compute_wy PROPERTIES
-  BUILD_RPATH "$ORIGIN/lib" BUILD_RPATH_USE_ORIGIN TRUE INSTALL_RPATH "$ORIGIN/lib")
-target_link_options(replayssm_310p_compute_wy PRIVATE "LINKER:-rpath,\\$ORIGIN/lib" "LINKER:--enable-new-dtags")
+  # CANN places the kernel in build/lib. Keep the Torch library at build/.
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<0:>"
+  BUILD_RPATH "$ORIGIN/lib"
+  INSTALL_RPATH "$ORIGIN/lib"
+  BUILD_RPATH_USE_ORIGIN TRUE
+  SKIP_BUILD_RPATH FALSE
+  BUILD_WITH_INSTALL_RPATH FALSE)
+target_link_options(replayssm_310p_compute_wy PRIVATE "LINKER:--enable-new-dtags")

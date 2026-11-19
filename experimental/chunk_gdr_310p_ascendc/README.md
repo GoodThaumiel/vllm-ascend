@@ -6,7 +6,7 @@
 
 ## 构建与单算子校验
 
-在 310P3、CANN 9.2.1、当前服务使用的 Python/Torch/torch_npu 环境里执行。构建只生成 WY 的 kernel 库和 Torch `.so`。运行时保留构建目录下的 `lib/`，供 Torch `.so` 查找 kernel 库。
+在 310P3、CANN 9.2.1、当前服务使用的 Python/Torch/torch_npu 环境里执行。Torch 库位于 `$WY_BUILD/libreplayssm_310p_compute_wy.so`，CANN kernel 库位于 `$WY_BUILD/lib/`。Torch 库通过 ELF RUNPATH 中的 `$ORIGIN/lib` 找到 kernel。
 
 ```bash
 cd experimental/chunk_gdr_310p_ascendc
@@ -16,13 +16,14 @@ cmake -S . -B "$WY_BUILD" -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE="$(command -v python3)"
 cmake --build "$WY_BUILD" --target replayssm_310p_compute_wy -j8
 export VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY="$WY_BUILD/libreplayssm_310p_compute_wy.so"
-readelf -d "$VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY" | grep -E 'RUNPATH|RPATH'
+readelf -d "$VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY" | grep -E 'RUNPATH|NEEDED'
+ldd "$VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY" | grep libreplayssm_310p_compute_wy_kernel
 
 cd ../..
 python3 -m experimental.chunk_gdr_310p_ascendc.smoke --device 0
 ```
 
-Smoke 使用现有 vLLM-Ascend 的 `fwd_h/fwd_o` 扩展。检查 64/128 维的 Q/K 转排、W/U 和 FP32 累计门控，并用有尾块的两条 packed 请求比较整个 chunk GDN 的输出和 checkpoint。
+确认 `ldd` 将 kernel 解析到本次构建的 `$WY_BUILD/lib/`。Smoke 使用现有 vLLM-Ascend 的 `fwd_h/fwd_o` 扩展。检查 64/128 维的 Q/K 转排、W/U 和 FP32 累计门控，并用有尾块的两条 packed 请求比较整个 chunk GDN 的输出和 checkpoint。
 
 ## 服务验证
 
