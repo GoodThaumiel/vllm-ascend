@@ -3,8 +3,8 @@
 
 import argparse
 import json
-import os
 import sys
+from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -31,6 +31,14 @@ def phase(case: str, step: str) -> None:
     print(f"[compute WY smoke] {case}: {step}", file=sys.stderr, flush=True)
 
 
+def run_npu_phase(case, step, call, *args, **kwargs):
+    phase(case, f"submit {step}")
+    result = call(*args, **kwargs)
+    phase(case, f"synchronize {step}")
+    torch.npu.synchronize()
+    return result
+
+
 def inputs(batch, tokens, heads, dim, device, seed):
     generator = torch.Generator().manual_seed(seed)
     q, k = (
@@ -53,11 +61,8 @@ def check_wy(device: torch.device) -> None:
         tensors = tuple(t.to(device) for t in host)
         torch.npu.synchronize()
 
-        phase(case, "submit AscendC")
-        actual = chunk.compute_wy_for_prefill(*tensors, 64)
+        actual = run_npu_phase(case, "AscendC", chunk.compute_wy_for_prefill, *tensors, 64)
         assert actual is not None
-        phase(case, "synchronize AscendC")
-        torch.npu.synchronize()
         phase(case, "copy outputs to CPU")
         actual = tuple(t.cpu() for t in actual)
         phase(case, "compute reference and compare on CPU")
@@ -67,6 +72,29 @@ def check_wy(device: torch.device) -> None:
         torch.testing.assert_close(actual[4], expected[4], rtol=1e-5, atol=1e-5)
         metrics = {name: compare(actual[i], expected[i], name, 0.01) for i, name in ((2, "w"), (3, "u"))}
         print(json.dumps({"batch": batch, "tokens": tokens, "dim": dim, **metrics}), flush=True)
+
+
+def compute_wy_on_cpu(q, k, v, g, beta, chunk_size):
+    inputs_cpu = tuple(t.cpu() for t in (q, k, v, g, beta))
+    result = chunk._compute_kernel_inputs_from_torch_wy(*inputs_cpu, chunk_size)
+    return tuple(t.to(q.device) for t in result)
+
+
+def run_chunk(case, prepare_wy, tensors, kwargs):
+    def prepare(*args):
+        phase(case, "synchronize input padding")
+        torch.npu.synchronize()
+        return run_npu_phase(case, "compute WY", prepare_wy, *args)
+
+    ops = torch.ops._C_ascend
+    fwd_h = partial(run_npu_phase, case, "fwd_h", ops.chunk_gated_delta_rule_fwd_h_vllm)
+    fwd_o = partial(run_npu_phase, case, "fwd_o", ops.chunk_fwd_o_vllm)
+    with (
+        patch.object(chunk, "compute_wy_for_prefill", prepare),
+        patch.object(ops, "chunk_gated_delta_rule_fwd_h_vllm", fwd_h),
+        patch.object(ops, "chunk_fwd_o_vllm", fwd_o),
+    ):
+        return run_npu_phase(case, "chunk GDN", chunk.chunk_gated_delta_rule_310, *tensors, **kwargs)
 
 
 def check_chunk(device: torch.device) -> None:
@@ -80,21 +108,15 @@ def check_chunk(device: torch.device) -> None:
     kwargs = dict(initial_state=state, output_final_state=True, cu_seqlens=cu)
     torch.npu.synchronize()
 
-    phase(case, "submit with AscendC WY")
-    out, checkpoint = chunk.chunk_gated_delta_rule_310(*tensors, **kwargs)
-    phase(case, "synchronize with AscendC WY")
-    torch.npu.synchronize()
-    phase(case, "submit with Torch WY")
-    with patch.dict(os.environ, {"VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY": ""}):
-        out_ref, checkpoint_ref = chunk.chunk_gated_delta_rule_310(*tensors, **kwargs)
-    phase(case, "synchronize with Torch WY")
-    torch.npu.synchronize()
+    out, checkpoint = run_chunk(f"{case} AscendC WY", chunk.compute_wy_for_prefill, tensors, kwargs)
+    out_ref, checkpoint_ref = run_chunk(f"{case} CPU Torch WY", compute_wy_on_cpu, tensors, kwargs)
     assert checkpoint is not None and checkpoint_ref is not None
     phase(case, "copy outputs and compare on CPU")
     print(
         json.dumps(
             {
                 "lengths": lengths,
+                "reference": "cpu_torch_wy",
                 "output": compare(out, out_ref, "output", 0.01),
                 "checkpoint": compare(checkpoint, checkpoint_ref, "checkpoint", 0.01),
                 "status": "PASSED",

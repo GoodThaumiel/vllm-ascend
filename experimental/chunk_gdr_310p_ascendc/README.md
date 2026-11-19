@@ -25,7 +25,7 @@ python3 -m experimental.chunk_gdr_310p_ascendc.smoke --device 0
 
 确认 `ldd` 将 kernel 解析到本次构建的 `$WY_BUILD/lib/`。Smoke 使用现有 vLLM-Ascend 的 `fwd_h/fwd_o` 扩展。检查 64/128 维的 Q/K 转排、W/U 和 FP32 累计门控，并用有尾块的两条 packed 请求比较整个 chunk GDN 的输出和 checkpoint。
 
-定位挂起时可以先用 `--stage wy` 只跑 WY，参考值和比较都在 CPU。再用 `--stage chunk` 跑两条完整 prefill 路径，NPU 计算结束后在 CPU 比较输出和 checkpoint。每个阶段都会立即打印日志，若卡住，保留最后一条 `[compute WY smoke]` 和它之后出现的设备日志。
+用 `--stage wy` 单测 WY，参考值和比较都在 CPU。用 `--stage chunk` 比较 AscendC WY 与 CPU Torch WY，两个分支都调用实际服务的 chunk GDN 入口和同一套 NPU `fwd_h/fwd_o`，最后在 CPU 比较输出和 checkpoint。脚本分别同步输入填充、WY、`fwd_h` 和 `fwd_o`。若卡住，保留最后一条 `[compute WY smoke]` 和它之后出现的设备日志。
 
 ## 服务验证
 
