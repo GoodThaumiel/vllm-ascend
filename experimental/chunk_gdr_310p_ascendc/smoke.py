@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import sys
 from unittest.mock import patch
 
 import torch
@@ -26,6 +27,10 @@ def compare(actual: torch.Tensor, expected: torch.Tensor, name: str, limit: floa
     return {"max_abs": diff.abs().max().item(), "relative_l2": rel_l2}
 
 
+def phase(case: str, step: str) -> None:
+    print(f"[compute WY smoke] {case}: {step}", file=sys.stderr, flush=True)
+
+
 def inputs(batch, tokens, heads, dim, device, seed):
     generator = torch.Generator().manual_seed(seed)
     q, k = (
@@ -40,40 +45,52 @@ def inputs(batch, tokens, heads, dim, device, seed):
     return q, k, v, g, beta
 
 
-@torch.inference_mode()
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", type=int, default=0)
-    args = parser.parse_args()
-    device = torch.device(f"npu:{args.device}")
-    torch.npu.set_device(device)
-    if not enable_custom_op():
-        raise RuntimeError("The stock 310P fwd_h/fwd_o extension is required")
-    library = load_compute_wy_library()
-    if library is None:
-        raise RuntimeError("Set VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY before running the smoke test")
-
+def check_wy(device: torch.device) -> None:
     for batch, tokens, heads, dim in ((1, 128, 8, 64), (2, 128, 8, 128), (1, 2048, 8, 128)):
-        tensors = inputs(batch, tokens, heads, dim, device, seed=310)
+        case = f"WY B={batch} T={tokens} D={dim}"
+        phase(case, "prepare inputs")
+        host = inputs(batch, tokens, heads, dim, "cpu", seed=310)
+        tensors = tuple(t.to(device) for t in host)
+        torch.npu.synchronize()
+
+        phase(case, "submit AscendC")
         actual = chunk.compute_wy_for_prefill(*tensors, 64)
         assert actual is not None
-        expected = chunk._compute_kernel_inputs_from_torch_wy(*tensors, 64)
+        phase(case, "synchronize AscendC")
+        torch.npu.synchronize()
+        phase(case, "copy outputs to CPU")
+        actual = tuple(t.cpu() for t in actual)
+        phase(case, "compute reference and compare on CPU")
+        expected = chunk._compute_kernel_inputs_from_torch_wy(*host, 64)
         for i in (0, 1):
             torch.testing.assert_close(actual[i], expected[i], rtol=0, atol=0)
         torch.testing.assert_close(actual[4], expected[4], rtol=1e-5, atol=1e-5)
         metrics = {name: compare(actual[i], expected[i], name, 0.01) for i, name in ((2, "w"), (3, "u"))}
-        print(json.dumps({"batch": batch, "tokens": tokens, "dim": dim, **metrics}))
+        print(json.dumps({"batch": batch, "tokens": tokens, "dim": dim, **metrics}), flush=True)
 
+
+def check_chunk(device: torch.device) -> None:
     # Use packed, unaligned rows and a nonzero incoming checkpoint.
     lengths = [111, 2081]
+    case = f"chunk GDN lengths={lengths}"
+    phase(case, "prepare inputs")
     tensors = inputs(1, sum(lengths), 8, 128, device, seed=311)
     cu = torch.tensor([0, lengths[0], sum(lengths)], device=device, dtype=torch.int32)
     state = torch.full((2, 16, 128, 128), 0.01, device=device, dtype=torch.float16)
     kwargs = dict(initial_state=state, output_final_state=True, cu_seqlens=cu)
+    torch.npu.synchronize()
+
+    phase(case, "submit with AscendC WY")
     out, checkpoint = chunk.chunk_gated_delta_rule_310(*tensors, **kwargs)
+    phase(case, "synchronize with AscendC WY")
+    torch.npu.synchronize()
+    phase(case, "submit with Torch WY")
     with patch.dict(os.environ, {"VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY": ""}):
         out_ref, checkpoint_ref = chunk.chunk_gated_delta_rule_310(*tensors, **kwargs)
+    phase(case, "synchronize with Torch WY")
+    torch.npu.synchronize()
     assert checkpoint is not None and checkpoint_ref is not None
+    phase(case, "copy outputs and compare on CPU")
     print(
         json.dumps(
             {
@@ -82,8 +99,30 @@ def main():
                 "checkpoint": compare(checkpoint, checkpoint_ref, "checkpoint", 0.01),
                 "status": "PASSED",
             }
-        )
+        ),
+        flush=True,
     )
+
+
+@torch.inference_mode()
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--stage", choices=("all", "wy", "chunk"), default="all")
+    args = parser.parse_args()
+    device = torch.device(f"npu:{args.device}")
+    phase("startup", f"initialize {device}")
+    torch.npu.set_device(device)
+    if args.stage != "wy" and not enable_custom_op():
+        raise RuntimeError("The stock 310P fwd_h/fwd_o extension is required")
+    phase("startup", "load compute WY library")
+    library = load_compute_wy_library()
+    if library is None:
+        raise RuntimeError("Set VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY before running the smoke test")
+    if args.stage != "chunk":
+        check_wy(device)
+    if args.stage != "wy":
+        check_chunk(device)
 
 
 if __name__ == "__main__":
