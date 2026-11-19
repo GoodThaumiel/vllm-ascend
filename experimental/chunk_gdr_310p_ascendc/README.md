@@ -16,7 +16,7 @@ cmake -S . -B "$WY_BUILD" -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE="$(command -v python3)"
 cmake --build "$WY_BUILD" --target replayssm_310p_compute_wy -j8
 export VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY="$WY_BUILD/libreplayssm_310p_compute_wy.so"
-readelf -d "$VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY" | grep -E 'RUNPATH|NEEDED'
+readelf -d "$VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY" | grep -F '$ORIGIN/lib'
 ldd "$VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY" | grep libreplayssm_310p_compute_wy_kernel
 
 cd ../..

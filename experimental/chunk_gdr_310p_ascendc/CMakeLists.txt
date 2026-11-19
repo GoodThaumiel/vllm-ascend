@@ -67,4 +67,7 @@ set_target_properties(replayssm_310p_compute_wy PROPERTIES
   BUILD_RPATH_USE_ORIGIN TRUE
   SKIP_BUILD_RPATH FALSE
   BUILD_WITH_INSTALL_RPATH FALSE)
-target_link_options(replayssm_310p_compute_wy PRIVATE "LINKER:--enable-new-dtags")
+# Emit the kernel search path even if CANN or the build cache sets CMAKE_SKIP_RPATH.
+target_link_options(replayssm_310p_compute_wy PRIVATE
+  "LINKER:--enable-new-dtags"
+  "LINKER:-rpath,$ORIGIN/lib")
