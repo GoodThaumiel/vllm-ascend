@@ -16,14 +16,29 @@
 #
 import torch
 import torch_npu
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
+from vllm_ascend import envs
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+
+
+def _has_target_prefill() -> bool:
+    if not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    return (
+        not getattr(context, "is_draft_model", False)
+        and isinstance(metadata, dict)
+        and any(getattr(layer_metadata, "num_prefills", 0) > 0 for layer_metadata in metadata.values())
+    )
 
 
 class AscendGroupedTopKRouter310(AscendGroupedTopKRouter):
     """310P router with chunked softmax top-k routing."""
 
     MAX_TOKENS_PER_GATING_CALL = 1024
+    SELECTED_SOFTMAX_GEOMETRY = (256, 8)
 
     def _compute_routing(
         self,
@@ -45,6 +60,23 @@ class AscendGroupedTopKRouter310(AscendGroupedTopKRouter):
         # npu_moe_gating_top_k_softmax requires FP16 ND input. This adjusts
         # dtype only; the default FP16 gate path needs no dtype conversion.
         router_logits = router_logits.to(torch.float16)
+
+        if (
+            envs.VLLM_ASCEND_310P_PREFILL_SELECTED_SOFTMAX
+            and self.renormalize
+            and router_logits.ndim == 2
+            and (router_logits.shape[-1], self.top_k) == self.SELECTED_SOFTMAX_GEOMETRY
+            and _has_target_prefill()
+        ):
+            weights = []
+            expert_ids = []
+            for chunk in router_logits.split(self.MAX_TOKENS_PER_GATING_CALL, dim=0):
+                selected_logits, ids = chunk.topk(self.top_k, dim=-1)
+                weights.append(selected_logits.float().softmax(dim=-1).to(chunk.dtype))
+                expert_ids.append(ids.to(torch.int32))
+            topk_weights = weights[0] if len(weights) == 1 else torch.cat(weights, dim=0)
+            topk_ids = expert_ids[0] if len(expert_ids) == 1 else torch.cat(expert_ids, dim=0)
+            return topk_weights * self.routed_scaling_factor, topk_ids
 
         if router_logits.shape[0] > self.MAX_TOKENS_PER_GATING_CALL:
             topk_results = [

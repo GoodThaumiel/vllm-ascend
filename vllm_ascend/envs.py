@@ -95,6 +95,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Absolute path to the experimental 310P MRv1 prefill compute WY Torch library.
     # Unset uses Torch WY. The path is local and is not sensitive.
     "VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY": lambda: os.getenv("VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY"),
+    # Use TopK on logits followed by selected softmax in the 310P prefill router.
+    # Default: 0. Valid values: 0 or 1. This configuration is not sensitive.
+    "VLLM_ASCEND_310P_PREFILL_SELECTED_SOFTMAX": lambda: _strict_binary_env(
+        "VLLM_ASCEND_310P_PREFILL_SELECTED_SOFTMAX"
+    ),
+    # Use the v24 310P FwdH/FwdO pair in chunk GDN prefill. Compute WY is configured separately.
+    # Default: 0. Valid values: 0 or 1. This configuration is not sensitive.
+    "VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO": lambda: _strict_binary_env("VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO"),
+    # Align 128-wide chunk GDN Q/K RMSNorm rows to 16 on 310P.
+    # Default: 0. Valid values: 0 or 1. This configuration is not sensitive.
+    "VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16": lambda: _strict_binary_env("VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16"),
     # Use shared backing across compatible 310P DFlash MRv1 KV groups.
     "VLLM_ASCEND_310P_DFLASH_SHARED_KV": lambda: _strict_binary_env("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "1"),
     # Size the shared DFlash pool using v24's logical bytes per block.

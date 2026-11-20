@@ -32,3 +32,32 @@ python3 -m experimental.chunk_gdr_310p_ascendc.smoke --device 0
 设置 `VLLM_USE_V2_MODEL_RUNNER=0`，将上述库路径 export 到启动 `vllm serve` 的 shell。重启后核对两个 rank 的 `310P AscendC compute WY enabled` 日志，并在 prefill profiling 中查找 `replayssm_310p_compute_wy`。当形状或 dtype 不适用时，该 worker 会记录一次回退日志。清除库路径并重启服务即可复跑 Torch WY 基线。
 
 先跑 C1 和混合长度请求，检查输出及 CANN 错误，再用 [DFlash 清单 §9.2](../dflash_310p_ascendc/LEVEL2.md#92-vllm-serve-双图与-2k400) 的 TP2、2k/400、C48 命令做开关对照。保持 K、RGDR 开关、显存参数和 capture sizes 一致，记录 prefill 时间、TTFT、实际 running、吞吐及两个 rank 的 kernel 时间。若可用 KV 容量变化，附上每轮的 cache blocks 和 prefill 调度批次 token 数。
+
+## 310P prefill A/B
+
+以下开关默认均为 `0`。用 `1` 在同一个 v30 / CANN 9.2.1 镜像内逐项启用，每轮重启服务。
+
+| 开关 | 生效范围 |
+| --- | --- |
+| `VLLM_ASCEND_310P_PREFILL_SELECTED_SOFTMAX` | 有 prefill 的 target 批次，256 个专家、top-8、普通 softmax 路由且启用重归一化。对选中的 logits 做 FP32 softmax，再转回 FP16，保留 routed scaling |
+| `VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16` | 128 维 GDN prefill Q/K 归一化。展平后补零到 16 行倍数，归一化后裁回 |
+| `VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO` | 128×128 GDN prefill，FP16 或零初始化 checkpoint，且 packed 批次各段长度为正。成对使用 v24 FwdH/FwdO |
+
+旧 H/O 来自实测 v24 镜像提交 [660ee3d63](https://github.com/HaonanWu1/vllm-ascend/tree/660ee3d630dba4cd54cdf1a1a5a58edfce128c5d)。采用它的 310P kernel、tiling、ACLNN 封装和 NZ 起始 state 布局，沿用当前构建的 310P BiSheng 兼容头。新的 Compute WY 仍由原有库路径控制。CANN 9.2.1 上需先验证旧 H/O 编译和精度。
+
+在目标容器用现有的 310P 安装流程重建 vLLM-Ascend。以下命令在仓库根目录运行，保留已验证的 WY 库路径。
+
+```bash
+COMPILE_CUSTOM_KERNELS=1 SOC_VERSION=ascend310p3 \
+  python3 -m pip install --no-build-isolation --no-deps -v -e .
+
+VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO=1 \
+  python3 -m experimental.chunk_gdr_310p_ascendc.smoke --device 0 --stage chunk
+
+VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16=1 \
+  python3 -m experimental.chunk_gdr_310p_ascendc.smoke --device 0 --stage chunk
+```
+
+两次 smoke 都使用非零 checkpoint 和带尾块的 2193-token packed 批。输出和 checkpoint 分别对照 CPU WY 以及同栈 v30 H/O。使用 RGDR patch 仓的 prefill probe 跑 `--suite gdn`。确认同一镜像里的 `gdn/chain/legacy`、`gdn/chain/vllm` 和 `gdn/wy/standalone` 有有效计时。
+
+服务沿用同一 TP2 / C48 / MNBT4096 启动和请求参数。先跑三开关均关闭的基线，再分别开启 TopK、RMSNorm 或旧 H/O，最后三项一起开启。全程保持 WY、DFlash 和 RGDR 配置一致。使用相同的请求输入和调度批次做对照，记录输出、TTFT 和 prefill forward。profiling 核对 TopK 的 `TopKV3` / 8 项 softmax、RMSNorm 的实际行数，以及 `ChunkGatedDeltaRuleFwdH` / `ChunkFwdO`。若有失败，回传首条设备异常和对应 smoke 阶段。

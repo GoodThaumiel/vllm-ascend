@@ -1940,6 +1940,129 @@ void npu_scatter_nd_update_sk(
     return;
 }
 
+#ifdef ASCEND_PLATFORM_310P
+std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_h(
+    const at::Tensor & k,
+    const at::Tensor & w,
+    const at::Tensor & u,
+    const c10::optional<at::Tensor> & g,
+    const c10::optional<at::Tensor> & gk,
+    const c10::optional<at::Tensor> & initial_state,
+    c10::optional<bool> output_final_state,
+    c10::optional<int64_t> chunk_size,
+    c10::optional<bool> save_new_value,
+    c10::optional<at::IntArrayRef> cu_seqlens,
+    c10::optional<at::IntArrayRef> chunk_indices,
+    c10::optional<bool> use_exp2,
+    c10::optional<bool> transpose_state_layout)
+{
+    bool output_final_state_ = output_final_state.has_value() ? output_final_state.value() : false;
+    const at::Tensor &initial_state_ = c10::value_or_else(initial_state, [] { return at::Tensor(); });
+    int64_t chunk_size_ = chunk_size.has_value() ? chunk_size.value() : 64;
+    const at::Tensor &g_ = c10::value_or_else(g, [] { return at::Tensor(); });
+    const at::Tensor &gk_ = c10::value_or_else(gk, [] { return at::Tensor(); });
+
+    auto k_sizes = k.sizes();
+    auto u_sizes = u.sizes();
+    int K = k_sizes[3];
+    int B = k_sizes[0];
+    int T = k_sizes[2];
+    int HV = u_sizes[1];
+    int V = u_sizes[3];
+
+    int NT = 0;
+    if (chunk_indices.has_value()) {
+        auto chunk_indices_ref = chunk_indices.value();
+        NT = chunk_indices_ref.size() / 2;
+    } else {
+        NT = (T + chunk_size_ - 1) / chunk_size_;
+    }
+
+    at::Tensor h_out = at::zeros({B, HV, NT, K, V}, k.options());
+    at::Tensor v_new_out = at::zeros(u.sizes(), u.options());
+    at::Tensor final_state_out;
+    if (output_final_state_) {
+        int N = cu_seqlens.has_value() ? cu_seqlens->size() - 1 : B;
+        auto state_options = initial_state.has_value() ? initial_state->options() : h_out.options();
+        final_state_out = at::empty({N, HV, K, V}, state_options);
+    } else {
+        final_state_out = at::empty({1}, k.options());
+    }
+
+    // 310P NZ h contract: h slot 0 carries the zN(K,V) f16 image of
+    // initial_state (zeros otherwise); the kernel seeds its L1-resident state
+    // bank from it with one flat burst and never reads initial_state itself.
+    if (initial_state_.defined() && K % 16 == 0 && V % 16 == 0) {
+        auto nz = initial_state_.to(k.scalar_type())
+                      .reshape({-1, HV, K / 16, 16, V / 16, 16})
+                      .permute({0, 1, 4, 2, 3, 5})
+                      .reshape({-1, HV, K, V});
+        if (cu_seqlens.has_value()) {
+            auto cs = cu_seqlens.value();
+            int64_t off = 0;
+            int64_t bi = 0;
+            for (int64_t i = 0; i + 1 < (int64_t)cs.size(); ++i) {
+                int64_t len = cs[i + 1] - cs[i];
+                if (len <= 0) {
+                    continue;
+                }
+                h_out.select(0, 0).select(1, off).copy_(nz.select(0, bi));
+                bi++;
+                off += (len + chunk_size_ - 1) / chunk_size_;
+            }
+        } else {
+            h_out.select(2, 0).copy_(nz);
+        }
+    }
+
+    bool save_new_value_ = save_new_value.value_or(true);
+    bool use_exp2_ = use_exp2.value_or(false);
+    bool transpose_state_layout_ = transpose_state_layout.value_or(false);
+
+    EXEC_NPU_CMD(
+        aclnnChunkGatedDeltaRuleFwdH,
+        k, w, u, g_,
+        gk_, initial_state_, output_final_state_, chunk_size_, save_new_value_,
+        cu_seqlens, chunk_indices, use_exp2_, transpose_state_layout_,
+        h_out, v_new_out, final_state_out
+    );
+
+    if (output_final_state_) {
+        return std::make_tuple(h_out, v_new_out, final_state_out);
+    } else {
+        return std::make_tuple(h_out, v_new_out, at::Tensor());
+    }
+}
+
+at::Tensor chunk_fwd_o(
+    const at::Tensor & q,
+    const at::Tensor & k,
+    const at::Tensor & v,
+    const at::Tensor & h,
+    double scale,
+    const c10::optional<at::Tensor> & g,
+    const c10::optional<at::Tensor> & g_gamma,
+    c10::optional<at::IntArrayRef> cu_seqlens,
+    c10::optional<at::IntArrayRef> chunk_indices,
+    c10::optional<int64_t> chunk_size,
+    c10::optional<bool> transpose_state_layout)
+{
+    at::Tensor o = at::zeros(v.sizes(), v.options());
+    int64_t chunk_size_ = chunk_size.has_value() ? chunk_size.value() : 64;
+    const at::Tensor &g_ = c10::value_or_else(g, [] { return at::Tensor(); });
+    (void)g_gamma;
+    (void)transpose_state_layout;
+
+    EXEC_NPU_CMD(
+        aclnnChunkFwdO,
+        q, k, v, h, g_,
+        cu_seqlens, chunk_indices, scale, chunk_size_,
+        o
+    );
+    return o;
+}
+#endif
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_h_vllm(
     const at::Tensor & k,
     const at::Tensor & w,
@@ -2701,6 +2824,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                   Tensor? num_accepted_tokens, "
         "                                   float scale_value=1.0) -> (Tensor output)");
     ops.impl("npu_recurrent_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule_310);
+
+    ops.def(
+        "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"
+    );
+    ops.impl("chunk_gated_delta_rule_fwd_h", torch::kPrivateUse1, &vllm_ascend::chunk_gated_delta_rule_fwd_h);
+
+    ops.def(
+        "chunk_fwd_o(Tensor q, Tensor k, Tensor v, Tensor h, float scale, *, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, int? chunk_size=None, bool? transpose_state_layout=False) -> Tensor"
+    );
+    ops.impl("chunk_fwd_o", torch::kPrivateUse1, &vllm_ascend::chunk_fwd_o);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h_vllm(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"

@@ -1,0 +1,220 @@
+/**
+ * Copyright (c) 2026 Tianjin University, Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * the BSD 3-Clause License (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
+#ifndef CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_GDN_FWDH_VNEW_HPP
+#define CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_GDN_FWDH_VNEW_HPP
+#include "catlass/catlass.hpp"
+#include "catlass/arch/resource.hpp"
+#include "../gdn_fwd_h_epilogue_policies.hpp"
+#include "catlass/gemm_coord.hpp"
+#include "catlass/matrix_coord.hpp"
+#include "catlass/epilogue/tile/tile_copy.hpp"
+
+
+
+namespace Catlass::Epilogue::Block {
+
+template <
+    class VOutputType_,
+    class GInputType_,
+    class UInputType_,
+    class WSInputType_
+>
+class BlockEpilogue <
+    EpilogueAtlasGDNFwdHVnew,
+    VOutputType_,
+    GInputType_,
+    UInputType_,
+    WSInputType_
+> {
+public:
+    // Type aliases
+    using DispatchPolicy = EpilogueAtlasGDNFwdHVnew;
+    using ArchTag = typename DispatchPolicy::ArchTag;
+
+    using VElementOutput = typename VOutputType_::Element;
+    using GElementInput = typename GInputType_::Element;
+    using UElementInput = typename UInputType_::Element;
+    using WSElementInput = typename WSInputType_::Element;
+
+    CATLASS_DEVICE
+    BlockEpilogue(Arch::Resource<ArchTag> &resource) : resource_(resource)
+    {
+
+        // Single buffer bank (the historical ping bank at 32..96K sat on top of
+        // the hand path's staging/resident windows and is gone). u / ws / vnew
+        // share 128K, uF / decay share 96K -- same lifetime-disjoint reuse as
+        // before, minus the isFirst switch. v_work arrives UB-resident via the
+        // wsUbOffset operator() argument, so there is no ws load buffer at all.
+        constexpr uint32_t CALC_BUF_OFFSET = 0;
+        constexpr uint32_t BUF_0_OFFSET = 96 * 1024;
+        constexpr uint32_t BUF_1_OFFSET = 128 * 1024;
+        constexpr uint32_t G_BUF_OFFSET = 161 * 1024;
+        constexpr uint32_t G_SUB_BUF_OFFSET = 163 * 1024;
+        constexpr uint32_t G_INPUT_BUF_OFFSET = 165 * 1024;
+        constexpr uint32_t SHARE_BUF_OFFSET = 166 * 1024;
+
+        calcUbTensor = resource.ubBuf.template GetBufferByByte<float>(CALC_BUF_OFFSET);
+        uUbTensor = resource.ubBuf.template GetBufferByByte<UElementInput>(BUF_1_OFFSET);
+        uUbFloatTensor = resource.ubBuf.template GetBufferByByte<float>(BUF_0_OFFSET);
+        gUbTensor = resource.ubBuf.template GetBufferByByte<float>(G_BUF_OFFSET);
+        gLastUbTensor = resource.ubBuf.template GetBufferByByte<float>(G_SUB_BUF_OFFSET);
+        gInputUbTensor = resource.ubBuf.template GetBufferByByte<GElementInput>(G_INPUT_BUF_OFFSET);
+        vNewOutputUbTensor = resource.ubBuf.template GetBufferByByte<VElementOutput>(BUF_1_OFFSET);
+        vNewDecayUbTensor = resource.ubBuf.template GetBufferByByte<VElementOutput>(BUF_0_OFFSET);
+        shareBuffer_ = resource.ubBuf.template GetBufferByByte<uint8_t>(SHARE_BUF_OFFSET);
+
+    }
+
+    CATLASS_DEVICE
+    ~BlockEpilogue() {}
+
+    CATLASS_DEVICE
+    void operator()(
+        AscendC::GlobalTensor<VElementOutput> vnewOutput,
+        AscendC::GlobalTensor<VElementOutput> vnewdecayOutput,
+        AscendC::GlobalTensor<GElementInput> gInput,
+        AscendC::GlobalTensor<UElementInput> uInput,
+        uint32_t wsUbOffset,
+        uint32_t chunkSize,
+        uint32_t kHeadDim,
+        uint32_t vHeadDim,
+        Arch::CrossCoreFlag cube1Done
+    )
+    {
+        uint32_t mActual = chunkSize;
+        uint32_t nkActual = kHeadDim;
+        uint32_t nvActual = vHeadDim;
+
+        // Single working instance (the kernel gates subblock 1 out): full m.
+        uint32_t subBlockIdx = 0;
+        uint32_t subBlockNum = 1;
+        uint32_t mActualPerSubBlock = CeilDiv(mActual, subBlockNum);
+        uint32_t mActualThisSubBlock = (subBlockIdx == 0) ? mActualPerSubBlock : (mActual - mActualPerSubBlock);
+        uint32_t mOffset = subBlockIdx * mActualPerSubBlock;
+        uint32_t nOffset = 0;
+        // 当前场景内部一定连续
+        // k [B, H, T, D]
+        // g [B, H, T]
+        // 在外部offset的基础上进一步offset
+        // 当前asset kdim == vHeadDim
+        int64_t offsetK = mOffset * nvActual + nOffset;
+        int64_t offsetD = 0; // 因为要用最后一个数减去之前所有，所以全部读入
+
+        uint32_t gbrcStart, gbrcRealStart, gbrcReptime, gbrcEffStart, gbrcEffEnd;
+        if(subBlockIdx==0)
+        {
+            gbrcStart = 0;
+            gbrcRealStart = 0;
+            gbrcReptime = (mActualThisSubBlock + 8 - 1) / 8;
+
+        }
+        else
+        {
+            gbrcStart = mActualPerSubBlock;
+            gbrcRealStart = gbrcStart & ~15;
+            gbrcReptime = (mActual - gbrcRealStart + 8 - 1) / 8;
+        }
+        gbrcEffStart = gbrcStart-gbrcRealStart;
+        gbrcEffEnd = gbrcEffStart + mActualThisSubBlock;
+
+        AscendC::ResetMask();
+
+        AscendC::GlobalTensor<VElementOutput> vnewOutputThisSubBlock = vnewOutput[offsetK];
+        AscendC::GlobalTensor<VElementOutput> vnewdecayOutputThisSubBlock = vnewdecayOutput[offsetK];
+        AscendC::GlobalTensor<GElementInput> gInputThisSubBlock = gInput;
+        AscendC::GlobalTensor<UElementInput> uInputThisSubBlock = uInput[offsetK];
+
+
+        // (V_MTE2 pairs dropped: reduce_flags fwd_h_v3 -- the g/u loads land in
+        // windows whose last V readers are ordered through the kept store
+        // fences of the previous call.)
+        if constexpr(std::is_same<GElementInput, float>::value) {
+            AscendC::DataCopy(gUbTensor, gInputThisSubBlock, mActual);
+        } else {
+            AscendC::DataCopy(gInputUbTensor, gInputThisSubBlock, mActual);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
+        if constexpr(!std::is_same<GElementInput, float>::value) {
+            AscendC::Cast(gUbTensor, gInputUbTensor, AscendC::RoundMode::CAST_NONE, mActual);
+        }
+
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        float inputVal = gUbTensor.GetValue(mActual-1);
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID6);
+
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate<float>(gLastUbTensor, inputVal, mActual);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Sub<float>(gUbTensor, gLastUbTensor, gUbTensor, mActual);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Exp(gUbTensor, gUbTensor, mActual);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        uint32_t dstShape_[2] = {gbrcReptime*8, nvActual};
+        uint32_t srcShape_[2] = {gbrcReptime*8, 1};
+        AscendC::Broadcast<float, 2, 1>(calcUbTensor, gUbTensor[gbrcRealStart], dstShape_, srcShape_, shareBuffer_);
+        AscendC::PipeBarrier<PIPE_V>();
+
+
+
+        AscendC::DataCopy(uUbTensor, uInputThisSubBlock, mActualThisSubBlock * nvActual);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID4);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID4);
+        AscendC::Cast(uUbFloatTensor, uUbTensor, AscendC::RoundMode::CAST_NONE, mActualThisSubBlock * nvActual);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // v_work stays UB-resident: the hand-mmad deformat left it at
+        // wsUbOffset (ND, f32). Producer is the V-pipe deformat, consumer is
+        // this V-pipe Sub -- program order on V, no flags, no GM round-trip.
+        AscendC::LocalTensor<float> wsResident =
+            resource_.ubBuf.template GetBufferByByte<float>(wsUbOffset + mOffset * nvActual * sizeof(float));
+        AscendC::Sub<float>(uUbFloatTensor, uUbFloatTensor, wsResident, mActualThisSubBlock * nvActual);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(vNewOutputUbTensor, uUbFloatTensor, AscendC::RoundMode::CAST_NONE, mActualThisSubBlock * nvActual);
+        // V write -> MTE3 read of vNewOutputUbTensor.
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
+        AscendC::DataCopy(vnewOutputThisSubBlock, vNewOutputUbTensor, mActualThisSubBlock * nvActual);
+        // Drain the GM store before any later V op rewrites this parity's buffer.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
+
+        AscendC::Mul(calcUbTensor[gbrcEffStart*nvActual], uUbFloatTensor, calcUbTensor[gbrcEffStart*nvActual], mActualThisSubBlock * nvActual);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(vNewDecayUbTensor, calcUbTensor[gbrcEffStart*nvActual], AscendC::RoundMode::CAST_NONE, mActualThisSubBlock * nvActual);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
+        AscendC::DataCopy(vnewdecayOutputThisSubBlock, vNewDecayUbTensor, mActualThisSubBlock * nvActual);
+        // (Store drains dropped: reduce_flags proves the next call's V ops are
+        // ordered behind these stores through the stage-top MTE3_MTE2 drains.)
+
+    }
+
+private:
+    Arch::Resource<ArchTag> &resource_;
+    AscendC::LocalTensor<float> calcUbTensor;
+    AscendC::LocalTensor<UElementInput> uUbTensor;
+    AscendC::LocalTensor<float> uUbFloatTensor;
+    AscendC::LocalTensor<float> gUbTensor;
+    AscendC::LocalTensor<float> gLastUbTensor;
+    AscendC::LocalTensor<GElementInput> gInputUbTensor;
+    AscendC::LocalTensor<VElementOutput> vNewOutputUbTensor;
+    AscendC::LocalTensor<VElementOutput> vNewDecayUbTensor;
+    AscendC::LocalTensor<uint8_t> shareBuffer_;
+
+};
+}
+
+#endif

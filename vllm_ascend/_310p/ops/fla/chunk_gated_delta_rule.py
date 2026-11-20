@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vllm_ascend import envs
 from vllm_ascend._310p.ops.compute_wy import compute_wy_for_prefill
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 
@@ -203,7 +204,26 @@ def _require_ascend_chunk_ops(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
 def _maybe_l2norm(x: torch.Tensor, enabled: bool) -> torch.Tensor:
     if not enabled:
         return x
+    if envs.VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16:
+        return l2norm_310p(x, pad_prefill_rows=True)
     return l2norm_310p(x)
+
+
+def _select_chunk_ho_ops(ascend_ops, k_dim, v_dim, initial_state, cu_seqlens):
+    # The v24 310P pair shares an NZ intermediate and seeds its state from FP16.
+    # Its scheduler compacts empty sequences, so use the v30 pair for those inputs.
+    if (
+        envs.VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO
+        and k_dim == v_dim == 128
+        and (initial_state is None or initial_state.dtype == torch.float16)
+        and (cu_seqlens is None or all(start < end for start, end in zip(cu_seqlens, cu_seqlens[1:])))
+    ):
+        fwd_h = getattr(ascend_ops, "chunk_gated_delta_rule_fwd_h", None)
+        fwd_o = getattr(ascend_ops, "chunk_fwd_o", None)
+        if fwd_h is None or fwd_o is None:
+            raise RuntimeError("Legacy 310P FwdH/FwdO is enabled but missing. Rebuild the 310P custom ops.")
+        return fwd_h, fwd_o
+    return ascend_ops.chunk_gated_delta_rule_fwd_h_vllm, ascend_ops.chunk_fwd_o_vllm
 
 
 def _pad_bthd_to_chunk(
@@ -532,6 +552,7 @@ def chunk_gated_delta_rule_310(
         return empty_out, final_state
 
     scale = k.shape[-1] ** -0.5 if scale is None else scale
+    fwd_h, fwd_o = _select_chunk_ho_ops(torch.ops._C_ascend, k.shape[-1], v.shape[-1], initial_state, cu_list)
     wy = compute_wy_for_prefill(q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE)
     if wy is None:
         wy = _compute_kernel_inputs_from_torch_wy(q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE)
@@ -550,7 +571,7 @@ def chunk_gated_delta_rule_310(
         state = initial_state
     state_kernel = state.transpose(-1, -2).contiguous()
 
-    h, v_new, final_state_kernel = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h_vllm(
+    h, v_new, final_state_kernel = fwd_h(
         k_kernel,
         w_kernel,
         u_kernel,
@@ -565,7 +586,7 @@ def chunk_gated_delta_rule_310(
         use_exp2=False,
         transpose_state_layout=False,
     )
-    o_kernel = torch.ops._C_ascend.chunk_fwd_o_vllm(
+    o_kernel = fwd_o(
         q_kernel,
         k_kernel,
         v_new,

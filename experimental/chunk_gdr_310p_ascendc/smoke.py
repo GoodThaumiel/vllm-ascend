@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sys
 from functools import partial
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from unittest.mock import patch
 import torch
 import torch_npu  # noqa: F401
 
+from vllm_ascend import envs
 from vllm_ascend._310p.ops.compute_wy import load_compute_wy_library
 from vllm_ascend._310p.ops.fla import chunk_gated_delta_rule as chunk
 from vllm_ascend.utils import enable_custom_op
@@ -86,26 +88,29 @@ def run_chunk(case, prepare_wy, tensors, kwargs):
         torch.npu.synchronize()
         return run_npu_phase(case, "compute WY", prepare_wy, *args)
 
-    ops = torch.ops._C_ascend
-    fwd_h = partial(run_npu_phase, case, "fwd_h", ops.chunk_gated_delta_rule_fwd_h_vllm)
-    fwd_o = partial(run_npu_phase, case, "fwd_o", ops.chunk_fwd_o_vllm)
+    select_ho_ops = chunk._select_chunk_ho_ops
+
+    def trace_ho_ops(*args):
+        fwd_h, fwd_o = select_ho_ops(*args)
+        return tuple(partial(run_npu_phase, case, op.__name__, op) for op in (fwd_h, fwd_o))
+
     with (
         patch.object(chunk, "compute_wy_for_prefill", prepare),
-        patch.object(ops, "chunk_gated_delta_rule_fwd_h_vllm", fwd_h),
-        patch.object(ops, "chunk_fwd_o_vllm", fwd_o),
+        patch.object(chunk, "_select_chunk_ho_ops", trace_ho_ops),
     ):
         return run_npu_phase(case, "chunk GDN", chunk.chunk_gated_delta_rule_310, *tensors, **kwargs)
 
 
 def check_chunk(device: torch.device) -> None:
     # Use packed, unaligned rows and a nonzero incoming checkpoint.
-    lengths = [111, 2081]
+    lengths = [111, 2082]
     case = f"chunk GDN lengths={lengths}"
     phase(case, "prepare inputs")
     tensors = inputs(1, sum(lengths), 8, 128, device, seed=311)
     cu = torch.tensor([0, lengths[0], sum(lengths)], device=device, dtype=torch.int32)
-    state = torch.full((2, 16, 128, 128), 0.01, device=device, dtype=torch.float16)
-    kwargs = dict(initial_state=state, output_final_state=True, cu_seqlens=cu)
+    generator = torch.Generator().manual_seed(312)
+    state = (0.02 * torch.randn((2, 16, 128, 128), generator=generator)).half().to(device)
+    kwargs = dict(initial_state=state, output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
     torch.npu.synchronize()
 
     out, checkpoint = run_chunk(f"{case} AscendC WY", chunk.compute_wy_for_prefill, tensors, kwargs)
@@ -124,6 +129,28 @@ def check_chunk(device: torch.device) -> None:
         ),
         flush=True,
     )
+    if envs.VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO or envs.VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16:
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO": "0",
+                "VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16": "0",
+            },
+        ):
+            baseline, baseline_state = run_chunk(f"{case} v30 baseline", chunk.compute_wy_for_prefill, tensors, kwargs)
+        assert baseline_state is not None
+        print(
+            json.dumps(
+                {
+                    "lengths": lengths,
+                    "reference": "v30_ho_unpadded_qk",
+                    "output": compare(out, baseline, "output", 0.01),
+                    "checkpoint": compare(checkpoint, baseline_state, "checkpoint", 0.01),
+                    "status": "PASSED",
+                }
+            ),
+            flush=True,
+        )
 
 
 @torch.inference_mode()
