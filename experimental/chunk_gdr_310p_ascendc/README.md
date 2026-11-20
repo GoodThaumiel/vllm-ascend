@@ -58,6 +58,8 @@ VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16=1 \
   python3 -m experimental.chunk_gdr_310p_ascendc.smoke --device 0 --stage chunk
 ```
 
-两次 smoke 都使用非零 checkpoint 和带尾块的 2193-token packed 批。输出和 checkpoint 分别对照 CPU WY 以及同栈 v30 H/O。使用 RGDR patch 仓的 prefill probe 跑 `--suite gdn`。确认同一镜像里的 `gdn/chain/legacy`、`gdn/chain/vllm` 和 `gdn/wy/standalone` 有有效计时。
+两次 smoke 都使用非零 checkpoint 和带尾块的 2193-token packed 批。候选和 v30 基线分别跑 AscendC WY 与 CPU WY，再和独立 CPU chunk 递推对照。输出和 checkpoint 继续用 relative L2 ≤ 0.01 判定。WY 的 Q/K/W/U/G、FwdH 的 H/v_new、每条请求的输出与 checkpoint 误差会在断言退出前写到 JSON 行。H 对比会在 CPU 上解开旧 H/O 的 NZ 中间布局。
+
+上一轮已经重建并跑过旧 H/O 的容器，本次只需拉取 Python 诊断改动后用相同两条 smoke 命令重跑。回传所有含 `"comparison"` 的 JSON 行。使用 RGDR patch 仓的 prefill probe 跑 `--suite gdn` 时，确认 `gdn/chain/legacy`、`gdn/chain/vllm` 和 `gdn/wy/standalone` 有有效计时。v30 使用 standalone WY，旧 WY 的 binding 可以显示 `SKIPPED`。
 
 服务沿用同一 TP2 / C48 / MNBT4096 启动和请求参数。先跑三开关均关闭的基线，再分别开启 TopK、RMSNorm 或旧 H/O，最后三项一起开启。全程保持 WY、DFlash 和 RGDR 配置一致。使用相同的请求输入和调度批次做对照，记录输出、TTFT 和 prefill forward。profiling 核对 TopK 的 `TopKV3` / 8 项 softmax、RMSNorm 的实际行数，以及 `ChunkGatedDeltaRuleFwdH` / `ChunkFwdO`。若有失败，回传首条设备异常和对应 smoke 阶段。

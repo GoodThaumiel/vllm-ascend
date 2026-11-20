@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+import io
+import json
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from runpy import run_path
 from types import SimpleNamespace
@@ -55,6 +58,16 @@ class Prefill310DispatchTest(unittest.TestCase):
             ):
                 self.chunk = run_path(str(ROOT / "ops/fla/chunk_gated_delta_rule.py"))
             self.router = run_path(str(ROOT / "fused_moe/grouped_topk_router.py"))["AscendGroupedTopKRouter310"]()
+            with patch.dict(
+                "sys.modules",
+                {
+                    "vllm_ascend._310p.ops.compute_wy": SimpleNamespace(load_compute_wy_library=Mock()),
+                    "vllm_ascend._310p.ops.fla": SimpleNamespace(chunk_gated_delta_rule=SimpleNamespace(**self.chunk)),
+                    "vllm_ascend.utils": SimpleNamespace(enable_custom_op=Mock()),
+                },
+            ):
+                smoke_path = ROOT.parents[1] / "experimental/chunk_gdr_310p_ascendc/smoke.py"
+                self.smoke = run_path(str(smoke_path))
         self.router.scoring_func = "softmax"
         self.router.use_grouped_topk = False
         self.router.e_score_correction_bias = None
@@ -112,3 +125,32 @@ class Prefill310DispatchTest(unittest.TestCase):
             select(SimpleNamespace(chunk_gated_delta_rule_fwd_h=legacy_h), 128, 128, fp16, None)
         self.envs.VLLM_ASCEND_310P_PREFILL_LEGACY_GDN_HO = False
         self.assertEqual(select(ops, 128, 128, fp16, None), (v30_h, v30_o))
+
+    def test_legacy_h_snapshot_decodes_nz_layout(self):
+        h = torch.arange(2 * 32 * 48).reshape(1, 1, 2, 32, 48)
+        nz = h.reshape(1, 1, 2, 2, 16, 3, 16).permute(0, 1, 2, 5, 3, 4, 6).reshape(h.shape)
+        torch.testing.assert_close(self.smoke["h_nz_to_nd"](nz), h)
+
+    def test_independent_chunk_reference_advances_each_checkpoint(self):
+        q = torch.tensor([1.0, 0.0], dtype=torch.float16).repeat(1, 3, 1, 1)
+        v = torch.tensor([[1.0, 0.0], [0.5, 0.0], [1.0, 0.0]], dtype=torch.float16).view(1, 3, 1, 2)
+        g = torch.zeros((1, 3, 1))
+        beta = torch.full((1, 3, 1), 0.5, dtype=torch.float16)
+        state = torch.zeros((2, 1, 2, 2), dtype=torch.float16)
+        state[:, 0, 0, 0] = torch.tensor([0.25, 0.75])
+        out, checkpoint = self.smoke["cpu_chunk_reference"]((q, q, v, g, beta), state, torch.tensor([0, 2, 3]))
+        recurrence = torch.tensor([0.625, 0.5625, 0.875])
+        torch.testing.assert_close(out[0, :, 0, 0], (recurrence * 2**-0.5).half())
+        torch.testing.assert_close(checkpoint[:, 0, 0, 0], recurrence[[1, 2]])
+
+    def test_failed_output_comparison_still_reports_checkpoint_and_stage_errors(self):
+        expected = {"output": torch.ones((1, 2, 1, 1)), "checkpoint": torch.ones((2, 1, 1)), "v_new": torch.ones(1)}
+        actual = {**expected, "output": torch.zeros_like(expected["output"])}
+        with redirect_stdout(io.StringIO()) as output:
+            passed = self.smoke["report_chunk_comparison"]("test", [1, 1], actual, expected)
+        report = json.loads(output.getvalue())
+        self.assertFalse(passed)
+        self.assertEqual(report["status"], "FAILED")
+        self.assertEqual(report["metrics"]["v_new"]["relative_l2"], 0)
+        self.assertEqual(report["metrics"]["checkpoint"]["relative_l2"], 0)
+        self.assertEqual(report["per_sequence"][1]["output"]["relative_l2"], 1)
