@@ -86,10 +86,8 @@ def replayssm_gdn_enabled(vllm_config) -> bool:
 
 def replayssm_sd_ring_len(buffer_len: int, num_spec: int) -> int:
     max_tokens = num_spec + 1
-    if buffer_len != REPLAYSSM_SD_MAX_HISTORY or not (
-        1 <= num_spec < REPLAYSSM_SD_MAX_TOKENS or num_spec in REPLAYSSM_SD_310P_SPEC_TOKENS
-    ):
-        raise ValueError("Ascend ReplaySSM SD requires buffer_len=16 and MTP1/2/3 or 310P MTP7")
+    if buffer_len != REPLAYSSM_SD_MAX_HISTORY or not 1 <= num_spec <= REPLAYSSM_SD_310P_SPEC_TOKENS[-1]:
+        raise ValueError("Ascend ReplaySSM SD requires buffer_len=16 and 1–7 draft tokens")
     return 1 << (buffer_len + max_tokens - 1).bit_length()
 
 

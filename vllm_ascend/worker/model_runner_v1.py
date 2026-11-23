@@ -395,7 +395,7 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
-        self._replayssm_sd_deferred_state: dict[str, tuple[int, torch.Tensor]] = {}
+        self._replayssm_sd_deferred_state: dict[str, tuple[int, int | torch.Tensor]] = {}
         self._replayssm_sd_ring_slots = (
             ReplaySSMSDRingSlots(replayssm_sd_ring_capacity(vllm_config))
             if replayssm_sd_enabled(vllm_config)
@@ -998,13 +998,20 @@ class NPUModelRunner(GPUModelRunner):
             preempted = (scheduler_output.preempted_req_ids or set()) | resumed
             for req_id in preempted:
                 self._replayssm_sd_deferred_state.pop(req_id, None)
-            for req_id in unscheduled - preempted:
-                row = self.input_batch.req_id_to_index.get(req_id)
-                if row is not None:
-                    self._replayssm_sd_deferred_state[req_id] = (
-                        int(self.input_batch.replayssm_decode_base[row]),
-                        self.num_accepted_tokens.gpu[row].clone(),
-                    )
+            deferred = unscheduled - preempted
+            if deferred and not self.use_async_scheduling and self.num_accepted_tokens_event is not None:
+                self.num_accepted_tokens_event.synchronize()
+            for req_id in deferred:
+                row = self.input_batch.req_id_to_index[req_id]
+                accepted = (
+                    self.num_accepted_tokens.gpu[row].clone()
+                    if self.use_async_scheduling
+                    else int(self.input_batch.num_accepted_tokens_cpu[row])
+                )
+                self._replayssm_sd_deferred_state[req_id] = (
+                    int(self.input_batch.replayssm_decode_base[row]),
+                    accepted,
+                )
 
         if self.use_async_scheduling:
             for i, req_id in enumerate(req_data.req_ids):
@@ -1091,7 +1098,11 @@ class NPUModelRunner(GPUModelRunner):
                 if row is None:
                     continue
                 self.input_batch.replayssm_decode_base[row] = decode_base
-                self.num_accepted_tokens.gpu[row].copy_(accepted)
+                if isinstance(accepted, int):
+                    self.input_batch.num_accepted_tokens_cpu[row] = accepted
+                    self.num_accepted_tokens.gpu[row].fill_(accepted)
+                else:
+                    self.num_accepted_tokens.gpu[row].copy_(accepted)
                 del self._replayssm_sd_deferred_state[req_id]
 
     def _sync_num_accepted_tokens(self, num_reqs: int, has_prev_mapping: bool) -> None:

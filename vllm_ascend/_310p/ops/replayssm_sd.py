@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serve adapter for the V12 310P ReplaySSM kernels."""
+"""Serve adapter for the 310P ReplaySSM kernels."""
 
 from pathlib import Path
 
@@ -12,6 +12,7 @@ VERIFY_TILE_V = 64
 COMPACT_TILE_V = 32
 CORES = 7
 STATUS_VARIANT = 1
+COMPACT_VARIANT = 1
 METADATA_ALIGNMENT_BYTES = 32
 
 
@@ -36,11 +37,25 @@ def replay_token_gather(pack: torch.Tensor, rows: int, width: int) -> torch.Tens
     return gather
 
 
+def replayssm_sd_310p_dispatch(speculative_config) -> tuple[int, int, int]:
+    """Return the physical verify width, verify variant and compact variant."""
+    width = speculative_config.num_speculative_tokens + 1
+    if speculative_config.method == "dflash":
+        physical_width = max(4, width + width % 2)
+        # The grouped Cube binding currently supports physical widths 4 and 8.
+        return physical_width, 2 if physical_width in (4, 8) else STATUS_VARIANT, 2
+    return width, STATUS_VARIANT, COMPACT_VARIANT
+
+
 def initialize_replayssm_sd_310p(layer, vllm_config) -> None:
     layer.use_replayssm_sd = replayssm_sd_enabled(vllm_config)
     if not layer.use_replayssm_sd:
         return
-    layer._replayssm_sd_verify_width = vllm_config.speculative_config.num_speculative_tokens + 1
+    (
+        layer._replayssm_sd_verify_width,
+        layer._replayssm_sd_verify_variant,
+        layer._replayssm_sd_compact_variant,
+    ) = replayssm_sd_310p_dispatch(vllm_config.speculative_config)
     key_heads = layer.num_k_heads // layer.tp_size
     value_heads = layer.num_v_heads // layer.tp_size
     if (key_heads, value_heads) != (8, 16) or layer.head_k_dim != 128 or layer.head_v_dim != 128:
@@ -61,7 +76,7 @@ def initialize_replayssm_sd_310p(layer, vllm_config) -> None:
 
 
 def replayssm_sd_310p_decode(layer, query, key, value, g, beta, metadata) -> torch.Tensor:
-    """Consume normalized q/k and replace only the speculative recurrence."""
+    """Consume normalized q/k, verify the candidates and fold committed history."""
     slots = metadata.replayssm_sd_block_slots
     ring_slots = metadata.replayssm_sd_ring_slots
     positions = metadata.replayssm_sd_positions
@@ -91,7 +106,7 @@ def replayssm_sd_310p_decode(layer, query, key, value, g, beta, metadata) -> tor
     ops = torch.ops.replayssm_sd_310p
     trace = active_trace()
     tile = VERIFY_TILE_V if trace is None else trace.tile
-    variant = STATUS_VARIANT if trace is None else trace.variant
+    variant = layer._replayssm_sd_verify_variant if trace is None else trace.variant
     if trace is not None:
         slot = int(slots.cpu()[0])
         ring_slot = int(ring_slots.cpu()[0])
@@ -147,6 +162,7 @@ def replayssm_sd_310p_decode(layer, query, key, value, g, beta, metadata) -> tor
         COMPACT_TILE_V,
         CORES,
         ring_slots,
+        layer._replayssm_sd_compact_variant,
     )
     if trace is not None:
         trace.layer(

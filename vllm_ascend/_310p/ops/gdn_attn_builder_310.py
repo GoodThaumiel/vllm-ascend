@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
-from vllm_ascend._310p.ops.replayssm_sd import aligned_metadata_size, replay_token_gather
+from vllm_ascend._310p.ops.replayssm_sd import aligned_metadata_size, replay_token_gather, replayssm_sd_310p_dispatch
 from vllm_ascend.ops.gdn_attn_builder import (
     AscendGDNAttentionBackend,
     AscendGDNAttentionMetadataBuilder,
@@ -79,7 +79,7 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
         )
 
     def _replayssm_sd_physical_tokens(self) -> int:
-        return self.num_spec + 1
+        return replayssm_sd_310p_dispatch(self.vllm_config.speculative_config)[0]
 
     def _stage_replayssm_sd_pack(self, pack, rows, attn_metadata):
         super()._stage_replayssm_sd_pack(pack, rows, attn_metadata)

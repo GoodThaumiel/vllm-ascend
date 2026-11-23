@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks for 310P request-owned ring capacity and lifecycle."""
 
+import ast
 import importlib.util
 import json
 import sys
@@ -95,6 +96,71 @@ class TestReplaySSM310PDemo(unittest.TestCase):
 
 
 class TestReplaySSM310PServe(unittest.TestCase):
+    def test_deferred_request_keeps_accepted_prefix_and_ring_after_batch_reorder(self):
+        source = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+        tree = ast.parse(source.read_text())
+        runner_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
+        )
+        runner_class.bases = [ast.Name(id="BaseRunner", ctx=ast.Load())]
+        runner_class.body = [
+            node
+            for node in runner_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("_update_states", "_restore_replayssm_sd_deferred_state")
+        ]
+
+        class BaseRunner:
+            def _update_states(self, output):
+                self.input_batch.req_id_to_index = {req: row for row, req in enumerate(output.num_scheduled_tokens)}
+                self.input_batch.num_accepted_tokens_cpu[:] = [1, 1]
+                self.input_batch.replayssm_decode_base[:] = [4096, 4096]
+
+        namespace = {
+            "BaseRunner": BaseRunner,
+            "Callable": object,
+            "replayssm_sd_enabled": _cache.replayssm_sd_enabled,
+        }
+        module = ast.fix_missing_locations(ast.Module(body=[runner_class], type_ignores=[]))
+        exec(compile(module, str(source), "exec"), namespace)
+        runner = namespace["NPUModelRunner"]()
+        runner.vllm_config = SimpleNamespace(additional_config={"replayssm_sd": True})
+        runner.use_async_scheduling = False
+        runner._replayssm_sd_deferred_state = {}
+        slots = runner._replayssm_sd_ring_slots = _cache.ReplaySSMSDRingSlots(2)
+        slots.assign(["paused", "finished"])
+        runner.input_batch = SimpleNamespace(
+            req_id_to_index={"paused": 0, "finished": 1},
+            replayssm_decode_base=[2048, 100],
+            num_accepted_tokens_cpu=[1, 1],
+        )
+        accepted = runner.input_batch.num_accepted_tokens_cpu
+        runner.num_accepted_tokens = SimpleNamespace(gpu=torch.ones(2, dtype=torch.int32))
+        event = runner.num_accepted_tokens_event = Mock()
+        event.synchronize.side_effect = lambda: accepted.__setitem__(0, 6)
+        runner._apply_pp_sampled_tokens_from_scheduler_output = Mock()
+        runner._track_tmp_encoder_cache_refs = Mock()
+        output = SimpleNamespace(
+            finished_req_ids={"finished"},
+            preempted_req_ids=set(),
+            scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
+            num_scheduled_tokens={"new": 8},
+            kv_cache_block_copies=[],
+        )
+        runner._update_states(output)
+        event.synchronize.assert_called_once()
+        self.assertEqual(slots.slots_for(["new", "paused"]), [2, 1])
+        self.assertEqual(runner._replayssm_sd_deferred_state, {"paused": (2048, 6)})
+
+        output.finished_req_ids = set()
+        output.num_scheduled_tokens["paused"] = 8
+        runner._update_states(output)
+        runner._restore_replayssm_sd_deferred_state()
+        self.assertEqual(runner.input_batch.replayssm_decode_base[1], 2048)
+        self.assertEqual(accepted, [1, 6])
+        self.assertEqual(runner.num_accepted_tokens.gpu.tolist(), [1, 6])
+        self.assertEqual(runner._replayssm_sd_deferred_state, {})
+
     def test_trace_reuses_native_drafts_and_rejects_different_inputs(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -129,25 +195,34 @@ class TestReplaySSM310PServe(unittest.TestCase):
             self.assertEqual(view.numel(), 65)
 
     def test_verify_dispatch_for_full_windows(self):
-        for width in (4, 8):
-            with self.subTest(width=width):
-                self._check_verify_dispatch((width, width), width)
+        for k in (3, 7):
+            with self.subTest(k=k):
+                self._check_verify_dispatch((k + 1, k + 1), k, "mtp", (k + 1, 1, 1))
 
     def test_verify_dispatch_for_short_windows(self):
-        for width in (4, 8):
-            with self.subTest(width=width):
-                self._check_verify_dispatch((width, 1, 2), width)
+        for k in (3, 7):
+            with self.subTest(k=k):
+                self._check_verify_dispatch((k + 1, 1, 2), k, "mtp", (k + 1, 1, 1))
+
+    def test_dflash_dispatch_for_full_and_short_windows(self):
+        # K=4/5 keep physical width 6 and use the supported vector verify.
+        for k, width, variant in ((1, 4, 2), (2, 4, 2), (3, 4, 2), (4, 6, 1), (5, 6, 1), (6, 8, 2), (7, 8, 2)):
+            self.assertEqual(_cache.replayssm_sd_ring_len(16, k), 32)
+            for lengths in ((k + 1, k + 1), (k + 1, 1, 2)):
+                with self.subTest(k=k, lengths=lengths):
+                    self._check_verify_dispatch(lengths, k, "dflash", (width, variant, 2))
 
     def test_mtp7_ring_keeps_32_entries_and_96_request_slots(self):
         config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=96))
         self.assertEqual(_cache.replayssm_sd_ring_len(16, 7), 32)
         self.assertEqual(_cache.replayssm_sd_ring_capacity(config), 96)
 
-    def _check_verify_dispatch(self, lengths, width):
+    def _check_verify_dispatch(self, lengths, k, method, dispatch):
+        width, verify_variant, compact_variant = dispatch
         rows = len(lengths)
         tokens = sum(lengths)
         lengths = torch.tensor(lengths, dtype=torch.int32)
-        pack = _cache.replayssm_sd_pack_indices(lengths, width)
+        pack = _cache.replayssm_sd_pack_indices(lengths, k + 1, width)
         v = torch.arange(tokens, dtype=torch.float16).view(1, tokens, 1, 1).expand(1, tokens, 16, 128)
         q = torch.ones(1, tokens, 8, 128, dtype=torch.float16)
         gates = torch.ones(1, tokens, 16)
@@ -165,17 +240,29 @@ class TestReplaySSM310PServe(unittest.TestCase):
         )
         if tokens != rows * width:
             meta.replayssm_sd_token_gather = _serve.replay_token_gather(pack, rows, width)
-        checkpoint = torch.empty(rows + 1, 16, 128, 128, dtype=torch.float16)
-        layer = SimpleNamespace(
-            head_k_dim=128,
-            kv_cache=(None, checkpoint),
-            _replayssm_sd_verify_width=width,
-            _replayssm_sd_d_ring=torch.empty(0),
-            _replayssm_sd_k_ring=torch.empty(0),
-            _replayssm_sd_g_ring=torch.empty(0),
-            _replayssm_sd_verify_status=torch.empty(rows * 16 * 2, dtype=torch.int32),
-            _replayssm_sd_compact_status=torch.empty(rows * 16 * 4, dtype=torch.int32),
+        # Match the service's nonzero aligned checkpoint offset and make its
+        # physical block IDs independent of the request-owned ring IDs.
+        checkpoint = torch.empty(rows + 2, 16, 128, 128, dtype=torch.float16)[1:]
+        layer = torch.nn.Module()
+        layer.num_k_heads = 16
+        layer.num_v_heads = 32
+        layer.tp_size = 2
+        layer.head_k_dim = layer.head_v_dim = 128
+        layer.A_log = torch.empty(0)
+        layer.kv_cache = None, checkpoint
+        layer._replayssm_sd_d_ring = torch.empty(0)
+        layer._replayssm_sd_k_ring = torch.empty(0)
+        layer._replayssm_sd_g_ring = torch.empty(0)
+        _serve.initialize_replayssm_sd_310p(
+            layer,
+            SimpleNamespace(
+                additional_config={"replayssm_sd": True},
+                speculative_config=SimpleNamespace(method=method, num_speculative_tokens=k),
+                scheduler_config=SimpleNamespace(max_num_seqs=rows),
+                compilation_config=SimpleNamespace(max_cudagraph_capture_size=0),
+            ),
         )
+        self.assertTrue(layer.use_replayssm_sd)
         ops = Mock()
 
         def fake_verify(*args):
@@ -187,7 +274,8 @@ class TestReplaySSM310PServe(unittest.TestCase):
             self.assertEqual(args[14].numel(), rows * 16 * 2)
             self.assertEqual(args[16:18], (64, 7))
             self.assertIs(args[18], ring_slots)
-            self.assertEqual(args[19], 1)
+            self.assertIs(args[12], lengths)
+            self.assertEqual(args[19], verify_variant)
             args[13].copy_(args[2] + 1)
 
         ops.verify_.side_effect = fake_verify
@@ -202,6 +290,7 @@ class TestReplaySSM310PServe(unittest.TestCase):
         self.assertEqual(compact[8].numel(), rows * 16 * 4)
         self.assertEqual(compact[9:11], (32, 7))
         self.assertIs(compact[11], ring_slots)
+        self.assertEqual(compact[12], compact_variant)
 
 
 if __name__ == "__main__":

@@ -53,10 +53,11 @@ from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
 from vllm_ascend._310p.kv_cache_sharing import get_310p_dflash_private_page_bytes, get_310p_shared_cache_slots
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.replayssm_sd import (
+    COMPACT_TILE_V,
     CORES,
-    STATUS_VARIANT,
     VERIFY_TILE_V,
     load_replayssm_sd_310p_ops,
+    replayssm_sd_310p_dispatch,
 )
 from vllm_ascend._310p.ops.replayssm_sd_trace import ReplaySSM310Trace
 from vllm_ascend._310p.ops.rgdr_grouped import grouped_rgdr_launch_config
@@ -148,11 +149,18 @@ class NPUModelRunner310(NPUModelRunner):
             )
         if self._replayssm_sd_ring_slots is not None:
             load_replayssm_sd_310p_ops()
+            width, verify, compact = replayssm_sd_310p_dispatch(self.speculative_config)
             logger.info(
-                "310P ReplaySSM SD V12 dispatch: width=%d, verify tile=%d, status variant=%d, cores=%d",
+                "310P ReplaySSM SD dispatch rank=%d method=%s logical_width=%d physical_width=%d "
+                "verify=%d/tile%d compact=%d/tile%d cores=%d",
+                get_tensor_model_parallel_rank(),
+                self.speculative_config.method,
                 self.num_spec_tokens + 1,
+                width,
+                verify,
                 VERIFY_TILE_V,
-                STATUS_VARIANT,
+                compact,
+                COMPACT_TILE_V,
                 CORES,
             )
         self._replayssm_trace = None
@@ -162,6 +170,7 @@ class NPUModelRunner310(NPUModelRunner):
                 not self.model_config.enforce_eager
                 or self.use_async_scheduling
                 or self.speculative_config is None
+                or self.speculative_config.method != "mtp"
                 or self.speculative_config.num_speculative_tokens != 3
                 or self.parallel_config.tensor_parallel_size != 2
                 or self.parallel_config.pipeline_parallel_size != 1
@@ -387,6 +396,8 @@ class NPUModelRunner310(NPUModelRunner):
                 tokens=total_num_scheduled_tokens,
                 max_query=int(num_scheduled_tokens.max()),
                 spec_rows=len(scheduler_output.scheduled_spec_decode_tokens),
+                preempted=sorted(scheduler_output.preempted_req_ids or ()),
+                resumed=sorted(scheduler_output.scheduled_cached_reqs.resumed_req_ids),
             )
 
         self.input_batch.block_table.commit_block_table(num_reqs)
@@ -707,6 +718,45 @@ class NPUModelRunner310(NPUModelRunner):
                 fields,
             )
 
+    def _trace_dflash_replayssm_sd(self, forward_context) -> None:
+        if not 0 < self._dflash_trace_step <= self._dflash_trace_limit or self._replayssm_sd_ring_slots is None:
+            return
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        context = self.compilation_config.static_forward_context
+        request_by_slot = {
+            self._replayssm_sd_ring_slots.slot_for(req_id): req_id for req_id in self.input_batch.req_ids
+        }
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            for name in group.layer_names:
+                metadata = attn_metadata.get(name)
+                if getattr(metadata, "replayssm_sd_cursor_status", None) is None:
+                    continue
+                layer = context[name]
+                ring = metadata.replayssm_sd_ring_slots.cpu().tolist()
+                rows = len(ring)
+                heads = layer.num_v_heads // layer.tp_size
+                verify_size = rows * heads * (layer.head_v_dim // VERIFY_TILE_V)
+                compact_size = rows * heads * (layer.head_v_dim // COMPACT_TILE_V)
+                self._trace_dflash(
+                    "replayssm_sd",
+                    gid=gid,
+                    layer=name,
+                    requests=[request_by_slot.get(slot) for slot in ring],
+                    checkpoint=metadata.replayssm_sd_block_slots.cpu().tolist(),
+                    ring=ring,
+                    accepted=metadata.num_accepted_tokens.cpu().tolist(),
+                    reset=metadata.replayssm_sd_reset.cpu().tolist(),
+                    lengths=metadata.replayssm_sd_lengths.cpu().tolist(),
+                    positions=metadata.replayssm_sd_positions.cpu().tolist(),
+                    bases=metadata.replayssm_sd_bases.cpu().tolist(),
+                    flush=metadata.replayssm_sd_flush.cpu().tolist(),
+                    cursor_status=metadata.replayssm_sd_cursor_status.cpu().tolist(),
+                    verify_status=layer._replayssm_sd_verify_status[:verify_size].cpu().unique().tolist(),
+                    compact_status=layer._replayssm_sd_compact_status[:compact_size].cpu().unique().tolist(),
+                )
+
     def _sample(self, logits, spec_decode_metadata):
         trace = getattr(self, "_replayssm_trace", None)
         if trace is None or not trace.record:
@@ -856,6 +906,7 @@ class NPUModelRunner310(NPUModelRunner):
             )
 
         self._trace_dflash("target_forward_enqueued")
+        self._trace_dflash_replayssm_sd(forward_context)
         descriptor = getattr(self, "_dflash_target_graph", None)
         if descriptor is not None and descriptor.num_tokens not in self._dflash_reported_replays:
             self._dflash_reported_replays.add(descriptor.num_tokens)
@@ -1074,7 +1125,7 @@ class NPUModelRunner310(NPUModelRunner):
             logger.info(
                 "310P DFlash shared KV allocation rank=%d pool_blocks=%d physical_bytes_per_pool_block=%d "
                 "state_slots=%d attention_slots=%d workload_tokens=%d blocks_per_request=%d estimated_concurrency=%d "
-                "groups(gid, type, layers, block_tokens, real_page_bytes)=%s",
+                "groups(gid, type, layers, block_tokens, real_page_bytes, speculative_blocks)=%s",
                 get_tensor_model_parallel_rank(),
                 kv_cache_config.num_blocks,
                 shared.bytes_per_pool_block,
@@ -1090,6 +1141,7 @@ class NPUModelRunner310(NPUModelRunner):
                         len(group.layer_names),
                         group.kv_cache_spec.block_size,
                         group.kv_cache_spec.real_page_size_bytes,
+                        getattr(group.kv_cache_spec, "num_speculative_blocks", 0),
                     )
                     for gid, group in enumerate(groups)
                 ],

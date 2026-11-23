@@ -52,8 +52,8 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
     def test_sd_rejects_unsupported_window_before_cache_allocation(self) -> None:
         with self.assertRaisesRegex(ValueError, "buffer_len=16"):
             CACHE.replayssm_sd_ring_len(32, 3)
-        for num_spec in (0, 4):
-            with self.assertRaisesRegex(ValueError, "MTP1/2/3"):
+        for num_spec in (0, 8):
+            with self.assertRaisesRegex(ValueError, "1–7 draft tokens"):
                 CACHE.replayssm_sd_ring_len(16, num_spec)
         with self.assertRaisesRegex(ValueError, "query length"):
             CACHE.replayssm_sd_pack_indices(torch.tensor([1, 5]))

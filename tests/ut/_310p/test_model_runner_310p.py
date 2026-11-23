@@ -61,6 +61,8 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
     runner.uses_mrope = False
     runner.enable_enpu = False
     runner.speculative_config = SimpleNamespace(method="mtp")
+    runner._dflash_trace_step = 0
+    runner._dflash_trace_limit = 0
     runner.update_stream = MagicMock()
     runner._all_gather_hidden_states_and_aux = MagicMock()
 

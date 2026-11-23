@@ -26,7 +26,6 @@ from vllm_ascend._310p.dflash_config import (
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
-from vllm_ascend.ops.replayssm.cache import replayssm_sd_enabled
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 
 QUERY_FIELDS = 6
@@ -101,7 +100,6 @@ class AscendDFlashProposer310(AscendDflashProposer):
             or self.dynamic_spec is not None
             or cache.enable_prefix_caching
             or self.dtype != torch.float16
-            or replayssm_sd_enabled(vllm_config)
             or cache.use_replayssm
             or mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY)
             or (mode == CUDAGraphMode.FULL_DECODE_ONLY and not self.use_cuda_graph)

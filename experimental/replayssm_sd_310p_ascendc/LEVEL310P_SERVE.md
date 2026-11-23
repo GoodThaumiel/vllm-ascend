@@ -94,7 +94,7 @@ eager A/B 可用于隔离算子和缓存收益，graph A/B 用于衡量当前服
 
 每轮在另一终端设置同一 `REPLAYSSM_MODEL`、`RESULTS`，并按运行中的服务设置
 `VARIANT` 和 `EXECUTION`。先确认 `/health`，检查 Replay 两个 rank 均有
-`310P ReplaySSM SD V12 dispatch` 以及独立 ring 分配日志。用固定的短 prompt
+`310P ReplaySSM SD dispatch`（`method=mtp`、`verify=1/tile64`、`compact=1/tile32`）以及独立 ring 分配日志。用固定的短 prompt
 记录两次温度为零的输出。Replay 用同模式下 native 的 JSON 作 token 对照。
 
 ```bash
