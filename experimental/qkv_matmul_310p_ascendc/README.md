@@ -52,3 +52,18 @@ done
 ```
 
 可将 `ROWS` 改为 4096 检查对齐整块，也可用 `ACCUM=fp16` 重测原 FP16 自研路径作为性能对照。每个 profile 只放一个 M，便于在自定义 launch 缺少 shape 标注时归属样本。回传 perf JSON 和对应的逐次算子记录，重点比较 native MatMul、`qkv_matmul_310p_fp32_accum` 的设备耗时，以及从 ND 激活出发时前置 `TransData` 的开销。统计 p50/p90 时排除每条路径的前 11 次 MatMul。
+
+## 服务级 prefill JIT 实验
+
+在 **310P MRv1、FULL_DECODE_ONLY** 的原服务命令前加 `VLLM_ASCEND_310P_PREFILL_JIT=1`，或在启动前执行以下命令。沿用原来的模型、投机和图尺寸配置。此实验只改 Python，沿用现有自定义算子库。
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=0
+export VLLM_ASCEND_310P_PREFILL_JIT=1
+```
+
+仅在 target forward 同时满足有活跃请求尚在算 prompt、当前批次走图外、当前处于真实请求执行时打开 JIT。包含 prefill 的混合批也会命中。退出 target forward 时恢复 TorchNPU 模式，draft 和 decode 图继续使用原有路径。作用域覆盖该 forward 中所有 TorchNPU 算子。切入和恢复各有一次设备同步，按完整 prefill forward 和 TTFT 验收。
+
+1. 用同一服务配置分别跑开关 `0` 和 `1`。启动后先做 C1，确认能完整生成，并记录第一次和预热后的 TTFT。
+2. 用 C10 持续补入覆盖纯 prefill、混合批和纯 decode。确认出现 `310P target prefill experiment uses TorchNPU jit_compile=True`，并按原 [DFlash 双图清单](../dflash_310p_ascendc/LEVEL2.md) 核对两个 TP rank 的 target/draft replay。
+3. 同口径抓一轮 `max_num_batched_tokens=4096` 的 prefill。核对目标投影、相关 `TransData` 和整个 forward 的时延，单列首次遇到 shape 的编译开销。回传前后端到端 TTFT、设备 trace 和首个错误栈。

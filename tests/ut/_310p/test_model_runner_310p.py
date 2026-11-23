@@ -24,7 +24,7 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
-from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend._310p.model_runner_310p import NPUModelRunner310, _run_with_prefill_jit
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 
@@ -93,6 +93,58 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
 
     assert calls == ["update", "model"]
     torch.testing.assert_close(hidden_states, torch.ones(1))
+
+
+@pytest.mark.parametrize(
+    ("enabled", "mode", "capturing", "profiling", "computed_tokens", "expected"),
+    [
+        (False, CUDAGraphMode.NONE, False, False, [0, 2000], False),
+        (True, CUDAGraphMode.NONE, False, False, [0, 2000], True),
+        (True, CUDAGraphMode.NONE, False, False, [1999, 2000], True),
+        (True, CUDAGraphMode.NONE, False, False, [2000, 2001], False),
+        (True, CUDAGraphMode.FULL, False, False, [0, 2000], False),
+        (True, CUDAGraphMode.NONE, True, False, [0, 2000], False),
+        (True, CUDAGraphMode.NONE, False, True, [0, 2000], False),
+    ],
+)
+def test_prefill_jit_is_scoped_to_eager_target_prefill(enabled, mode, capturing, profiling, computed_tokens, expected):
+    runner = object.__new__(NPUModelRunner310)
+    runner._prefill_jit_enabled = enabled
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY)
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_computed_tokens_cpu=np.array(computed_tokens),
+        num_prompt_tokens=np.full(2, 2000),
+    )
+    forward_context = SimpleNamespace(cudagraph_runtime_mode=mode, capturing=capturing, in_profile_run=profiling)
+
+    assert runner._should_run_prefill_with_jit(forward_context) is expected
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_prefill_jit_restores_compile_mode(fail):
+    calls = []
+
+    def forward():
+        assert calls == [True]
+        if fail:
+            raise RuntimeError("prefill failure")
+        return "hidden states"
+
+    with (
+        patch("vllm_ascend._310p.model_runner_310p.torch_npu.npu.is_jit_compile_false", return_value=True),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.torch_npu.npu.set_compile_mode",
+            side_effect=lambda *, jit_compile: calls.append(jit_compile),
+        ),
+    ):
+        if fail:
+            with pytest.raises(RuntimeError, match="prefill failure"):
+                _run_with_prefill_jit(forward)
+        else:
+            assert _run_with_prefill_jit(forward) == "hidden states"
+
+    assert calls == [True, False]
 
 
 def test_310p_runner_does_not_advertise_standardized_shared_kv_backing() -> None:
