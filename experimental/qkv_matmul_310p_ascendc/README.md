@@ -36,18 +36,17 @@ python3 -m experimental.qkv_matmul_310p_ascendc.bench \
 
 精度通过后分别抓 profile。两边的权重都预先转为 NZ。原生默认从 ND 激活调用 `F.linear`，与当前分支的 unquantized linear 入口一致。脚本记录 `F.linear` 返回的格式（2 为 ND，29 为 NZ）。跨镜像对比时，分别记录 device MatMul 的输出格式和返回格式，并检查前后的 `TransData` 是否转换了激活或结果。自研 `custom` 在计时前转好激活 NZ，`custom-from-nd` 则把激活转换算入时延。若要给两边传完全相同的 NZ tensors，可另跑 `--impl both --native-input-format nz`。只有测原生的 `--impl native` 可在旧镜像直接用同一脚本，无需自研库。[TorchNPU 矩阵乘分派源码](https://github.com/Ascend/op-plugin/blob/master/op_plugin/ops/opapi/MmKernelNpuOpApi.cpp)
 
-```bash
-python3 -m experimental.qkv_matmul_310p_ascendc.bench \
-  --device 0 --stage perf --impl both --output /tmp/qkv310p-sweep.json
+310P3 上用 `--no-timing` 跳过 NPU Event 计时，避免 `aclrtEventElapsedTime` 返回 `107006`。每组先提交 1 次输出检查和 10 次预热，再提交 100 次正式调用。JSON 记录配置、格式及调用次数，设备时延从 msprof 的逐次记录计算。
 
+```bash
 ROWS=4001
 ACCUM=fp32
 for impl in native custom custom-from-nd; do
   msprof --output="/tmp/qkv310p-prof-$ROWS-$impl-$ACCUM" \
     --application="python3 -m experimental.qkv_matmul_310p_ascendc.bench \
       --device 0 --stage perf --impl $impl --rows $ROWS --accum-dtype $ACCUM \
-      --warmup 10 --repeats 100 --output /tmp/qkv310p-$ROWS-$impl-$ACCUM.json"
+      --no-timing --warmup 10 --repeats 100 --output /tmp/qkv310p-$ROWS-$impl-$ACCUM.json"
 done
 ```
 
-可将 `ROWS` 改为 4096 检查对齐整块，也可用 `ACCUM=fp16` 重测原 FP16 自研路径作为性能对照。每个 profile 只放一个 M，便于在自定义 launch 缺少 shape 标注时归属样本。回传 check JSON、perf JSON 和对应 op summary，重点记录 native MatMul、`qkv_matmul_310p_fp32_accum`、`qkv_matmul_310p_fp16` 的设备耗时，以及两边从 ND 激活出发的 event p50/p90。
+可将 `ROWS` 改为 4096 检查对齐整块，也可用 `ACCUM=fp16` 重测原 FP16 自研路径作为性能对照。每个 profile 只放一个 M，便于在自定义 launch 缺少 shape 标注时归属样本。回传 perf JSON 和对应的逐次算子记录，重点比较 native MatMul、`qkv_matmul_310p_fp32_accum` 的设备耗时，以及从 ND 激活出发时前置 `TransData` 的开销。统计 p50/p90 时排除每条路径的前 11 次 MatMul。

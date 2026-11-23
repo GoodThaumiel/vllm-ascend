@@ -85,10 +85,17 @@ def check_error(actual: torch.Tensor, expected: torch.Tensor, name: str) -> dict
     return {"relative_l2": relative_l2, "max_abs": max_abs}
 
 
-def measure(call, warmup: int, repeats: int) -> dict:
+def run_perf(call, warmup: int, repeats: int, *, timing: bool) -> dict:
     for _ in range(warmup):
         call()
     torch.npu.synchronize()
+    result = {"warmup": warmup, "repeats": repeats}
+    if not timing:
+        for _ in range(repeats):
+            call()
+        torch.npu.synchronize()
+        return result
+
     events = [(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in range(repeats)]
     for start, end in events:
         start.record()
@@ -98,10 +105,10 @@ def measure(call, warmup: int, repeats: int) -> dict:
     times = sorted(start.elapsed_time(end) * 1000 for start, end in events)
     p90_index = (9 * repeats + 9) // 10 - 1
     return {
+        **result,
         "p50_us": statistics.median(times),
         "p90_us": times[p90_index],
         "min_us": times[0],
-        "repeats": repeats,
     }
 
 
@@ -144,8 +151,9 @@ def run_rows(args: argparse.Namespace, device: torch.device) -> list[dict]:
             case["output_formats"][name] = out_format
             print(f"  {name} output_format={out_format}", flush=True)
             if args.stage == "perf":
-                case[name] = measure(call, args.warmup, args.repeats)
-                case[name]["tflops_p50"] = 2 * rows * K * N / (case[name]["p50_us"] * 1e6)
+                case[name] = run_perf(call, args.warmup, args.repeats, timing=not args.no_timing)
+                if not args.no_timing:
+                    case[name]["tflops_p50"] = 2 * rows * K * N / (case[name]["p50_us"] * 1e6)
                 print(json.dumps(case[name]), flush=True)
             else:
                 outputs[name] = out.cpu()
@@ -176,6 +184,7 @@ def main() -> None:
     parser.add_argument("--cores", type=int, default=0, help="0 uses all available Cube cores")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=100)
+    parser.add_argument("--no-timing", action="store_true", help="Submit perf iterations for msprof without NPU events")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -205,6 +214,8 @@ def main() -> None:
         "cores": args.cores,
         "seed": args.seed,
     }
+    if args.stage == "perf":
+        report["timing"] = "disabled" if args.no_timing else "npu_event"
     with torch.inference_mode():
         if args.stage == "check" and args.impl != "native":
             report["layout"] = layout_cases(device, args.cores, args.accum_dtype == "fp32")
