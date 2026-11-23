@@ -1,0 +1,52 @@
+# Ascend310P3 QKV FP16 MatMul
+
+独立工程，用于复现 0.30.0 prefill/mixed batch 的 QKV 投影并和原生路径做单算子对比。算子计算 `Y = X @ W.T`，无 bias，固定 `K=2048`、`N=6144`，支持 `1 <= M <= 4096`。
+
+| 张量 | 逻辑形状 | 物理形状 |
+| --- | --- | --- |
+| X | `[M, 2048]` | NZ `[128, ceil(M / 16), 16, 16]` |
+| W | `[6144, 2048]` | NZ `[128, 384, 16, 16]` |
+| Y | `[M, 6144]` | ND `[M, 6144]` |
+
+Torch binding 可接收带原生 FRACTAL_NZ descriptor 的矩阵，也可接收按上述字节顺序打包的连续 4D tensor。动态尾块按 16 行向上对齐读入和计算，只写回逻辑有效行。
+
+每个 Cube 核负责一组不相交的 128 列，权重 panel 在 L1 中复用。每个输出 tile 以 256×128×128 的 M/N/K 分块运行 16 次低阶 `Mmad`，首个 K 块清空 L0C，其余块累加。L0C 和 UB 都是 FP16，最后用 CO1→CO2 enhanced DataCopy 和按列条带的 DataCopy 写出 ND。FP16 累加需要独立验收精度。该写回方式参考 [Ascend C 耦合架构示例](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_10_00007.html)。
+
+## 上机清单
+
+从 `vllm-ascend` 根目录执行，使用已加载 CANN 9.2.1 和 torch_npu 的 310P3 容器。只编译实验目录。
+
+```bash
+OP=experimental/qkv_matmul_310p_ascendc
+cmake -S "$OP" -B "$OP/build-c921" \
+  -DCMAKE_BUILD_TYPE=Release -DSOC_VERSION=Ascend310P3 \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build "$OP/build-c921" --parallel
+readelf -d "$OP/build-c921/libqkv_matmul_310p_torch.so" | grep -E 'NEEDED|RUNPATH'
+ldd "$OP/build-c921/libqkv_matmul_310p_torch.so" | grep qkv_matmul_310p_kernel
+```
+
+先验证布局和精度。首段每行设置两个分属不同 K 块的非零元素，用精确输出核对 K 累加、NZ 方向、尾块和输出前后的哨兵行，分别覆盖 native NZ descriptor 和手工打包输入。第二段用相同随机输入比较 CPU FP32 reference、原生输出和自研输出。
+
+```bash
+python3 -m experimental.qkv_matmul_310p_ascendc.bench \
+  --device 0 --stage check --output /tmp/qkv310p-check.json
+```
+
+精度通过后分别抓 profile。两边的权重都预先转为 NZ。原生默认从 ND 激活调用 `F.linear`，与当前分支的 unquantized linear 入口一致。确认原生 trace 出现 `MatMulWeightNz`，记录该 kernel 及其前置 `TransData`。自研 `custom` 在计时前转好激活 NZ，`custom-from-nd` 则把激活转换算入时延。若要给两边传完全相同的 NZ tensors，可另跑 `--impl both --native-input-format nz`，并核对这时原生所选 kernel。[TorchNPU 矩阵乘分派源码](https://github.com/Ascend/op-plugin/blob/master/op_plugin/ops/opapi/MmKernelNpuOpApi.cpp)
+
+```bash
+python3 -m experimental.qkv_matmul_310p_ascendc.bench \
+  --device 0 --stage perf --impl both --output /tmp/qkv310p-sweep.json
+
+ROWS=4001
+for impl in native custom custom-from-nd; do
+  msprof --output="/tmp/qkv310p-prof-$ROWS-$impl" \
+    --application="python3 -m experimental.qkv_matmul_310p_ascendc.bench \
+      --device 0 --stage perf --impl $impl --rows $ROWS \
+      --warmup 10 --repeats 100 --output /tmp/qkv310p-$ROWS-$impl.json"
+done
+```
+
+可将 `ROWS` 改为 4096，检查对齐整块。每个 profile 只放一个 M，便于在自定义 launch 缺少 shape 标注时归属样本。回传 check JSON、perf JSON 和对应 op summary。比较 `MatMulWeightNz` 对 `qkv_matmul_310p_fp16` 的设备耗时，以及两边从 ND 激活出发的 event p50/p90。若原生选了别的 kernel，请保留 kernel 名和输入输出格式，便于复现 2.4 ms 的服务路径。
