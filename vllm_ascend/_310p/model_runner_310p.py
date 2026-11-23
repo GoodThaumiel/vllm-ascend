@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
@@ -83,17 +82,6 @@ _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
 
 
-def _run_with_prefill_jit(forward: Callable[[], Any]) -> Any:
-    if not torch_npu.npu.is_jit_compile_false():
-        return forward()
-
-    torch_npu.npu.set_compile_mode(jit_compile=True)
-    try:
-        return forward()
-    finally:
-        torch_npu.npu.set_compile_mode(jit_compile=False)
-
-
 class NPUModelRunner310(NPUModelRunner):
     """
     310P model runner with a distinct ACL graph capture/replay contract from 910B:
@@ -113,11 +101,9 @@ class NPUModelRunner310(NPUModelRunner):
     supports_standardized_shared_kv_backing = False
     uniform_decode_query_len: int
     _spec_dummy_capture: bool = False
-    _prefill_jit_enabled: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._prefill_jit_enabled = ascend_envs.VLLM_ASCEND_310P_PREFILL_JIT
         self._dflash_trace_limit = (
             ascend_envs.VLLM_ASCEND_310P_DFLASH_STAGE_TRACE
             if self.speculative_config is not None and self.speculative_config.method == "dflash"
@@ -796,21 +782,6 @@ class NPUModelRunner310(NPUModelRunner):
             finally:
                 self._spec_dummy_capture = False
 
-    def _should_run_prefill_with_jit(self, forward_context) -> bool:
-        if (
-            not self._prefill_jit_enabled
-            or self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
-            or forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
-            or forward_context.capturing
-            or forward_context.in_profile_run
-        ):
-            return False
-
-        num_reqs = self.input_batch.num_reqs
-        return bool(
-            np.any(self.input_batch.num_computed_tokens_cpu[:num_reqs] < self.input_batch.num_prompt_tokens[:num_reqs])
-        )
-
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -853,10 +824,6 @@ class NPUModelRunner310(NPUModelRunner):
             **model_kwargs,
         }
         run_model = partial(self.model, **model_inputs)
-        if self._should_run_prefill_with_jit(forward_context):
-            forward_context.skip_compiled = True
-            logger.info_once("310P target prefill experiment uses TorchNPU jit_compile=True.", scope="local")
-            run_model = partial(_run_with_prefill_jit, run_model)
         trace = getattr(self, "_replayssm_trace", None)
         if trace is not None and trace.record:
             if input_ids is None:

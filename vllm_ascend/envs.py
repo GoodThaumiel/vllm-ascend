@@ -106,10 +106,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Align 128-wide chunk GDN Q/K RMSNorm rows to 16 on 310P.
     # Default: 0. Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16": lambda: _strict_binary_env("VLLM_ASCEND_310P_PREFILL_RMSNORM_PAD16"),
-    # Experimentally enable TorchNPU JIT around 310P MRv1 target forwards
-    # containing prefill under FULL_DECODE_ONLY. Default: 0. Valid: 0 or 1.
-    # Non-sensitive. The runner reads this once, outside the forward path.
-    "VLLM_ASCEND_310P_PREFILL_JIT": lambda: _strict_binary_env("VLLM_ASCEND_310P_PREFILL_JIT"),
     # Use shared backing across compatible 310P DFlash MRv1 KV groups.
     "VLLM_ASCEND_310P_DFLASH_SHARED_KV": lambda: _strict_binary_env("VLLM_ASCEND_310P_DFLASH_SHARED_KV", "1"),
     # Size the shared DFlash pool using v24's logical bytes per block.
