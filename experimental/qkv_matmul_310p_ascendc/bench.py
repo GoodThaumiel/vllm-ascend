@@ -30,7 +30,7 @@ def pack_nz_cpu(x: torch.Tensor) -> torch.Tensor:
     return padded.reshape(padded_rows // C0, C0, cols // C0, C0).permute(2, 0, 1, 3).contiguous()
 
 
-def layout_cases(device: torch.device, cores: int) -> list[dict]:
+def layout_cases(device: torch.device, cores: int, fp32_accum: bool) -> list[dict]:
     """Exercise exact NZ indexing, all 16 K passes and partial row writeback."""
     k = torch.arange(K)
     n = torch.arange(N)
@@ -58,7 +58,7 @@ def layout_cases(device: torch.device, cores: int) -> list[dict]:
             w_format = int(torch_npu.get_npu_format(w_nz))
             print(f"check/layout M={rows} input={name} formats={x_format}/{w_format}", flush=True)
             out.fill_(float("nan"))
-            torch.ops.qkv_matmul_310p.run_(x_nz, w_nz, out, cores)
+            torch.ops.qkv_matmul_310p.run_(x_nz, w_nz, out, cores, fp32_accum)
             actual = backing.cpu()
             torch.testing.assert_close(actual[1:-1], expected, atol=0, rtol=0)
             torch.testing.assert_close(actual[[0, -1]], torch.full((2, N), -17, dtype=x.dtype), atol=0, rtol=0)
@@ -79,7 +79,7 @@ def check_error(actual: torch.Tensor, expected: torch.Tensor, name: str) -> dict
     relative_l2 = (torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(expected.float())).item()
     max_abs = delta.abs().max().item()
     print(f"  {name} relative_l2={relative_l2:.6g} max_abs={max_abs:.6g}", flush=True)
-    torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2, msg=f"{name} pointwise tolerance")
+    torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2, msg=lambda details: f"{name}\n{details}")
     if relative_l2 > 4e-3:
         raise AssertionError(f"{name} relative L2 {relative_l2:.6g} exceeds 0.004")
     return {"relative_l2": relative_l2, "max_abs": max_abs}
@@ -105,15 +105,16 @@ def measure(call, warmup: int, repeats: int) -> dict:
     }
 
 
-def custom_linear(x: torch.Tensor, weight: torch.Tensor, cores: int, *, pack: bool) -> torch.Tensor:
+def custom_linear(x: torch.Tensor, weight: torch.Tensor, cores: int, fp32_accum: bool, *, pack: bool) -> torch.Tensor:
     out = torch.empty((x.shape[0], N), device=x.device, dtype=torch.float16)
     x_nz = torch_npu.npu_format_cast(x, NZ) if pack else x
-    torch.ops.qkv_matmul_310p.run_(x_nz, weight, out, cores)
+    torch.ops.qkv_matmul_310p.run_(x_nz, weight, out, cores, fp32_accum)
     return out
 
 
 def run_rows(args: argparse.Namespace, device: torch.device) -> list[dict]:
     implementations = ("native", "custom") if args.impl == "both" else (args.impl,)
+    fp32_accum = args.accum_dtype == "fp32"
     need_nz = "custom" in implementations or ("native" in implementations and args.native_input_format == "nz")
     generator = torch.Generator().manual_seed(args.seed)
     weight_cpu = (torch.randn(N, K, generator=generator) * K**-0.5).half()
@@ -126,18 +127,22 @@ def run_rows(args: argparse.Namespace, device: torch.device) -> list[dict]:
         x_nz = torch_npu.npu_format_cast(x, NZ) if need_nz else x
         calls = {
             "native": partial(F.linear, x_nz if args.native_input_format == "nz" else x, weight_nz),
-            "custom": partial(custom_linear, x_nz, weight_nz, args.cores, pack=False),
-            "custom-from-nd": partial(custom_linear, x, weight_nz, args.cores, pack=True),
+            "custom": partial(custom_linear, x_nz, weight_nz, args.cores, fp32_accum, pack=False),
+            "custom-from-nd": partial(custom_linear, x, weight_nz, args.cores, fp32_accum, pack=True),
         }
-        case = {"rows": rows}
+        case = {"rows": rows, "output_formats": {}}
         outputs = {}
         for name in implementations:
             print(f"{args.stage}/{name} M={rows}", flush=True)
             call = calls[name]
             out = call()
             torch.npu.synchronize()
-            if out.shape != (rows, N) or out.dtype != torch.float16 or torch_npu.get_npu_format(out) != ND:
-                raise RuntimeError(f"{name} did not produce ND FP16 [{rows},{N}]")
+            out_format = int(torch_npu.get_npu_format(out))
+            allowed_formats = (ND, NZ) if name == "native" else (ND,)
+            if out.shape != (rows, N) or out.dtype != torch.float16 or out_format not in allowed_formats:
+                raise RuntimeError(f"{name} produced shape={out.shape}, dtype={out.dtype}, format={out_format}")
+            case["output_formats"][name] = out_format
+            print(f"  {name} output_format={out_format}", flush=True)
             if args.stage == "perf":
                 case[name] = measure(call, args.warmup, args.repeats)
                 case[name]["tflops_p50"] = 2 * rows * K * N / (case[name]["p50_us"] * 1e6)
@@ -160,6 +165,12 @@ def main() -> None:
     parser.add_argument("--stage", choices=("check", "perf"), default="check")
     parser.add_argument("--impl", choices=("both", "native", "custom", "custom-from-nd"), default="both")
     parser.add_argument("--native-input-format", choices=("nd", "nz"), default="nd")
+    parser.add_argument(
+        "--accum-dtype",
+        choices=("fp32", "fp16"),
+        default="fp32",
+        help="L0C accumulator for the custom kernel (outputs always FP16)",
+    )
     parser.add_argument("--rows", nargs="+", type=int, default=PROFILE_ROWS)
     parser.add_argument("--library", type=Path, default=DEFAULT_LIBRARY)
     parser.add_argument("--cores", type=int, default=0, help="0 uses all available Cube cores")
@@ -190,12 +201,13 @@ def main() -> None:
         "stage": args.stage,
         "implementation": args.impl,
         "native_input_format": args.native_input_format,
+        "custom_accum_dtype": args.accum_dtype if args.impl != "native" else None,
         "cores": args.cores,
         "seed": args.seed,
     }
     with torch.inference_mode():
         if args.stage == "check" and args.impl != "native":
-            report["layout"] = layout_cases(device, args.cores)
+            report["layout"] = layout_cases(device, args.cores, args.accum_dtype == "fp32")
         report["cases"] = run_rows(args, device)
     report["status"] = "PASSED"
     result = json.dumps(report, indent=2)

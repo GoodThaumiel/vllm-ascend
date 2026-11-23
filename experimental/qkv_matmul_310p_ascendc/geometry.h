@@ -18,6 +18,7 @@ constexpr uint32_t A_SLICE_BYTES = TILE_M * TILE_K * FP16_BYTES;
 constexpr uint32_t W_SLICE_BYTES = TILE_K * TILE_N * FP16_BYTES;
 constexpr uint32_t W_PANEL_BYTES = K * TILE_N * FP16_BYTES;
 constexpr uint32_t C_TILE_BYTES = TILE_M * TILE_N * FP16_BYTES;
+constexpr uint32_t C_TILE_FP32_BYTES = TILE_M * TILE_N * sizeof(float);
 
 static_assert(N % TILE_N == 0 && K % TILE_K == 0);
 static_assert(TILE_M % C0 == 0 && TILE_N % C0 == 0 && TILE_K % C0 == 0);

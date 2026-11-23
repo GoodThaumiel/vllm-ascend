@@ -10,6 +10,7 @@
 #include <array>
 
 #include "aclrtlaunch_qkv_matmul_310p_fp16.h"
+#include "aclrtlaunch_qkv_matmul_310p_fp32_accum.h"
 #include "geometry.h"
 
 namespace {
@@ -46,7 +47,7 @@ void check_nz(const at::Tensor& tensor, int64_t rows, const char* name) {
               name, " must own the complete NZ storage at offset zero");
 }
 
-uint32_t get_cube_cores() {
+uint32_t get_cube_cores(bool fp32_accum) {
   using platform_ascendc::CoreMemType;
   auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
   TORCH_CHECK(platform != nullptr, "could not query the Ascend platform");
@@ -58,15 +59,15 @@ uint32_t get_cube_cores() {
   require(CoreMemType::L1, A_SLICE_BYTES + W_PANEL_BYTES, "L1");
   require(CoreMemType::L0_A, A_SLICE_BYTES, "L0A");
   require(CoreMemType::L0_B, W_SLICE_BYTES, "L0B");
-  require(CoreMemType::L0_C, C_TILE_BYTES, "L0C");
-  require(CoreMemType::UB, C_TILE_BYTES, "UB");
+  require(CoreMemType::L0_C, fp32_accum ? C_TILE_FP32_BYTES : C_TILE_BYTES, "L0C");
+  require(CoreMemType::UB, fp32_accum ? C_TILE_FP32_BYTES + C_TILE_BYTES : C_TILE_BYTES, "UB");
   const auto cores = platform->GetCoreNumAic();
   TORCH_CHECK(cores > 0, "could not query the Cube core count");
   return cores;
 }
 
 void run(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& out,
-         int64_t cores) {
+         int64_t cores, bool fp32_accum) {
   TORCH_CHECK(x.device().type() == c10::DeviceType::PrivateUse1,
               "QKV matmul requires Ascend tensors");
   for (const auto& tensor : {x, weight, out}) {
@@ -87,20 +88,27 @@ void run(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& out,
 
   const c10_npu::OptionalNPUGuard guard(x.device());
   // This experiment is built for one SoC. Cache its per-core capacities.
-  static const uint32_t cube_cores = get_cube_cores();
+  static const uint32_t cube_cores_fp16 = get_cube_cores(false);
+  uint32_t cube_cores = cube_cores_fp16;
+  if (fp32_accum) {
+    static const uint32_t cube_cores_fp32 = get_cube_cores(true);
+    cube_cores = cube_cores_fp32;
+  }
   TORCH_CHECK(cores >= 0 && cores <= cube_cores,
               "cores must be 0 (auto) or in [1,", cube_cores, "]");
   const auto blocks = std::min(cores == 0 ? cube_cores : static_cast<uint32_t>(cores),
                               N_TILES);
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const auto status = aclrtlaunch_qkv_matmul_310p_fp16(
-      blocks, stream, x.data_ptr(), weight.data_ptr(), out.data_ptr(), static_cast<uint32_t>(rows));
+  const auto m = static_cast<uint32_t>(rows);
+  const auto status = fp32_accum
+      ? aclrtlaunch_qkv_matmul_310p_fp32_accum(blocks, stream, x.data_ptr(), weight.data_ptr(), out.data_ptr(), m)
+      : aclrtlaunch_qkv_matmul_310p_fp16(blocks, stream, x.data_ptr(), weight.data_ptr(), out.data_ptr(), m);
   TORCH_CHECK(status == ACL_SUCCESS, "QKV matmul launch failed: ", status);
 }
 }  // namespace
 
 TORCH_LIBRARY(qkv_matmul_310p, m) {
-  m.def("run_(Tensor x, Tensor weight, Tensor(a!) out, int cores=0) -> ()");
+  m.def("run_(Tensor x, Tensor weight, Tensor(a!) out, int cores=0, bool fp32_accum=False) -> ()");
 }
 TORCH_LIBRARY_IMPL(qkv_matmul_310p, PrivateUse1, m) {
   m.impl("run_", &run);

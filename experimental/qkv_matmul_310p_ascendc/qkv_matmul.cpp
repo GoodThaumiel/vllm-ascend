@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kernel_operator.h"
 
+#include <type_traits>
+
 #include "geometry.h"
 
 namespace {
 using namespace AscendC;
 using namespace qkv310p;
 
+template <typename Accumulator>
 class QkvMatmul {
+    static constexpr bool FP32_ACCUM = std::is_same_v<Accumulator, float>;
+    static constexpr uint32_t ACC_BYTES = FP32_ACCUM ? C_TILE_FP32_BYTES : C_TILE_BYTES;
+
 public:
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR out, uint32_t rows)
     {
@@ -20,8 +26,11 @@ public:
         pipe_.InitBuffer(b1_, 1, W_PANEL_BYTES);
         pipe_.InitBuffer(a2_, 1, A_SLICE_BYTES);
         pipe_.InitBuffer(b2_, 1, W_SLICE_BYTES);
-        pipe_.InitBuffer(c1_, 1, C_TILE_BYTES);
-        pipe_.InitBuffer(c2_, 1, C_TILE_BYTES);
+        pipe_.InitBuffer(c1_, 1, ACC_BYTES);
+        pipe_.InitBuffer(c2_, 1, ACC_BYTES);
+        if constexpr (FP32_ACCUM) {
+            pipe_.InitBuffer(castOut_, 1, C_TILE_BYTES);
+        }
     }
 
     __aicore__ inline void Run()
@@ -55,7 +64,7 @@ private:
     __aicore__ inline void ComputeTile(LocalTensor<half> panel, uint32_t row, uint32_t col,
                                        uint16_t validRows, uint16_t mBlocks)
     {
-        auto acc = c1_.AllocTensor<half>();
+        auto acc = c1_.AllocTensor<Accumulator>();
         MmadParams mma{};
         mma.m = mBlocks * C0;
         mma.n = TILE_N;
@@ -102,16 +111,42 @@ private:
     __aicore__ inline void StoreTile(uint32_t row, uint32_t col, uint16_t validRows,
                                     uint16_t mBlocks)
     {
-        auto acc = c1_.DeQue<half>();
-        auto ub = c2_.AllocTensor<half>();
+        auto acc = c1_.DeQue<Accumulator>();
+        auto ub = c2_.AllocTensor<Accumulator>();
         DataCopyEnhancedParams drain{};
         drain.blockMode = BlockMode::BLOCK_MODE_MATRIX;
-        const uint16_t fractals = mBlocks * (TILE_N / C0);
-        DataCopy(ub, acc, DataCopyParams{1, fractals, 0, 0}, drain);
+        if constexpr (FP32_ACCUM) {
+            // FP32 transfer in NZ strips, as in M200 hand_mmad_310p.
+            DataCopy(ub, acc, DataCopyParams{TILE_N / C0, mBlocks, 0, 0}, drain);
+        } else {
+            const uint16_t fractals = mBlocks * (TILE_N / C0);
+            DataCopy(ub, acc, DataCopyParams{1, fractals, 0, 0}, drain);
+        }
         c2_.EnQue(ub);
         c1_.FreeTensor(acc);
 
-        ub = c2_.DeQue<half>();
+        ub = c2_.DeQue<Accumulator>();
+        if constexpr (FP32_ACCUM) {
+            auto converted = castOut_.AllocTensor<half>();
+            const uint32_t stripElems = mBlocks * FRACTAL;
+            PipeBarrier<PIPE_V>();
+            for (uint32_t n = 0; n < TILE_N / C0; ++n) {
+                const uint32_t offset = n * stripElems;
+                Cast(converted[offset], ub[offset], RoundMode::CAST_NONE, stripElems);
+            }
+            castOut_.EnQue(converted);
+            converted = castOut_.DeQue<half>();
+            StoreNd(converted, row, col, validRows, mBlocks);
+            castOut_.FreeTensor(converted);
+        } else {
+            StoreNd(ub, row, col, validRows, mBlocks);
+        }
+        c2_.FreeTensor(ub);
+    }
+
+    __aicore__ inline void StoreNd(LocalTensor<half> ub, uint32_t row, uint32_t col,
+                                  uint16_t validRows, uint16_t mBlocks)
+    {
         // Each NZ column strip has a contiguous 32B burst for each matrix row.
         // Write just the logical rows, even if the Cube used a padded M tail.
         const uint64_t dst = static_cast<uint64_t>(row) * N + col;
@@ -120,7 +155,6 @@ private:
             DataCopy(out_[dst + n * C0], ub[n * stripStride],
                      DataCopyParams{validRows, 1, 0, N_BLOCKS - 1});
         }
-        c2_.FreeTensor(ub);
     }
 
     TPipe pipe_;
@@ -130,6 +164,7 @@ private:
     TQue<TPosition::B2, 1> b2_;
     TQue<TPosition::CO1, 1> c1_;
     TQue<TPosition::CO2, 1> c2_;
+    TQue<TPosition::VECOUT, 1> castOut_;
     GlobalTensor<half> x_, weight_, out_;
     uint32_t rows_, rowBlocks_;
 };
@@ -139,7 +174,16 @@ extern "C" __global__ __aicore__ void qkv_matmul_310p_fp16(
     GM_ADDR x, GM_ADDR weight, GM_ADDR out, uint32_t rows)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC);
-    QkvMatmul op;
+    QkvMatmul<half> op;
+    op.Init(x, weight, out, rows);
+    op.Run();
+}
+
+extern "C" __global__ __aicore__ void qkv_matmul_310p_fp32_accum(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR out, uint32_t rows)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC);
+    QkvMatmul<float> op;
     op.Init(x, weight, out, rows);
     op.Run();
 }
