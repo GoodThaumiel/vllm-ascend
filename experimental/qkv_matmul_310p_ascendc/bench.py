@@ -39,7 +39,6 @@ def layout_cases(device: torch.device, cores: int) -> list[dict]:
     packed_weight = pack_nz_cpu(weight).to(device)
     cases = []
     for rows in TAIL_ROWS:
-        print(f"check/layout M={rows}", flush=True)
         r = torch.arange(rows)
         selected_k = (r * 73 + 127) % K
         next_k = (selected_k + 128) % K
@@ -55,12 +54,23 @@ def layout_cases(device: torch.device, cores: int) -> list[dict]:
             ("fractal_nz", torch_npu.npu_format_cast(x.to(device), NZ), weight_nz),
             ("packed", pack_nz_cpu(x).to(device), packed_weight),
         ):
+            x_format = int(torch_npu.get_npu_format(x_nz))
+            w_format = int(torch_npu.get_npu_format(w_nz))
+            print(f"check/layout M={rows} input={name} formats={x_format}/{w_format}", flush=True)
             out.fill_(float("nan"))
             torch.ops.qkv_matmul_310p.run_(x_nz, w_nz, out, cores)
             actual = backing.cpu()
             torch.testing.assert_close(actual[1:-1], expected, atol=0, rtol=0)
             torch.testing.assert_close(actual[[0, -1]], torch.full((2, N), -17, dtype=x.dtype), atol=0, rtol=0)
-            cases.append({"rows": rows, "input": name, "exact": True, "guard_unchanged": True})
+            cases.append(
+                {
+                    "rows": rows,
+                    "input": name,
+                    "input_formats": [x_format, w_format],
+                    "exact": True,
+                    "guard_unchanged": True,
+                }
+            )
     return cases
 
 

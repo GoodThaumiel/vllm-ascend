@@ -8,7 +8,7 @@
 | W | `[6144, 2048]` | NZ `[128, 384, 16, 16]` |
 | Y | `[M, 6144]` | ND `[M, 6144]` |
 
-Torch binding 可接收带原生 FRACTAL_NZ descriptor 的矩阵，也可接收按上述字节顺序打包的连续 4D tensor。动态尾块按 16 行向上对齐读入和计算，只写回逻辑有效行。
+Torch binding 可接收带原生 FRACTAL_NZ descriptor 的矩阵，也可接收按上述字节顺序打包的连续 4D tensor。后者接受 torch_npu 为普通 4D 张量使用的 ND 或 NCHW 基础格式标签。动态尾块按 16 行向上对齐读入和计算，只写回逻辑有效行。
 
 每个 Cube 核负责一组不相交的 128 列，权重 panel 在 L1 中复用。每个输出 tile 以 256×128×128 的 M/N/K 分块运行 16 次低阶 `Mmad`，首个 K 块清空 L0C，其余块累加。L0C 和 UB 都是 FP16，最后用 CO1→CO2 enhanced DataCopy 和按列条带的 DataCopy 写出 ND。FP16 累加需要独立验收精度。该写回方式参考 [Ascend C 耦合架构示例](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_10_00007.html)。
 
@@ -27,7 +27,7 @@ readelf -d "$OP/build-c921/libqkv_matmul_310p_torch.so" | grep -E 'NEEDED|RUNPAT
 ldd "$OP/build-c921/libqkv_matmul_310p_torch.so" | grep qkv_matmul_310p_kernel
 ```
 
-先验证布局和精度。首段每行设置两个分属不同 K 块的非零元素，用精确输出核对 K 累加、NZ 方向、尾块和输出前后的哨兵行，分别覆盖 native NZ descriptor 和手工打包输入。第二段用相同随机输入比较 CPU FP32 reference、原生输出和自研输出。
+先验证布局和精度。首段每行设置两个分属不同 K 块的非零元素，用精确输出核对 K 累加、NZ 方向、尾块和输出前后的哨兵行，分别覆盖 native NZ descriptor 和手工打包输入，同时记录两种输入的格式标签。第二段用相同随机输入比较 CPU FP32 reference、原生输出和自研输出。
 
 ```bash
 python3 -m experimental.qkv_matmul_310p_ascendc.bench \

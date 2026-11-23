@@ -28,17 +28,19 @@ void check_nz(const at::Tensor& tensor, int64_t rows, const char* name) {
   const auto& desc = descriptor(tensor);
   const std::array<int64_t, 4> storage_shape{K / C0, row_blocks, C0, C0};
   const at::IntArrayRef expected_storage(storage_shape);
-  if (tensor.dim() == 2) {
-    TORCH_CHECK(tensor.sizes() == at::IntArrayRef({rows, K}) &&
-                    at::IntArrayRef(desc.base_sizes_) == tensor.sizes() &&
-                    desc.npu_format_ == ACL_FORMAT_FRACTAL_NZ &&
-                    at::IntArrayRef(desc.storage_sizes_) == expected_storage,
-                name, " must be a FRACTAL_NZ matrix with physical shape ", expected_storage,
-                ", got storage ", at::IntArrayRef(desc.storage_sizes_));
-  } else {
-    TORCH_CHECK(desc.npu_format_ == ACL_FORMAT_ND && tensor.sizes() == expected_storage,
-                name, " must be a FRACTAL_NZ matrix or packed ND storage ", expected_storage);
-  }
+  const auto storage_sizes = at::IntArrayRef(desc.storage_sizes_);
+  const bool native_nz = desc.npu_format_ == ACL_FORMAT_FRACTAL_NZ &&
+                         tensor.sizes() == at::IntArrayRef({rows, K}) &&
+                         at::IntArrayRef(desc.base_sizes_) == tensor.sizes() &&
+                         storage_sizes == expected_storage;
+  // TorchNPU can tag a contiguous 4D upload as NCHW. Its bytes are in the
+  // same row-major order as ND, and already packed as NZ by the caller.
+  const bool packed_nz = (desc.npu_format_ == ACL_FORMAT_ND || desc.npu_format_ == ACL_FORMAT_NCHW) &&
+                         tensor.sizes() == expected_storage;
+  TORCH_CHECK(native_nz || packed_nz,
+              name, " must be FRACTAL_NZ or contiguous packed storage ", expected_storage,
+              ", got format=", static_cast<int>(desc.npu_format_), ", shape=", tensor.sizes(),
+              ", storage=", storage_sizes);
   TORCH_CHECK(tensor.storage_offset() == 0 &&
                   tensor.storage().nbytes() >= static_cast<size_t>(physical_bytes),
               name, " must own the complete NZ storage at offset zero");
