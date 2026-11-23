@@ -132,12 +132,16 @@ def run_rows(args: argparse.Namespace, device: torch.device) -> list[dict]:
         x_cpu = torch.randn(rows, K, generator=input_generator, dtype=torch.float16)
         x = x_cpu.to(device)
         x_nz = torch_npu.npu_format_cast(x, NZ) if need_nz else x
+        native_x = x_nz if args.native_input_format == "nz" else x
         calls = {
-            "native": partial(F.linear, x_nz if args.native_input_format == "nz" else x, weight_nz),
+            "native": partial(F.linear, native_x, weight_nz),
             "custom": partial(custom_linear, x_nz, weight_nz, args.cores, fp32_accum, pack=False),
             "custom-from-nd": partial(custom_linear, x, weight_nz, args.cores, fp32_accum, pack=True),
         }
         case = {"rows": rows, "output_formats": {}}
+        if "native" in implementations:
+            case["native_input_formats"] = [int(torch_npu.get_npu_format(t)) for t in (native_x, weight_nz)]
+            print(f"  native M={rows} input_formats={case['native_input_formats']}", flush=True)
         outputs = {}
         for name in implementations:
             print(f"{args.stage}/{name} M={rows}", flush=True)
@@ -174,6 +178,12 @@ def main() -> None:
     parser.add_argument("--impl", choices=("both", "native", "custom", "custom-from-nd"), default="both")
     parser.add_argument("--native-input-format", choices=("nd", "nz"), default="nd")
     parser.add_argument(
+        "--jit-compile",
+        choices=("off", "on", "inherit"),
+        default="off",
+        help="TorchNPU compile mode (off matches the 310P vLLM worker)",
+    )
+    parser.add_argument(
         "--accum-dtype",
         choices=("fp32", "fp16"),
         default="fp32",
@@ -196,6 +206,10 @@ def main() -> None:
     device = torch.device(f"npu:{args.device}")
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = True
+    if args.jit_compile != "inherit":
+        torch_npu.npu.set_compile_mode(jit_compile=args.jit_compile == "on")
+    jit_compile = not torch_npu.npu.is_jit_compile_false()
+    print(f"TorchNPU jit_compile={jit_compile} (requested {args.jit_compile})", flush=True)
     library = None
     if args.impl != "native":
         library = str(args.library.resolve(strict=True))
@@ -210,6 +224,8 @@ def main() -> None:
         "stage": args.stage,
         "implementation": args.impl,
         "native_input_format": args.native_input_format,
+        "jit_compile": jit_compile,
+        "jit_compile_requested": args.jit_compile,
         "custom_accum_dtype": args.accum_dtype if args.impl != "native" else None,
         "cores": args.cores,
         "seed": args.seed,

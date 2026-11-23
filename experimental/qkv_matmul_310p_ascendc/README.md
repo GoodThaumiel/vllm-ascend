@@ -38,6 +38,8 @@ python3 -m experimental.qkv_matmul_310p_ascendc.bench \
 
 310P3 上用 `--no-timing` 跳过 NPU Event 计时，避免 `aclrtEventElapsedTime` 返回 `107006`。每组先提交 1 次输出检查和 10 次预热，再提交 100 次正式调用。JSON 记录配置、格式及调用次数，设备时延从 msprof 的逐次记录计算。
 
+脚本默认用 `--jit-compile off` 对齐 310P 服务 worker 的 `set_compile_mode(jit_compile=False)`。若需复现旧脚本的分派，用 `--jit-compile inherit` 保留容器默认值。定位分派时在同一容器分别用两个新进程测 `--impl native --rows 4001`，保持其他参数一致，并核对输入格式、`OP Type` 和前后 `TransData`。默认的 ND 激活与 NZ 权重适合验证 `MatMulWeightNz`，改成 NZ 激活可能走另一条分派。
+
 ```bash
 ROWS=4001
 ACCUM=fp32
