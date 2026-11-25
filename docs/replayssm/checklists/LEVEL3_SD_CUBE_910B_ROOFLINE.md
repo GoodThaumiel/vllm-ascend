@@ -1,5 +1,7 @@
 # 910B4 整窗 Cube verify、短 K compact 与 Native RGDR 对照
 
+V20 与 compact v1 的 BS1–128 回归覆盖 27B TP4 和 9B TP1，执行入口见 [Vector 基线清单](LEVEL3_SD_VECTOR_BATCH_PROBE.md)。
+
 ## 迁移判断
 
 核对的远端分支名为 `replayssm-310`，tip 为 `d46aa506`。310P3 verify 将一个 key head 的窗口 K/Q 放入 128×16 面板，每个 value head 用一次 Mmad 投影完整 checkpoint，L0B 面板在两个 value head 间复用，FP32 结果交给 Vector 递推。compact variant 2 将 K/D 按环尾拆成至多两段，两个 value head 共读 K，在 FP32 UB 里用 Broadcast/Mul/Add 折叠。若现场还有独立 Cube compact 二进制，回传其 commit/symbol 可补一组直接对照。[310 verify 源码](https://github.com/GoodThaumiel/vllm-ascend/blob/d46aa506/experimental/replayssm_sd_310p_ascendc/kernels/verify_cube.cpp) · [310 compact 源码](https://github.com/GoodThaumiel/vllm-ascend/blob/d46aa506/experimental/replayssm_sd_310p_ascendc/kernels/compact_batch.cpp) · [310 交接记录](https://github.com/GoodThaumiel/vllm-ascend/blob/d46aa506/experimental/replayssm_sd_310p_ascendc/ascend310p-replayssm-sd-handoff.md)

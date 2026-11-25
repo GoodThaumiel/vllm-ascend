@@ -53,9 +53,9 @@ def aligned_bytes(size: int) -> int:
     return math.ceil(size / PAGE_ALIGNMENT_BYTES) * PAGE_ALIGNMENT_BYTES
 
 
-def native_state_page(device: torch.device, tp: int, batch: int, length: int):
+def native_state_page(device: torch.device, tp: int, batch: int, length: int, *, geometry: str = "27b"):
     """Use unique token slots and a server-like per-slot state stride."""
-    key_heads, value_heads = 16 // tp, 48 // tp
+    key_heads, value_heads = 16 // tp, (48 if geometry == "27b" else 32) // tp
     conv_bytes = 3 * (value_heads + 2 * key_heads) * HEAD_DIM * 2
     state_bytes = value_heads * HEAD_DIM * HEAD_DIM * 2
     page_bytes = aligned_bytes(conv_bytes + state_bytes)

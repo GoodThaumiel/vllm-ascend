@@ -2,6 +2,8 @@
 """One same-input graph benchmark. Use --path to isolate msprof captures."""
 
 import argparse
+import hashlib
+import importlib
 import json
 import statistics
 import subprocess
@@ -26,31 +28,32 @@ from scripts.replayssm.profile_sd_operator_compare import (  # noqa: E402
     reconstruct_native_start,
 )
 
-PATHS = (
-    "native",
-    "v20",
-    "compact_v1",
+VECTOR_PATHS = ("native", "v20", "compact_v1", "vector_pair")
+CUBE_PATHS = (
     "cube_verify",
     "cube_compact",
     "projection",
     "grouped_projection",
     "fold_gemm",
-    "vector_pair",
     "cube_pair",
 )
+PATHS = (*VECTOR_PATHS, *CUBE_PATHS)
 DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 def batches(text):
     if text == "all":
-        return range(1, 129)
-    values = tuple(int(x) for x in text.split(","))
+        return tuple(range(1, 129))
+    try:
+        values = tuple(int(x) for x in text.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated batches in 1..128, or all") from exc
     if not values or min(values) < 1 or max(values) > 128 or len(set(values)) != len(values):
         raise argparse.ArgumentTypeError("expected unique batches in 1..128, or all")
     return values
 
 
-def measure(call, reset, iterations):
+def measure(call, reset, iterations, label):
     for _ in range(2):
         reset()
         call()
@@ -59,15 +62,19 @@ def measure(call, reset, iterations):
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         call()
+    torch.npu.synchronize()
     us = []
-    for _ in range(iterations):
-        reset()
-        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        us.append(start.elapsed_time(end) * 1000)
+    print(f"MEASURE_BEGIN {label} replays={iterations}", flush=True)
+    with torch.profiler.record_function(f"REPLAYSSM_SD/{label}"):
+        for _ in range(iterations):
+            reset()
+            start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            us.append(start.elapsed_time(end) * 1000)
+    print(f"MEASURE_END {label}", flush=True)
     return {"graph_us": us, "p50_us": statistics.median(us), "p90_us": sorted(us)[(9 * len(us) - 1) // 10]}
 
 
@@ -77,7 +84,8 @@ def trial(args, b, dev):
 
     p, t, base = args.pos, args.length, args.base
     active = {"none": 0, "mixed": max(1, b // 8), "full": b}[args.flush]
-    cpu = make_case(tp=4, batch=b, position=p, length=t, base=base, tile_v=128, seed=42)
+    cpu = make_case(geometry=args.geometry, tp=args.tp, batch=b, position=p, length=t, base=base, tile_v=128, seed=42)
+    key_heads, value_heads = cpu["k"].shape[2], cpu["v"].shape[2]
     cpu["beta"] = cpu["beta"].bfloat16().float()
     c = {n: v.to(dev) for n, v in cpu.items()}
     c["checkpoint"] = torch.cat((torch.zeros_like(c["checkpoint"][:1]).expand(4, -1, -1, -1), c["checkpoint"]))
@@ -85,8 +93,8 @@ def trial(args, b, dev):
     ring = c["slots"]
     slots = ring + 4
     flush = (torch.arange(b, device=dev) < active).int()
-    status = torch.empty(b * 12 * 4, dtype=torch.int32, device=dev)
-    state, _ = native_state_page(dev, 4, b, t)
+    status = torch.full((b * value_heads * 4,), -1, dtype=torch.int32, device=dev)
+    state, state_page_bytes = native_state_page(dev, args.tp, b, t, geometry=args.geometry)
     start_state = reconstruct_native_start(cpu, p).to(dev)
     first = state[1::t]
     indices = torch.arange(1, b * t + 1, device=dev, dtype=torch.int32)
@@ -142,50 +150,60 @@ def trial(args, b, dev):
         )
 
     def reset_state():
-        c["checkpoint"].copy_(initial)
+        # Only the active prefix is mutable. Keep the same inputs for every replay.
+        if p and active:
+            c["checkpoint"][5 : 5 + active].copy_(initial[5 : 5 + active])
 
-    # Candidate positions and committed entries are disjoint. Keep goldens on CPU outside timing.
+    # Native materializes the committed ring in its initial state. Replay reads
+    # the same history directly and writes its candidates into disjoint slots.
     vector()
-    assert not c["status"].cpu().any()
-    golden = {n: c[n].cpu() for n in ("out", "d_cache", "k_cache", "g_cache")}
+    if c["status"].cpu().any():
+        raise RuntimeError("V20 returned nonzero status")
+    expected_out = c["out"][:, :t].float().cpu()
     first.copy_(start_state)
-    y_native = native().view(b, t, 12, 128)
+    y_native = native().view_as(expected_out).float().cpu()
+    torch.testing.assert_close(y_native, expected_out, atol=0.01, rtol=0.03)
+    errors = {"native_vs_v20_out": (y_native - expected_out).abs().max().item()}
     fold()
-    assert not status.cpu().any()
+    if status.cpu().any():
+        raise RuntimeError("Compact V1 returned nonzero status")
     checkpoint = c["checkpoint"].cpu()
+    if p and active:
+        torch.testing.assert_close(checkpoint[5 : 5 + active], start_state[:active].cpu(), atol=0.001, rtol=0.015)
+    unchanged = 5 + (active if p else 0)
+    torch.testing.assert_close(checkpoint[unchanged:], cpu["checkpoint"][unchanged - 4 :], atol=0, rtol=0)
     reset_state()
-    # Poison only destinations, so a missing candidate write cannot inherit the vector result.
-    c["out"].fill_(float("nan"))
-    for s in range(t):
-        for n in ("d_cache", "k_cache", "g_cache"):
-            c[n][1:, :, (base + p + s) % 32].fill_(float("nan"))
-    verify(c, t, p, base)
-    errors = {}
-    for n, ref in golden.items():
-        actual = c[n].cpu()
-        torch.testing.assert_close(actual.float(), ref.float(), atol=0.01, rtol=0.03, equal_nan=True)
-        errors[n] = (actual.float() - ref.float()).nan_to_num().abs().max().item()
-    torch.testing.assert_close(y_native.float().cpu(), golden["out"][:, :t].float(), atol=0.01, rtol=0.03)
-    compact(c, active, p, base, status)
-    torch.testing.assert_close(c["checkpoint"].cpu().float(), checkpoint.float(), atol=0.01, rtol=0.03)
-    errors["checkpoint"] = (c["checkpoint"].cpu().float() - checkpoint.float()).abs().max().item()
-    reset_state()
-    rhs = panel(c, t)
-    shared_rhs = panel(c, t, grouped=True)
-    calls = dict(
-        native=native,
-        v20=vector,
-        compact_v1=fold,
-        cube_verify=lambda: verify(c, t, p, base),
-        cube_compact=lambda: compact(c, active, p, base, status),
-        grouped_projection=lambda: checkpoint_projection(c["checkpoint"][5:], shared_rhs),
-        projection=lambda: checkpoint_projection(c["checkpoint"][5:], rhs),
-        vector_pair=lambda: (vector(), fold()),
-        cube_pair=lambda: (verify(c, t, p, base), compact(c, active, p, base, status)),
-    )
-    if active and p:
-        _, dl, kh = compact_inputs(c, active, p, base)
-        calls["fold_gemm"] = lambda: torch.bmm(dl, kh)
+
+    calls = dict(native=native, v20=vector, compact_v1=fold, vector_pair=lambda: (vector(), fold()))
+    if any(path in CUBE_PATHS for path in args.path):
+        # Poison destinations so a missing Cube candidate write cannot inherit V20 results.
+        golden = {n: c[n].cpu() for n in ("out", "d_cache", "k_cache", "g_cache")}
+        c["out"].fill_(float("nan"))
+        for s in range(t):
+            for n in ("d_cache", "k_cache", "g_cache"):
+                c[n][1:, :, (base + p + s) % 32].fill_(float("nan"))
+        verify(c, t, p, base)
+        for n, ref in golden.items():
+            actual = c[n].cpu().float()
+            torch.testing.assert_close(actual, ref.float(), atol=0.01, rtol=0.03, equal_nan=True)
+            errors[n] = (actual - ref.float()).nan_to_num().abs().max().item()
+        compact(c, active, p, base, status)
+        actual = c["checkpoint"].cpu().float()
+        torch.testing.assert_close(actual, checkpoint.float(), atol=0.01, rtol=0.03)
+        errors["checkpoint"] = (actual - checkpoint.float()).abs().max().item()
+        reset_state()
+        rhs = panel(c, t)
+        shared_rhs = panel(c, t, grouped=True)
+        calls.update(
+            cube_verify=lambda: verify(c, t, p, base),
+            cube_compact=lambda: compact(c, active, p, base, status),
+            grouped_projection=lambda: checkpoint_projection(c["checkpoint"][5:], shared_rhs),
+            projection=lambda: checkpoint_projection(c["checkpoint"][5:], rhs),
+            cube_pair=lambda: (verify(c, t, p, base), compact(c, active, p, base, status)),
+        )
+        if active and p:
+            _, dl, kh = compact_inputs(c, active, p, base)
+            calls["fold_gemm"] = lambda: torch.bmm(dl, kh)
     rows = []
     for path in args.path:
         if path not in calls:
@@ -198,7 +216,7 @@ def trial(args, b, dev):
             else lambda: None
         )
         reset_state()
-        print(f"MEASURE batch={b} path={path}", flush=True)
+        label = f"{args.geometry}_tp{args.tp}_b{b}_t{t}_pos{p}_base{base}_{args.flush}/{path}"
         rows.append(
             dict(
                 batch=b,
@@ -206,28 +224,46 @@ def trial(args, b, dev):
                 length=t,
                 base=base,
                 active_flush=active,
+                key_heads=key_heads,
+                value_heads=value_heads,
+                native_state_page_bytes=state_page_bytes,
                 path=path,
                 errors=errors,
-                **measure(calls[path], reset, args.iterations),
+                **measure(calls[path], reset, args.iterations, label),
             )
         )
     return rows
 
 
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--batches", type=batches, default=DEFAULT_BATCHES)
+    ap.add_argument("--suite", choices=("all", "vector"), default="all")
+    ap.add_argument("--geometry", choices=("27b", "9b"), default="27b")
+    ap.add_argument("--batches", type=batches)
     ap.add_argument("--length", type=int, choices=(1, 4), default=4)
     ap.add_argument("--pos", type=int, choices=range(17), default=15)
     ap.add_argument("--base", type=int, choices=range(32), default=31)
     ap.add_argument("--flush", choices=("none", "mixed", "full"), default="full")
-    ap.add_argument("--path", nargs="+", choices=PATHS, default=PATHS)
+    ap.add_argument("--path", nargs="+", choices=PATHS)
     ap.add_argument("--iterations", type=int, default=100)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--output", type=Path, required=True)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.iterations < 1:
         ap.error("iterations must be positive")
+    vector_only = args.suite == "vector" or args.geometry == "9b"
+    args.batches = args.batches or (batches("all") if vector_only else DEFAULT_BATCHES)
+    args.path = args.path or (VECTOR_PATHS if vector_only else PATHS)
+    if vector_only and any(path in CUBE_PATHS for path in args.path):
+        ap.error("Vector suite and 9B TP1 require Vector/native paths")
+    if len(set(args.path)) != len(args.path):
+        ap.error("paths must be unique")
+    args.tp = 4 if args.geometry == "27b" else 1
+    return args
+
+
+def main():
+    args = parse_args()
     import torch_npu  # noqa: F401
 
     from vllm_ascend.utils import enable_custom_op
@@ -235,19 +271,25 @@ def main():
     torch.npu.set_device(args.device)
     if not enable_custom_op():
         raise RuntimeError("framework v20 + compact v1 extension required")
+    library = Path(importlib.import_module("vllm_ascend.vllm_ascend_C").__file__).resolve()
     report = dict(
+        status="RUNNING",
         commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         packages=package_versions(),
         config=vars(args),
         soc=torch.npu.get_device_name(args.device),
+        library=str(library),
+        library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
         rows=[],
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for b in args.batches:
         try:
             report["rows"].extend(trial(args, b, torch.device(f"npu:{args.device}")))
+            if b == args.batches[-1]:
+                report["status"] = "PASSED"
         except Exception as exc:
-            report.update(failed_batch=b, error=repr(exc))
+            report.update(status="FAILED", failed_batch=b, error=repr(exc))
             raise
         finally:
             args.output.write_text(json.dumps(report, indent=2, default=str) + "\n")

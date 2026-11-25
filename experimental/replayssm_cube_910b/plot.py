@@ -16,7 +16,9 @@ def contract(row):
     Full-window demo explicitly computes 16 columns (including padding).
     """
     b, t, p, f, path = (row[k] for k in ("batch", "length", "pos", "active_flush", "path"))
-    h, k, d, n = 12, 4, 128, 16
+    # Older reports predate the 9B option and contain only 27B TP4 rows.
+    h, k = row.get("value_heads", 12), row.get("key_heads", 4)
+    d, n = 128, 16
     # Native: loaded initial state and t candidate state writes. Core operations:
     # two projections, decay and one outer-product add per candidate.
     native = (b * h * t * 7 * d * d, 2 * b * h * d * d * (1 + t) + b * t * (4 * k * d + 4 * h * d + 6 * h))
@@ -66,7 +68,7 @@ def main():
     if not all(math.isfinite(x) and x > 0 for x in (args.bandwidth_gbs, args.cube_tflops, args.vector_tflops)):
         ap.error("all ceilings must be positive and finite")
     report = json.loads(args.report.read_text())
-    if "error" in report:
+    if report.get("status", "PASSED") != "PASSED" or "error" in report or not report["rows"]:
         ap.error("incomplete report")
     counters = {}
     if args.counters:
@@ -94,13 +96,20 @@ def main():
         by[path].append((b, us, ai, rate))
         points.append(dict(batch=b, path=path, p50_us=us, flops=flops, bytes=size, flop_per_byte=ai, tflops=rate))
     fig, (lat, roof) = plt.subplots(1, 2, figsize=(14, 6), layout="constrained")
+    path_names = {
+        "native": "Native RGDR",
+        "v20": "Verify V20",
+        "compact_v1": "Compact v1",
+        "vector_pair": "V20 + compact v1",
+    }
     for name, rows in by.items():
         rows.sort()
         b, us, ai, rate = zip(*rows)
-        (line,) = lat.plot(b, us, ".-", label=name)
+        label = path_names.get(name, name)
+        (line,) = lat.plot(b, us, ".-", label=label)
         positive = [r for r in rows if r[2] > 0 and r[3] > 0]
         if positive:
-            roof.plot([r[2] for r in positive], [r[3] for r in positive], ".", color=line.get_color(), label=name)
+            roof.plot([r[2] for r in positive], [r[3] for r in positive], ".", color=line.get_color(), label=label)
     xs = [pt["flop_per_byte"] for pt in points if pt["flop_per_byte"] > 0]
     if xs:
         lo = math.log10(min(xs) / 2)
@@ -119,9 +128,10 @@ def main():
     for ax in (lat, roof):
         ax.grid(True, which="both", alpha=0.2)
         ax.legend(fontsize=8)
+    config = report["config"]
     fig.suptitle(
-        f"910B4 TP4 geometry | T={report['config']['length']} pos={report['config']['pos']} "
-        f"flush={report['config']['flush']} | ceilings: {args.roof_source}"
+        f"910B4 Qwen3.5-{config.get('geometry', '27b').upper()} TP{config.get('tp', 4)} | "
+        f"T={config['length']} pos={config['pos']} flush={config['flush']} | ceilings: {args.roof_source}"
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out)
