@@ -88,11 +88,31 @@ def last_projections(case, blocks):
     first = torch.arange(blocks)
     tasks = first + ((batch * hk - 1 - first) // blocks) * blocks
     rows, keys = tasks // hk, tasks % hk
-    checkpoint = case["checkpoint"][rows + 1, keys * group + group - 1].float()
-    rhs = torch.zeros((blocks, 128, 16), dtype=torch.float32)
+    return reference_projections(case, rows, keys * group + group - 1)
+
+
+def reference_projections(case, rows, heads):
+    """Build FP32 C tiles for the requested (row, V head) pairs."""
+    group = case["v"].shape[2] // case["k"].shape[2]
+    keys = heads // group
+    checkpoint = case["checkpoint"][rows + 1, heads].float()
+    rhs = torch.zeros((rows.numel(), 128, 16), dtype=torch.float32)
     rhs[:, :, :4] = case["k"][rows, :, keys].transpose(1, 2)
     rhs[:, :, 4:8] = case["q"][rows, :, keys].transpose(1, 2)
     return torch.bmm(checkpoint, rhs)
+
+
+def assert_stage(actual, expected, stage, *, atol, rtol, dump=None, equal_nan=False):
+    """Preserve the failing tensor and identify the stage in the traceback."""
+    try:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, equal_nan=equal_nan)
+    except AssertionError as exc:
+        if dump is not None:
+            dump.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                dict(stage=stage, actual=actual, expected=expected, atol=atol, rtol=rtol, equal_nan=equal_nan), dump
+            )
+        raise AssertionError(f"{stage} ({tuple(actual.shape)}): {exc}") from None
 
 
 def trial(args, b, dev):
@@ -205,13 +225,13 @@ def trial(args, b, dev):
                 for n in ("d_cache", "k_cache", "g_cache"):
                     c[n][1:, :, (base + p + s) % 32].fill_(float("nan"))
 
-        def check_outputs(label, error_prefix=""):
+        def check_outputs(label, error_prefix="", dump=None):
             if c["status"].cpu().any():
                 raise RuntimeError(f"{label} returned nonzero status")
             for n, ref in golden.items():
                 actual = c[n].cpu().float()
                 expected = ref.float()
-                torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.03, equal_nan=True)
+                assert_stage(actual, expected, f"{label}/{n}", atol=0.01, rtol=0.03, equal_nan=True, dump=dump)
                 errors[f"{error_prefix}{n}"] = (actual - expected).nan_to_num().abs().max().item()
 
     if compare_demo:
@@ -239,8 +259,17 @@ def trial(args, b, dev):
     if compare_mixed:
         blocks = min(b * key_heads, args.mixed_cores)
         zeros = torch.zeros((16, 128), dtype=torch.bfloat16, device=dev)
-        scratch = torch.full((blocks, 128, 16), float("nan"), dtype=torch.float32, device=dev)
-        expected_projection = last_projections(cpu, blocks)
+        if args.mixed_workspace == "per-head":
+            heads = torch.arange(value_heads).repeat(b)
+            row_ids = torch.arange(b).repeat_interleave(value_heads)
+            expected_projection = reference_projections(cpu, row_ids, heads)
+        else:
+            expected_projection = last_projections(cpu, blocks)
+        scratch = torch.full(expected_projection.shape, float("nan"), dtype=torch.float32, device=dev)
+        dump = args.output.with_suffix(".mismatch.pt") if args.mixed_dump else None
+
+        def check_projection(label):
+            assert_stage(scratch.cpu(), expected_projection, f"{label}/projection", atol=2e-5, rtol=1e-3, dump=dump)
 
         def verify_mixed():
             torch.ops.replayssm_mix_910b.verify_(
@@ -257,10 +286,13 @@ def trial(args, b, dev):
                 args.mixed_cores,
             )
 
-        poison()
-        verify_mixed()
-        torch.testing.assert_close(scratch.cpu(), expected_projection, atol=2e-5, rtol=1e-3)
-        check_outputs("mixed eager", "mixed_eager_")
+        for iteration in range(args.mixed_check_repeats):
+            poison()
+            scratch.fill_(float("nan"))
+            verify_mixed()
+            label = f"mixed eager run {iteration + 1}"
+            check_projection(label)
+            check_outputs(label, "mixed_eager_", dump=dump)
         torch.testing.assert_close(c["checkpoint"], initial, atol=0, rtol=0)
         calls.update(mixed_verify=verify_mixed, mixed_pair=lambda: (verify_mixed(), fold()))
     rows = []
@@ -286,15 +318,20 @@ def trial(args, b, dev):
                 if path == "mixed_pair":
                     status.fill_(-1)
                 graph.replay()
-                torch.testing.assert_close(scratch.cpu(), expected_projection, atol=2e-5, rtol=1e-3)
-                check_outputs("mixed graph", "mixed_graph_")
+                check_projection("mixed graph")
+                check_outputs("mixed graph", "mixed_graph_", dump=dump)
                 expected_state = checkpoint if path == "mixed_pair" else initial.cpu()
                 torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
                 if path == "mixed_pair" and status.cpu().any():
                     raise RuntimeError("Captured compact returned nonzero status")
 
             timings = measure(calls[path], reset, args.iterations, label, check_graph=check_graph)
-            mix_metadata = dict(aic_blocks=blocks, aiv_blocks=2 * blocks, workspace_bytes=scratch.nbytes)
+            mix_metadata = dict(
+                aic_blocks=blocks,
+                aiv_blocks=2 * blocks,
+                workspace_bytes=scratch.nbytes,
+                workspace_layout=args.mixed_workspace,
+            )
         else:
             timings = measure(calls[path], reset, args.iterations, label)
         rows.append(
@@ -328,12 +365,15 @@ def parse_args(argv=None):
     ap.add_argument("--path", nargs="+", choices=(*PATHS, *MIXED_PATHS))
     ap.add_argument("--mixed-library", type=Path, help="Path to libreplayssm_sd_mix_torch.so")
     ap.add_argument("--mixed-cores", type=int, choices=range(1, 21), default=20)
+    ap.add_argument("--mixed-workspace", choices=("per-core", "per-head"), default="per-core")
+    ap.add_argument("--mixed-check-repeats", type=int, default=1, help="Untimed eager checks with identical inputs")
+    ap.add_argument("--mixed-dump", action="store_true", help="Save the first mismatch beside --output")
     ap.add_argument("--iterations", type=int, default=100)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args(argv)
-    if args.iterations < 1:
-        ap.error("iterations must be positive")
+    if args.iterations < 1 or args.mixed_check_repeats < 1:
+        ap.error("iterations and mixed check repeats must be positive")
     vector_only = args.suite == "vector" or (args.geometry == "9b" and args.suite == "all")
     if args.suite == "mixed":
         defaults = (*VECTOR_PATHS, *MIXED_PATHS)

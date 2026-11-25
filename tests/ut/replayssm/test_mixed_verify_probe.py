@@ -1,14 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
 from experimental.replayssm_cube_910b.plot import contract
-from experimental.replayssm_cube_910b.run import last_projections, parse_args
+from experimental.replayssm_cube_910b.run import assert_stage, last_projections, parse_args, reference_projections
 from experimental.replayssm_sd_ascendc.lab import make_case, recurrent_golden
 
 
 class TestMixedVerifyProbe(unittest.TestCase):
+    def test_per_head_diagnostic_keeps_early_projections(self):
+        case = make_case(geometry="9b", tp=1, batch=2)
+        heads = torch.arange(32).repeat(2)
+        rows = torch.arange(2).repeat_interleave(32)
+        all_projections = reference_projections(case, rows, heads)
+        torch.testing.assert_close(last_projections(case, 16), all_projections[33::2])
+        for index in (0, 18, 63):
+            row, head = divmod(index, 32)
+            rhs = torch.cat((case["k"][row, :, head // 2], case["q"][row, :, head // 2])).float()
+            torch.testing.assert_close(all_projections[index, :, :8], case["checkpoint"][row + 1, head].float() @ rhs.T)
+
+    def test_failure_names_tensor_and_preserves_values(self):
+        actual, expected = torch.tensor([0.0, 0.0227]), torch.zeros(2)
+        with TemporaryDirectory() as directory:
+            dump = Path(directory) / "failed.pt"
+            with self.assertRaisesRegex(AssertionError, "mixed eager/d_cache"):
+                assert_stage(actual, expected, "mixed eager/d_cache", atol=0.01, rtol=0.03, dump=dump)
+            result = torch.load(dump, weights_only=True)
+            self.assertEqual(result["stage"], "mixed eager/d_cache")
+            torch.testing.assert_close(result["actual"], actual)
+            torch.testing.assert_close(result["expected"], expected)
+
     def test_workspace_reference_uses_last_task_and_head(self):
         for geometry, tp in (("27b", 4), ("9b", 1)):
             case = make_case(geometry=geometry, tp=tp, batch=3)

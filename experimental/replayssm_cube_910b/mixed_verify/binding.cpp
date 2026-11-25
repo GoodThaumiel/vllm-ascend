@@ -48,7 +48,9 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   }
   expect(status, {b * hv}, at::kInt, "status");
   expect(zeros, {16, 128}, at::kBFloat16, "zero RHS");
-  expect(scratch, {blocks, 128, 16}, at::kFloat, "scratch");
+  TORCH_CHECK(scratch.dim() == 3, "scratch must be rank-3");
+  const bool perHeadWorkspace = scratch.size(0) == b * hv;
+  expect(scratch, {perHeadWorkspace ? b * hv : blocks, 128, 16}, at::kFloat, "scratch");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
   const auto rc = aclrtlaunch_replayssm_sd_verify_mix_910b(
@@ -57,7 +59,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       ringSlots.data_ptr(), pos.data_ptr(), base.data_ptr(), length.data_ptr(), out.data_ptr(), status.data_ptr(),
       zeros.data_ptr(), scratch.data_ptr(), static_cast<uint32_t>(b), static_cast<uint32_t>(hk),
       static_cast<uint32_t>(hv), static_cast<uint32_t>(numSlots), static_cast<uint32_t>(numRingSlots),
-      static_cast<uint32_t>(blocks));
+      static_cast<uint32_t>(blocks), static_cast<uint32_t>(perHeadWorkspace));
   TORCH_CHECK(rc == ACL_SUCCESS, "910B mixed verify launch failed: ", rc);
 }
 }  // namespace

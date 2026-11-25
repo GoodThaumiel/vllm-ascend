@@ -45,6 +45,42 @@ cmake -S "$P/mixed_verify" -B "$BUILD" -DSOC_VERSION=Ascend910B4 \
   -DPython3_EXECUTABLE="$(command -v python3)" > "$R/configure.log" 2>&1
 cmake --build "$BUILD" -j8 > "$R/build.log" 2>&1
 LIB="$BUILD/libreplayssm_sd_mix_torch.so"
+```
+
+### 8808a37 精度问题回归
+
+上机在两处中止。单核一例的最后一张投影通过，D ring 有 44 个元素超差，最大差 0.02277。
+多核一例的 FP32 投影已有 1,530 个元素超差，最大差 0.04181。
+旧单核检查只保留每个 AIC 的最后一张投影，早期 head 的投影还需排查。
+修复合并 AIC 的 RHS/checkpoint 就绪事件，并让 AIV 的投影、历史 G、候选 gate/beta 使用不同的
+MTE2→V event。原始容差保持 projection `atol=2e-5, rtol=1e-3`，输出和 ring `atol=0.01, rtol=0.03`。
+[CANN FetchEventID 约束](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/resource_management/TPipe/FetchEventID.md)
+
+拉取修复后重新编译实验库及其依赖的 kernel .so。下面两种 workspace 使用同一核调度和握手。
+`per-core` 复用投影槽，是正式测量配置。`per-head` 给每个 V head 一个独占投影槽，便于区分共享槽复用和投影/递推错误。
+失败时 JSON 和 traceback 会标记阶段及张量名，`--mixed-dump` 将首个失败张量的实测值和参考值保存为 `*.mismatch.pt`。
+
+```bash
+for workspace in per-core per-head; do
+  for geometry in 27b 9b; do
+    for case in '1 16' '20 15'; do
+      read -r cores pos <<< "$case"
+      timeout 120s python3 "$P/run.py" --suite mixed --mixed-library "$LIB" \
+        --geometry "$geometry" --batches 1 --pos "$pos" --length 4 --base 31 \
+        --mixed-cores "$cores" --mixed-workspace "$workspace" --mixed-check-repeats 5 \
+        --mixed-dump --path mixed_verify --iterations 3 \
+        --output "$R/precision-$geometry-$workspace-c$cores-p$pos.json"
+    done
+  done
+done
+```
+
+回传失败 JSON、`*.mismatch.pt` 和 `sha256sum "$LIB" "$BUILD/lib/libreplayssm_sd_mix_kernel.so"`。
+如果正式复用槽路径仍失败，可单独运行对应的 `--mixed-workspace per-head` 用例，再继续定位。
+
+### 常规冒烟
+
+```bash
 for geometry in 27b 9b; do
   for scenario in '0 1' '15 4' '16 4'; do
     read -r pos length <<< "$scenario"

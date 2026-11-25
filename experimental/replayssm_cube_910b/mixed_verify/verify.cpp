@@ -20,10 +20,14 @@ constexpr uint16_t CONSUMED = 7;
 constexpr float SCALE = 0.08838834764831845f;
 
 template <HardEvent Event>
-__aicore__ inline void Fence() {
-  const auto id = static_cast<event_t>(GetTPipePtr()->FetchEventID(Event));
+__aicore__ inline void Fence(event_t id) {
   SetFlag<Event>(id);
   WaitFlag<Event>(id);
+}
+
+template <HardEvent Event>
+__aicore__ inline void Fence() {
+  Fence<Event>(static_cast<event_t>(GetTPipePtr()->FetchEventID(Event)));
 }
 
 __aicore__ inline uint32_t Physical(uint32_t base, uint32_t p) {
@@ -36,12 +40,17 @@ struct Inputs {
   GlobalTensor<float> g, beta, gates, scratch;
   GlobalTensor<int32_t> slots, ringSlots, pos, base, length, status;
   uint32_t batch, hk, hv, numSlots, numRingSlots, blocks;
+  bool perHeadWorkspace;
 
   __aicore__ inline uint64_t KeyInput(uint32_t row, uint32_t key) const {
     return (static_cast<uint64_t>(row) * TOKENS * hk + key) * DIM;
   }
   __aicore__ inline uint64_t Output(uint32_t row, uint32_t t, uint32_t head) const {
     return ((static_cast<uint64_t>(row) * TOKENS + t) * hv + head) * DIM;
+  }
+
+  __aicore__ inline uint64_t Projection(uint32_t block, uint32_t row, uint32_t head) const {
+    return (perHeadWorkspace ? static_cast<uint64_t>(row) * hv + head : block) * DIM * COLS;
   }
 };
 
@@ -63,11 +72,13 @@ class Projector {
       const int32_t slot = x.slots.GetValue(row);
       const bool valid = slot > 0 && static_cast<uint32_t>(slot) < x.numSlots;
       if (valid) {
-        LoadRhs(x, row, key);
+        StageRhs(x, row, key);
       }
       for (uint32_t member = 0; member < group; ++member) {
         if (valid) {
-          Project(x, (static_cast<uint64_t>(slot) * x.hv + key * group + member) * DIM * DIM);
+          const uint32_t head = key * group + member;
+          const uint64_t stateOff = (static_cast<uint64_t>(slot) * x.hv + head) * DIM * DIM;
+          Project(x, stateOff, x.Projection(block, row, head), member == 0);
         }
         // Pad/error rows have the same handshakes. The AIVs skip the read.
         CrossCoreSetFlag<MIX_MODE, PIPE_FIX>(READY);
@@ -90,27 +101,34 @@ class Projector {
     DataCopy(dst, src, p);
   }
 
-  __aicore__ inline void LoadRhs(Inputs &x, uint32_t row, uint32_t key) {
+  __aicore__ inline void StageRhs(Inputs &x, uint32_t row, uint32_t key) {
     // NZ for [N,K]. Each tile has 16 rows; K goes in 0..3 and Q in 4..7.
     auto b1 = b1_.Get<bfloat16_t>();
     DataCopy(b1, x.zeros, COLS * DIM);
     const auto off = x.KeyInput(row, key);
     ToL1(b1, x.k[off], TOKENS, x.hk * DIM, COLS);
     ToL1(b1[TOKENS * 16], x.q[off], TOKENS, x.hk * DIM, COLS);
-    Fence<HardEvent::MTE2_MTE1>();
+  }
+
+  __aicore__ inline void LoadRhsFromL1() {
     LoadData2DParams p{};
     p.repeatTimes = DIM / 16;
     p.srcStride = 1;
     // Already NZ for [N,K], matching arch22 SFA's B load.
-    LoadData(b2_.Get<bfloat16_t>(), b1, p);
+    LoadData(b2_.Get<bfloat16_t>(), b1_.Get<bfloat16_t>(), p);
   }
 
-  __aicore__ inline void Project(Inputs &x, uint64_t off) {
+  __aicore__ inline void Project(Inputs &x, uint64_t off, uint64_t scratchOffset, bool loadRhs) {
     auto a1 = a1_.Get<bfloat16_t>();
     auto a2 = a2_.Get<bfloat16_t>();
     auto c = c1_.Get<float>();
     ToL1(a1, x.checkpoint[off], DIM, DIM, DIM);
+    // RHS staging and checkpoint staging use the same MTE2 pipe.
+    // Wait once for both, so an outstanding wait is never signalled twice.
     Fence<HardEvent::MTE2_MTE1>();
+    if (loadRhs) {
+      LoadRhsFromL1();
+    }
     LoadData2DParams p{};
     p.repeatTimes = DIM / 16;
     p.srcStride = DIM / 16;
@@ -134,7 +152,7 @@ class Projector {
     fx.srcStride = DIM;
     fx.dstStride = COLS;
     fx.ndNum = 1;
-    Fixpipe<float, float, CFG_ROW_MAJOR>(x.scratch[GetBlockIdx() * DIM * COLS], c, fx);
+    Fixpipe<float, float, CFG_ROW_MAJOR>(x.scratch[scratchOffset], c, fx);
   }
 
   TPipe pipe_;
@@ -175,8 +193,8 @@ class Consumer {
           // The previous head may still have Vector reads of proj_ or the
           // gate buffers in flight. Order the next DMA writes after them.
           Fence<HardEvent::V_MTE2>();
-          DataCopy(proj_.Get<float>(), x.scratch[(block * DIM + vStart) * COLS], PANEL);
-          Fence<HardEvent::MTE2_V>();
+          DataCopy(proj_.Get<float>(), x.scratch[x.Projection(block, row, head) + vStart * COLS], PANEL);
+          Fence<HardEvent::MTE2_V>(projectionReady_);
         }
         // After the read, the projection lives in this AIV's private UB.
         CrossCoreSetFlag<MIX_MODE, PIPE_MTE2>(CONSUMED);
@@ -197,6 +215,9 @@ class Consumer {
         }
       }
     }
+    pipe_.ReleaseEventID<HardEvent::MTE2_V>(projectionReady_);
+    pipe_.ReleaseEventID<HardEvent::MTE2_V>(historyReady_);
+    pipe_.ReleaseEventID<HardEvent::MTE2_V>(candidatesReady_);
   }
 
  private:
@@ -215,6 +236,11 @@ class Consumer {
     pipe_.InitBuffer(gates_, 2 * RING * sizeof(float));
     pipe_.InitBuffer(candidate_, 3 * CANDIDATE_SCALARS * sizeof(float));
     pipe_.InitBuffer(scalarOut_, 32);
+    // MTE2 can enqueue gate copies while the V wait on the projection is
+    // still outstanding. Reserve distinct token IDs for these dependencies.
+    projectionReady_ = static_cast<event_t>(pipe_.AllocEventID<HardEvent::MTE2_V>());
+    historyReady_ = static_cast<event_t>(pipe_.AllocEventID<HardEvent::MTE2_V>());
+    candidatesReady_ = static_cast<event_t>(pipe_.AllocEventID<HardEvent::MTE2_V>());
     auto offsets = gather_.Get<uint32_t>();
     for (uint32_t col = 0; col < 2 * TOKENS; ++col) {
       for (uint32_t v = 0; v < TILE; ++v) {
@@ -375,7 +401,7 @@ class Consumer {
     DataCopyPadExtParams<float> padding{true, 0, FLOAT_LANES_PER_BLOCK - 1, 0.0f};
     DataCopyPad(logGate, x.g[offset], p, padding);
     DataCopyPad(beta, x.beta[offset], p, padding);
-    Fence<HardEvent::MTE2_V>();
+    Fence<HardEvent::MTE2_V>(candidatesReady_);
     Exp(decay, logGate, CANDIDATE_SCALARS);
     Fence<HardEvent::V_S>();
   }
@@ -384,7 +410,7 @@ class Consumer {
     DataCopyExtParams p{1, static_cast<uint32_t>(count * sizeof(float)), 0, 0, 0};
     DataCopyPadExtParams<float> padding{true, 0, 0, 0.0f};
     DataCopyPad(dst, src, p, padding);
-    Fence<HardEvent::MTE2_V>();
+    Fence<HardEvent::MTE2_V>(historyReady_);
     Exp(dst, dst, count);
     Fence<HardEvent::V_S>();
   }
@@ -404,6 +430,7 @@ class Consumer {
   TQue<TPosition::VECOUT, 1> out_;
   TBuf<TPosition::VECCALC> rhs_, products_, dot_, proj_, outer_, gather_, key_, delta_, selected_, gates_, candidate_;
   TBuf<TPosition::VECOUT> scalarOut_;
+  event_t projectionReady_, historyReady_, candidatesReady_;
 };
 #endif
 }  // namespace
@@ -413,7 +440,7 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
     GM_ADDR d, GM_ADDR keys, GM_ADDR gates, GM_ADDR slots, GM_ADDR ringSlots,
     GM_ADDR pos, GM_ADDR base, GM_ADDR length, GM_ADDR out, GM_ADDR status, GM_ADDR zeros,
     GM_ADDR scratch, uint32_t batch, uint32_t hk, uint32_t hv, uint32_t numSlots,
-    uint32_t numRingSlots, uint32_t blocks) {
+    uint32_t numRingSlots, uint32_t blocks, uint32_t perHeadWorkspace) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
   Inputs x;
   x.q.SetGlobalBuffer((__gm__ bfloat16_t *)q);
@@ -440,6 +467,7 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   x.numSlots = numSlots;
   x.numRingSlots = numRingSlots;
   x.blocks = blocks;
+  x.perHeadWorkspace = perHeadWorkspace != 0;
 #if defined(__DAV_C220_CUBE__)
   Projector op;
   op.Run(x);
