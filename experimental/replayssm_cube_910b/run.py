@@ -29,6 +29,7 @@ from scripts.replayssm.profile_sd_operator_compare import (  # noqa: E402
 )
 
 VECTOR_PATHS = ("native", "v20", "compact_v1", "vector_pair")
+MIXED_PATHS = ("mixed_verify", "mixed_pair")
 CUBE_PATHS = (
     "cube_verify",
     "cube_compact",
@@ -53,7 +54,7 @@ def batches(text):
     return values
 
 
-def measure(call, reset, iterations, label):
+def measure(call, reset, iterations, label, check_graph=None):
     for _ in range(2):
         reset()
         call()
@@ -75,7 +76,23 @@ def measure(call, reset, iterations, label):
             end.synchronize()
             us.append(start.elapsed_time(end) * 1000)
     print(f"MEASURE_END {label}", flush=True)
+    if check_graph is not None:
+        check_graph(graph)
     return {"graph_us": us, "p50_us": statistics.median(us), "p90_us": sorted(us)[(9 * len(us) - 1) // 10]}
+
+
+def last_projections(case, blocks):
+    """Reference the last head produced in each AIC's reusable workspace slot."""
+    batch, _, hk, _ = case["k"].shape
+    group = case["v"].shape[2] // hk
+    first = torch.arange(blocks)
+    tasks = first + ((batch * hk - 1 - first) // blocks) * blocks
+    rows, keys = tasks // hk, tasks % hk
+    checkpoint = case["checkpoint"][rows + 1, keys * group + group - 1].float()
+    rhs = torch.zeros((blocks, 128, 16), dtype=torch.float32)
+    rhs[:, :, :4] = case["k"][rows, :, keys].transpose(1, 2)
+    rhs[:, :, 4:8] = case["q"][rows, :, keys].transpose(1, 2)
+    return torch.bmm(checkpoint, rhs)
 
 
 def trial(args, b, dev):
@@ -175,18 +192,32 @@ def trial(args, b, dev):
     reset_state()
 
     calls = dict(native=native, v20=vector, compact_v1=fold, vector_pair=lambda: (vector(), fold()))
-    if any(path in CUBE_PATHS for path in args.path):
+    compare_demo = any(path in CUBE_PATHS for path in args.path)
+    compare_mixed = any(path in MIXED_PATHS for path in args.path)
+    if compare_demo or compare_mixed:
         # Poison destinations so a missing Cube candidate write cannot inherit V20 results.
         golden = {n: c[n].cpu() for n in ("out", "d_cache", "k_cache", "g_cache")}
-        c["out"].fill_(float("nan"))
-        for s in range(t):
-            for n in ("d_cache", "k_cache", "g_cache"):
-                c[n][1:, :, (base + p + s) % 32].fill_(float("nan"))
+
+        def poison():
+            c["out"].fill_(float("nan"))
+            c["status"].fill_(-1)
+            for s in range(t):
+                for n in ("d_cache", "k_cache", "g_cache"):
+                    c[n][1:, :, (base + p + s) % 32].fill_(float("nan"))
+
+        def check_outputs(label, error_prefix=""):
+            if c["status"].cpu().any():
+                raise RuntimeError(f"{label} returned nonzero status")
+            for n, ref in golden.items():
+                actual = c[n].cpu().float()
+                expected = ref.float()
+                torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.03, equal_nan=True)
+                errors[f"{error_prefix}{n}"] = (actual - expected).nan_to_num().abs().max().item()
+
+    if compare_demo:
+        poison()
         verify(c, t, p, base)
-        for n, ref in golden.items():
-            actual = c[n].cpu().float()
-            torch.testing.assert_close(actual, ref.float(), atol=0.01, rtol=0.03, equal_nan=True)
-            errors[n] = (actual - ref.float()).nan_to_num().abs().max().item()
+        check_outputs("cube_demo")
         compact(c, active, p, base, status)
         actual = c["checkpoint"].cpu().float()
         torch.testing.assert_close(actual, checkpoint.float(), atol=0.01, rtol=0.03)
@@ -204,6 +235,34 @@ def trial(args, b, dev):
         if active and p:
             _, dl, kh = compact_inputs(c, active, p, base)
             calls["fold_gemm"] = lambda: torch.bmm(dl, kh)
+
+    if compare_mixed:
+        blocks = min(b * key_heads, args.mixed_cores)
+        zeros = torch.zeros((16, 128), dtype=torch.bfloat16, device=dev)
+        scratch = torch.full((blocks, 128, 16), float("nan"), dtype=torch.float32, device=dev)
+        expected_projection = last_projections(cpu, blocks)
+
+        def verify_mixed():
+            torch.ops.replayssm_mix_910b.verify_(
+                *(c[n] for n in ("q", "k", "v", "g", "beta", "checkpoint", "d_cache", "k_cache", "g_cache")),
+                slots,
+                ring,
+                c["positions"],
+                c["bases"],
+                c["lengths"],
+                c["out"],
+                c["status"],
+                zeros,
+                scratch,
+                args.mixed_cores,
+            )
+
+        poison()
+        verify_mixed()
+        torch.testing.assert_close(scratch.cpu(), expected_projection, atol=2e-5, rtol=1e-3)
+        check_outputs("mixed eager", "mixed_eager_")
+        torch.testing.assert_close(c["checkpoint"], initial, atol=0, rtol=0)
+        calls.update(mixed_verify=verify_mixed, mixed_pair=lambda: (verify_mixed(), fold()))
     rows = []
     for path in args.path:
         if path not in calls:
@@ -212,11 +271,32 @@ def trial(args, b, dev):
             (lambda: first.copy_(start_state))
             if path == "native"
             else reset_state
-            if path in ("vector_pair", "compact_v1", "cube_pair", "cube_compact")
+            if path in ("vector_pair", "compact_v1", "cube_pair", "cube_compact", "mixed_pair")
             else lambda: None
         )
         reset_state()
         label = f"{args.geometry}_tp{args.tp}_b{b}_t{t}_pos{p}_base{base}_{args.flush}/{path}"
+        mix_metadata = {}
+        if path in MIXED_PATHS:
+
+            def check_graph(graph, reset=reset, path=path):
+                reset()
+                poison()
+                scratch.fill_(float("nan"))
+                if path == "mixed_pair":
+                    status.fill_(-1)
+                graph.replay()
+                torch.testing.assert_close(scratch.cpu(), expected_projection, atol=2e-5, rtol=1e-3)
+                check_outputs("mixed graph", "mixed_graph_")
+                expected_state = checkpoint if path == "mixed_pair" else initial.cpu()
+                torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
+                if path == "mixed_pair" and status.cpu().any():
+                    raise RuntimeError("Captured compact returned nonzero status")
+
+            timings = measure(calls[path], reset, args.iterations, label, check_graph=check_graph)
+            mix_metadata = dict(aic_blocks=blocks, aiv_blocks=2 * blocks, workspace_bytes=scratch.nbytes)
+        else:
+            timings = measure(calls[path], reset, args.iterations, label)
         rows.append(
             dict(
                 batch=b,
@@ -228,8 +308,9 @@ def trial(args, b, dev):
                 value_heads=value_heads,
                 native_state_page_bytes=state_page_bytes,
                 path=path,
-                errors=errors,
-                **measure(calls[path], reset, args.iterations, label),
+                errors=dict(errors),
+                **timings,
+                **mix_metadata,
             )
         )
     return rows
@@ -237,25 +318,35 @@ def trial(args, b, dev):
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--suite", choices=("all", "vector"), default="all")
+    ap.add_argument("--suite", choices=("all", "vector", "mixed"), default="all")
     ap.add_argument("--geometry", choices=("27b", "9b"), default="27b")
     ap.add_argument("--batches", type=batches)
     ap.add_argument("--length", type=int, choices=(1, 4), default=4)
     ap.add_argument("--pos", type=int, choices=range(17), default=15)
     ap.add_argument("--base", type=int, choices=range(32), default=31)
     ap.add_argument("--flush", choices=("none", "mixed", "full"), default="full")
-    ap.add_argument("--path", nargs="+", choices=PATHS)
+    ap.add_argument("--path", nargs="+", choices=(*PATHS, *MIXED_PATHS))
+    ap.add_argument("--mixed-library", type=Path, help="Path to libreplayssm_sd_mix_torch.so")
+    ap.add_argument("--mixed-cores", type=int, choices=range(1, 21), default=20)
     ap.add_argument("--iterations", type=int, default=100)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args(argv)
     if args.iterations < 1:
         ap.error("iterations must be positive")
-    vector_only = args.suite == "vector" or args.geometry == "9b"
-    args.batches = args.batches or (batches("all") if vector_only else DEFAULT_BATCHES)
-    args.path = args.path or (VECTOR_PATHS if vector_only else PATHS)
-    if vector_only and any(path in CUBE_PATHS for path in args.path):
-        ap.error("Vector suite and 9B TP1 require Vector/native paths")
+    vector_only = args.suite == "vector" or (args.geometry == "9b" and args.suite == "all")
+    if args.suite == "mixed":
+        defaults = (*VECTOR_PATHS, *MIXED_PATHS)
+    else:
+        defaults = VECTOR_PATHS if vector_only else PATHS
+    args.batches = args.batches or (DEFAULT_BATCHES if defaults == PATHS else batches("all"))
+    args.path = args.path or defaults
+    if (args.suite != "all" or args.geometry == "9b") and any(path in CUBE_PATHS for path in args.path):
+        ap.error("the PyTorch Cube demo uses the 27B TP4 all suite")
+    if any(path in MIXED_PATHS for path in args.path) and not args.mixed_library:
+        ap.error("mixed paths require --mixed-library")
+    if args.suite == "vector" and any(path in MIXED_PATHS for path in args.path):
+        ap.error("use --suite mixed for AIC/AIV paths")
     if len(set(args.path)) != len(args.path):
         ap.error("paths must be unique")
     args.tp = 4 if args.geometry == "27b" else 1
@@ -282,6 +373,13 @@ def main():
         library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
         rows=[],
     )
+    if any(path in MIXED_PATHS for path in args.path):
+        mixed_library = args.mixed_library.resolve(strict=True)
+        torch.ops.load_library(str(mixed_library))
+        report.update(
+            mixed_library=str(mixed_library),
+            mixed_library_sha256=hashlib.sha256(mixed_library.read_bytes()).hexdigest(),
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for b in args.batches:
         try:

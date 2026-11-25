@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: Apache-2.0
+import unittest
+
+import torch
+
+from experimental.replayssm_cube_910b.plot import contract
+from experimental.replayssm_cube_910b.run import last_projections, parse_args
+from experimental.replayssm_sd_ascendc.lab import make_case, recurrent_golden
+
+
+class TestMixedVerifyProbe(unittest.TestCase):
+    def test_workspace_reference_uses_last_task_and_head(self):
+        for geometry, tp in (("27b", 4), ("9b", 1)):
+            case = make_case(geometry=geometry, tp=tp, batch=3)
+            _, _, hk, dim = case["k"].shape
+            group = case["v"].shape[2] // hk
+            for blocks in (1, 5, min(20, 3 * hk)):
+                expected = last_projections(case, blocks)
+                for block in range(blocks):
+                    row, key = divmod(list(range(block, 3 * hk, blocks))[-1], hk)
+                    state = case["checkpoint"][row + 1, (key + 1) * group - 1].float()
+                    rhs = torch.cat((case["k"][row, :, key], case["q"][row, :, key])).float()
+                    torch.testing.assert_close(expected[block, :, :8], state @ rhs.T)
+                self.assertEqual(expected.shape, (blocks, dim, 16))
+                self.assertEqual(expected[:, :, 8:].count_nonzero().item(), 0)
+
+    def test_two_tiles_projected_recurrence_matches_dense(self):
+        # Simulate the 128x16 FP32 handoff to two V64 consumers. Exercise both
+        # head-sharing ratios, a wrapped committed ring and padded K/Q columns.
+        for geometry, tp, pos, length in (("27b", 4, 0, 1), ("9b", 1, 16, 4), ("27b", 4, 15, 1)):
+            case = make_case(geometry=geometry, tp=tp, batch=1, position=pos, length=length, base=31)
+            target = recurrent_golden(case)
+            _, _, hk, _ = case["k"].shape
+            hv = case["v"].shape[2]
+            group = hv // hk
+            actual = torch.zeros_like(case["out"])
+            actual_d = case["d_cache"].clone()
+            for key_head in range(hk):
+                rhs = torch.zeros((128, 16), dtype=torch.float64)
+                keys = case["k"][0, :length, key_head].double()
+                rhs[:, :length] = keys.T
+                rhs[:, 4 : 4 + length] = case["q"][0, :length, key_head].double().T
+                history_indices = [(31 + i) % 32 for i in range(pos)]
+                history_keys = case["k_cache"][1, key_head, history_indices].double()
+                dots = torch.cat((history_keys, keys)) @ rhs
+                for head in range(key_head * group, (key_head + 1) * group):
+                    projection = case["checkpoint"][1, head].double() @ rhs
+                    for begin in (0, 64):
+                        tile = slice(begin, begin + 64)
+                        y = projection[tile].clone()
+                        for i, phys in enumerate(history_indices):
+                            y.mul_(case["g_cache"][1, head, phys].double().exp())
+                            y.add_(case["d_cache"][1, head, phys, tile].double()[:, None] * dots[i])
+                        for t in range(length):
+                            y.mul_(case["g"][0, t, head].double().exp())
+                            delta = (case["v"][0, t, head, tile].double() - y[:, t]) * case["beta"][0, t, head]
+                            y.add_(delta[:, None] * dots[pos + t])
+                            actual[0, t, head, tile] = y[:, 4 + t] * 128**-0.5
+                            actual_d[1, head, (31 + pos + t) % 32, tile] = delta
+            torch.testing.assert_close(actual, target["out"], atol=0, rtol=0)
+            torch.testing.assert_close(actual_d, target["d_cache"], atol=0, rtol=0, equal_nan=True)
+
+    def test_sweep_mapping_and_roofline(self):
+        for geometry in ("27b", "9b"):
+            args = parse_args(
+                [
+                    "--geometry",
+                    geometry,
+                    "--suite",
+                    "mixed",
+                    "--mixed-library",
+                    "fixture.so",
+                    "--output",
+                    "unused.json",
+                ]
+            )
+            self.assertEqual(args.batches, tuple(range(1, 129)))
+            self.assertEqual(args.path[-2:], ("mixed_verify", "mixed_pair"))
+            common = dict(batch=128, length=4, pos=15, active_flush=16, value_heads=32, key_heads=16)
+            verify = contract(dict(common, path="mixed_verify"))
+            compact = contract(dict(common, path="compact_v1"))
+            pair = contract(dict(common, path="mixed_pair"))
+            self.assertEqual(pair, tuple(a + b for a, b in zip(verify, compact)))

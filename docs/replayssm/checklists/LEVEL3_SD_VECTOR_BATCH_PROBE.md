@@ -1,6 +1,7 @@
 # 910B4 Vector 基线 BS1–128 对照
 
 使用已有的 verify V20（tile128、40 AIV）和 compact v1（tile32、40 AIV）。
+同口径的 AIC/AIV 整窗投影对照见 [910B4 混合核 verify](LEVEL3_SD_MIXED_VERIFY_910B.md)。
 每个 batch 分别测框架原生 RGDR、V20、compact v1，以及 V20 → compact v1 的同图回放。
 TP 表示单卡上模拟的每 rank 头部几何。两种模型都用 T4（MTP3），pos15、base31、ring32 和独立 checkpoint/ring 槽。
 

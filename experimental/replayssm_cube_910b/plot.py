@@ -35,13 +35,20 @@ def contract(row):
     moved = f * h * (4 * d * d + 2 * p * d) + f * k * 2 * p * d if p else 0
     compact = (f * h * 3 * p * d * d, moved + 4 * b * h * 4)
     short = (f * h * (2 * d * d * n + 2 * d * d) if p else 0, compact[1])
-    if path in ("vector_pair", "cube_pair"):
-        a, c = (v20, compact) if path == "vector_pair" else (cube, short)
+    # Both AIVs prepare the K-side table once per key-head group. Count the
+    # FP32 panel stores and tile reads as logical GM traffic.
+    mixed = (
+        2 * b * h * d * d * n + 4 * b * k * (p + t) * d * n + 3 * b * h * (p + t) * d * n,
+        verify_io + 2 * b * h * d * n * 4,
+    )
+    if path in ("vector_pair", "cube_pair", "mixed_pair"):
+        a, c = {"vector_pair": (v20, compact), "cube_pair": (cube, short), "mixed_pair": (mixed, compact)}[path]
         return a[0] + c[0], a[1] + c[1]
     return {
         "native": native,
         "v20": v20,
         "cube_verify": cube,
+        "mixed_verify": mixed,
         "compact_v1": compact,
         "cube_compact": short,
         "grouped_projection": (b * h * 2 * d * d * n, b * (h * 2 * d * d + k * 2 * d * n + h * 2 * d * n)),
@@ -101,6 +108,8 @@ def main():
         "v20": "Verify V20",
         "compact_v1": "Compact v1",
         "vector_pair": "V20 + compact v1",
+        "mixed_verify": "AIC/AIV verify",
+        "mixed_pair": "AIC/AIV verify + compact v1",
     }
     for name, rows in by.items():
         rows.sort()
