@@ -40,6 +40,8 @@ CUBE_PATHS = (
 )
 PATHS = (*VECTOR_PATHS, *CUBE_PATHS)
 DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
+PROJECTION_ATOL = 2e-5
+PROJECTION_RTOL = 1e-3
 
 
 def batches(text):
@@ -100,6 +102,25 @@ def reference_projections(case, rows, heads):
     rhs[:, :, :4] = case["k"][rows, :, keys].transpose(1, 2)
     rhs[:, :, 4:8] = case["q"][rows, :, keys].transpose(1, 2)
     return torch.bmm(checkpoint, rhs)
+
+
+def projection_error_summary(actual, expected):
+    """Locate bad lanes in each workspace tile and count zeros and nonfinite values."""
+    bad = ~torch.isclose(actual, expected, atol=PROJECTION_ATOL, rtol=PROJECTION_RTOL)
+    summary = {}
+    for part, cols in (("k", slice(0, 4)), ("q", slice(4, 8)), ("padding", slice(8, 16))):
+        errors = bad[..., cols]
+        values = actual[..., cols]
+        tiles = errors.reshape(-1, 2, 64, errors.size(-1)).sum(dim=(2, 3))
+        indices = tiles.nonzero().tolist()
+        summary[part] = dict(
+            mismatches=int(tiles.sum()),
+            zero_values=int((errors & (values == 0)).sum()),
+            nonfinite_values=int((errors & ~values.isfinite()).sum()),
+            tile_halves=[(tile, half, int(tiles[tile, half])) for tile, half in indices[:8]],
+            affected_tile_halves=len(indices),
+        )
+    return summary
 
 
 def assert_stage(actual, expected, stage, *, atol, rtol, dump=None, equal_nan=False):
@@ -269,7 +290,19 @@ def trial(args, b, dev):
         dump = args.output.with_suffix(".mismatch.pt") if args.mixed_dump else None
 
         def check_projection(label):
-            assert_stage(scratch.cpu(), expected_projection, f"{label}/projection", atol=2e-5, rtol=1e-3, dump=dump)
+            actual = scratch.cpu()
+            try:
+                assert_stage(
+                    actual,
+                    expected_projection,
+                    f"{label}/projection",
+                    atol=PROJECTION_ATOL,
+                    rtol=PROJECTION_RTOL,
+                    dump=dump,
+                )
+            except AssertionError as exc:
+                summary = projection_error_summary(actual, expected_projection)
+                raise AssertionError(f"{exc}\nProjection mismatch by column group: {json.dumps(summary)}") from None
 
         def verify_mixed():
             torch.ops.replayssm_mix_910b.verify_(
@@ -310,20 +343,22 @@ def trial(args, b, dev):
         label = f"{args.geometry}_tp{args.tp}_b{b}_t{t}_pos{p}_base{base}_{args.flush}/{path}"
         mix_metadata = {}
         if path in MIXED_PATHS:
+            expected_state = checkpoint if path == "mixed_pair" else initial.cpu()
 
-            def check_graph(graph, reset=reset, path=path):
-                reset()
-                poison()
-                scratch.fill_(float("nan"))
-                if path == "mixed_pair":
-                    status.fill_(-1)
-                graph.replay()
-                check_projection("mixed graph")
-                check_outputs("mixed graph", "mixed_graph_", dump=dump)
-                expected_state = checkpoint if path == "mixed_pair" else initial.cpu()
-                torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
-                if path == "mixed_pair" and status.cpu().any():
-                    raise RuntimeError("Captured compact returned nonzero status")
+            def check_graph(graph, reset=reset, path=path, expected_state=expected_state):
+                for iteration in range(args.mixed_check_repeats):
+                    reset()
+                    poison()
+                    scratch.fill_(float("nan"))
+                    if path == "mixed_pair":
+                        status.fill_(-1)
+                    graph.replay()
+                    label = f"{path} graph run {iteration + 1}"
+                    check_projection(label)
+                    check_outputs(label, "mixed_graph_", dump=dump)
+                    torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
+                    if path == "mixed_pair" and status.cpu().any():
+                        raise RuntimeError("Captured compact returned nonzero status")
 
             timings = measure(calls[path], reset, args.iterations, label, check_graph=check_graph)
             mix_metadata = dict(
@@ -366,7 +401,7 @@ def parse_args(argv=None):
     ap.add_argument("--mixed-library", type=Path, help="Path to libreplayssm_sd_mix_torch.so")
     ap.add_argument("--mixed-cores", type=int, choices=range(1, 21), default=20)
     ap.add_argument("--mixed-workspace", choices=("per-core", "per-head"), default="per-core")
-    ap.add_argument("--mixed-check-repeats", type=int, default=1, help="Untimed eager checks with identical inputs")
+    ap.add_argument("--mixed-check-repeats", type=int, default=1, help="Untimed eager and graph checks per case")
     ap.add_argument("--mixed-dump", action="store_true", help="Save the first mismatch beside --output")
     ap.add_argument("--iterations", type=int, default=100)
     ap.add_argument("--device", type=int, default=0)

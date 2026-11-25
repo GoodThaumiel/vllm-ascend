@@ -10,6 +10,7 @@ Benchmark 两组沿用 BS1–128、MTP3/T4、pos15、base31、mixed/full flush�
 - AIC group 的任务是 `(request, key head)`，按 block stride 遍历，blocks 取 `min(BS × HK, 20)`。
   910B4 每个组有 1 个 AIC 和 2 个 AIV。两种几何分别为每个 K head 处理 3 或 2 个 V head。
 - AIC 用两次 ND→NZ 整理一份共享 RHS。K 在列 0–3，Q 在列 4–7，列 8–15 补零。
+  三次搬运分别写互不重叠的 L1 区域，合用一次 MTE2→MTE1 就绪事件。
   每个 V head 做 `[128,128] × [128,16]` BF16 Mmad，FP32 累加，Fixpipe 以 ND 写出。
   L1 的 A/B 为 32/4 KiB，L0A/B/C 为 32/4/8 KiB。
 - 两个 AIV 各读 FP32 `[64,16]` 到自己 UB 后发回确认。投影每个 AIC 使用一个 8 KiB workspace 槽，最多 160 KiB。
@@ -47,36 +48,35 @@ cmake --build "$BUILD" -j8 > "$R/build.log" 2>&1
 LIB="$BUILD/libreplayssm_sd_mix_torch.so"
 ```
 
-### 8808a37 精度问题回归
+### 原始投影精度回归
 
-上机在两处中止。单核一例的最后一张投影通过，D ring 有 44 个元素超差，最大差 0.02277。
-多核一例的 FP32 投影已有 1,530 个元素超差，最大差 0.04181。
-旧单核检查只保留每个 AIC 的最后一张投影，早期 head 的投影还需排查。
-修复合并 AIC 的 RHS/checkpoint 就绪事件，并让 AIV 的投影、历史 G、候选 gate/beta 使用不同的
-MTE2→V event。原始容差保持 projection `atol=2e-5, rtol=1e-3`，输出和 ring `atol=0.01, rtol=0.03`。
-[CANN FetchEventID 约束](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/resource_management/TPipe/FetchEventID.md)
+在 `8213d9c` 上，27B TP4 的单核冒烟通过，B1 四个 AIC 的 graph replay 投影有 509 个超差。
+随后 9B TP1 的 B1 单核 eager 投影有 511 个超差。
+原来的 RHS 整块清零与后续 K/Q 搬入重叠在 L1，现改为 K、Q、padding 各写自己的行区间。
+保留上一轮的事件修复。原始容差保持 projection `atol=2e-5, rtol=1e-3`，输出和 ring `atol=0.01, rtol=0.03`。
+[CANN 流水同步](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_10_00064.html)
 
 拉取修复后重新编译实验库及其依赖的 kernel .so。下面两种 workspace 使用同一核调度和握手。
 `per-core` 复用投影槽，是正式测量配置。`per-head` 给每个 V head 一个独占投影槽，便于区分共享槽复用和投影/递推错误。
-失败时 JSON 和 traceback 会标记阶段及张量名，`--mixed-dump` 将首个失败张量的实测值和参考值保存为 `*.mismatch.pt`。
+每个配置均运行五次未计时的 eager 校验和五次未计时的 graph 校验。
+失败时 JSON 和 traceback 会标记阶段及张量名，并按 K、Q、padding 分别列出超差、零值和非有限值数目。
+`--mixed-dump` 将首个失败张量的实测值和参考值保存为 `*.mismatch.pt`。
 
 ```bash
-for workspace in per-core per-head; do
-  for geometry in 27b 9b; do
-    for case in '1 16' '20 15'; do
-      read -r cores pos <<< "$case"
-      timeout 120s python3 "$P/run.py" --suite mixed --mixed-library "$LIB" \
-        --geometry "$geometry" --batches 1 --pos "$pos" --length 4 --base 31 \
-        --mixed-cores "$cores" --mixed-workspace "$workspace" --mixed-check-repeats 5 \
-        --mixed-dump --path mixed_verify --iterations 3 \
-        --output "$R/precision-$geometry-$workspace-c$cores-p$pos.json"
-    done
+for workspace in per-head per-core; do
+  for case in '27b 20 15' '9b 1 16'; do
+    read -r geometry cores pos <<< "$case"
+    name="precision-$geometry-$workspace-c$cores-p$pos"
+    timeout 120s python3 "$P/run.py" --suite mixed --mixed-library "$LIB" \
+      --geometry "$geometry" --batches 1 --pos "$pos" --length 4 --base 31 --flush mixed \
+      --mixed-cores "$cores" --mixed-workspace "$workspace" --mixed-check-repeats 5 \
+      --mixed-dump --iterations 3 --output "$R/$name.json" 2>&1 | tee "$R/$name.log"
   done
 done
 ```
 
 回传失败 JSON、`*.mismatch.pt` 和 `sha256sum "$LIB" "$BUILD/lib/libreplayssm_sd_mix_kernel.so"`。
-如果正式复用槽路径仍失败，可单独运行对应的 `--mixed-workspace per-head` 用例，再继续定位。
+如果同一几何的 `per-head` 失败，优先定位实际超差的列组。如果只有 `per-core` 失败，优先检查跨核复用时序。
 
 ### 常规冒烟
 

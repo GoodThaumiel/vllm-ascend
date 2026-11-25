@@ -103,11 +103,13 @@ class Projector {
 
   __aicore__ inline void StageRhs(Inputs &x, uint32_t row, uint32_t key) {
     // NZ for [N,K]. Each tile has 16 rows; K goes in 0..3 and Q in 4..7.
+    // Clear only the unused lanes. A full L1 clear would overlap the K/Q
+    // destinations, and successive MTE2 writes can be in flight together.
     auto b1 = b1_.Get<bfloat16_t>();
-    DataCopy(b1, x.zeros, COLS * DIM);
     const auto off = x.KeyInput(row, key);
     ToL1(b1, x.k[off], TOKENS, x.hk * DIM, COLS);
     ToL1(b1[TOKENS * 16], x.q[off], TOKENS, x.hk * DIM, COLS);
+    ToL1(b1[2 * TOKENS * 16], x.zeros, COLS - 2 * TOKENS, DIM, COLS);
   }
 
   __aicore__ inline void LoadRhsFromL1() {

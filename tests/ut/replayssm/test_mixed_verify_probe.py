@@ -6,7 +6,13 @@ from tempfile import TemporaryDirectory
 import torch
 
 from experimental.replayssm_cube_910b.plot import contract
-from experimental.replayssm_cube_910b.run import assert_stage, last_projections, parse_args, reference_projections
+from experimental.replayssm_cube_910b.run import (
+    assert_stage,
+    last_projections,
+    parse_args,
+    projection_error_summary,
+    reference_projections,
+)
 from experimental.replayssm_sd_ascendc.lab import make_case, recurrent_golden
 
 
@@ -32,6 +38,22 @@ class TestMixedVerifyProbe(unittest.TestCase):
             self.assertEqual(result["stage"], "mixed eager/d_cache")
             torch.testing.assert_close(result["actual"], actual)
             torch.testing.assert_close(result["expected"], expected)
+
+    def test_projection_failure_summary_groups_k_q_and_padding_by_tile_half(self):
+        expected = torch.zeros(2, 128, 16)
+        expected[..., :8] = 0.01
+        actual = expected.clone()
+        actual[0, :, :4] = 0
+        actual[1, 64:, 4:8] = 0.02
+        actual[1, 0, 8] = float("nan")
+        summary = projection_error_summary(actual, expected)
+        self.assertEqual(summary["k"]["mismatches"], 512)
+        self.assertEqual(summary["k"]["zero_values"], 512)
+        self.assertEqual(summary["k"]["tile_halves"], [(0, 0, 256), (0, 1, 256)])
+        self.assertEqual(summary["q"]["tile_halves"], [(1, 1, 256)])
+        self.assertEqual(summary["q"]["zero_values"], 0)
+        self.assertEqual(summary["padding"]["nonfinite_values"], 1)
+        self.assertEqual(summary["padding"]["tile_halves"], [(1, 0, 1)])
 
     def test_workspace_reference_uses_last_task_and_head(self):
         for geometry, tp in (("27b", 4), ("9b", 1)):
