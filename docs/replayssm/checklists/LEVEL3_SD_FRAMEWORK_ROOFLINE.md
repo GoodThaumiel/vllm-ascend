@@ -54,3 +54,5 @@ python3 scripts/replayssm/profile_sd_operator_compare.py \
 - [ ] JSON 会记录原生每候选 state slot 分配与 Replay page-backed ring 分配；这仅是单层状态 backing 对照，不是完整服务显存节省。
 
 本级只验证插件打包和 recurrent 边界的性能/精度。若 B32/64、T4 仍明显偏慢，先利用 profiler 确认重复 dot/Scalar 同步、checkpoint matvec 与 DMA 占比，再决定共享点积表或 Cube 投影，不直接改变已通过的算子数学路径。
+
+后续版本使用 B1/2/4/8/16/32/64/128 的固定原生对照，完整逐整数扫描和 SVG/CSV 输出见 [910B SD roofline 清单](LEVEL3_SD_CUBE_910B_ROOFLINE.md)。

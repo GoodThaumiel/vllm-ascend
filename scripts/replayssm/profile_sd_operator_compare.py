@@ -263,7 +263,7 @@ def run_case(args: argparse.Namespace, batch: int, context: int, length: int, po
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tp", type=int, choices=(4, 8), default=4)
-    parser.add_argument("--batches", type=positive_ints, default=(1, 16, 32, 64))
+    parser.add_argument("--batches", type=positive_ints, default=(1, 2, 4, 8, 16, 32, 64, 128))
     parser.add_argument("--context-lengths", type=positive_ints, default=(32768,))
     parser.add_argument("--lengths", type=positive_ints, default=(1, 4))
     parser.add_argument("--accepted", type=int, default=1)
