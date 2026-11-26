@@ -29,6 +29,15 @@ def replayssm_sd_enabled(vllm_config) -> bool:
     raise ValueError("additional_config.replayssm_sd must be a boolean")
 
 
+def replayssm_sd_verify_variant(vllm_config) -> int:
+    """Resolve the vector verify kernel selected for serving."""
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    variant = additional_config.get("replayssm_sd_verify_variant", REPLAYSSM_SD_VERIFY_VARIANT)
+    if not isinstance(variant, int) or variant not in (REPLAYSSM_SD_VERIFY_VARIANT, 20):
+        raise ValueError("additional_config.replayssm_sd_verify_variant must be 13 or 20")
+    return variant
+
+
 def replayssm_sd_ring_capacity(vllm_config) -> int:
     """Number of request-owned ring slots, excluding reserved slot zero."""
     max_seqs = vllm_config.scheduler_config.max_num_seqs

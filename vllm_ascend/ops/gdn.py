@@ -57,11 +57,11 @@ from vllm_ascend.ops.replayssm.cache import (
     REPLAYSSM_SD_MAX_TOKENS,
     REPLAYSSM_SD_MAX_VALUE_HEADS,
     REPLAYSSM_SD_VERIFY_TILE_V,
-    REPLAYSSM_SD_VERIFY_VARIANT,
     append_gdn_replayssm_ar_dtypes,
     append_gdn_replayssm_ar_shapes,
     replayssm_sd_enabled,
     replayssm_sd_ring_len,
+    replayssm_sd_verify_variant,
 )
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
@@ -404,6 +404,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             persistent=False,
         )
         if replayssm_sd_enabled(vllm_config):
+            self._replayssm_sd_verify_variant = replayssm_sd_verify_variant(vllm_config)
             max_rows = max(max_rows, vllm_config.compilation_config.max_cudagraph_capture_size or 0)
             tasks = max_rows * local_v_heads * (self.head_v_dim // REPLAYSSM_AR_TILE_V)
             self.register_buffer(
@@ -418,7 +419,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             logger.info_once(
                 "ReplaySSM SD enabled for Qwen GDN: BF16 conv/checkpoint, "
-                "FP16 d/k rings, FP32 g ring, verify=v13/tile128, compact=v1/tile32, cores=40"
+                "FP16 d/k rings, FP32 g ring, verify=v%d/tile128, compact=v1/tile32, cores=40",
+                self._replayssm_sd_verify_variant,
             )
             return
         logger.info_once(
@@ -521,7 +523,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_k_dim**-0.5,
             REPLAYSSM_SD_VERIFY_TILE_V,
             40,
-            REPLAYSSM_SD_VERIFY_VARIANT,
+            self._replayssm_sd_verify_variant,
             ring_slots,
         )
         replayssm_sd_compact(

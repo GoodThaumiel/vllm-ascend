@@ -111,8 +111,18 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
                     "the Ascend platform hook must leave the upstream RecoverSSM flag unset for SD",
                 )
 
-    def test_sd_serve_verify_selects_v13_tile128(self) -> None:
+    def test_sd_verify_variant_config(self) -> None:
         self.assertEqual((CACHE.REPLAYSSM_SD_VERIFY_VARIANT, CACHE.REPLAYSSM_SD_VERIFY_TILE_V), (13, 128))
+        config = SimpleNamespace(additional_config={})
+        self.assertEqual(CACHE.replayssm_sd_verify_variant(config), 13)
+        config.additional_config["replayssm_sd_verify_variant"] = 20
+        self.assertEqual(CACHE.replayssm_sd_verify_variant(config), 20)
+        for unsupported in (14, 22, True, "20", 20.0, None):
+            config.additional_config["replayssm_sd_verify_variant"] = unsupported
+            with self.assertRaisesRegex(ValueError, "must be 13 or 20"):
+                CACHE.replayssm_sd_verify_variant(config)
+
+    def test_sd_serve_dispatches_selected_verify_variant(self) -> None:
         try:
             from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
         except ModuleNotFoundError as exc:
@@ -150,18 +160,20 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
         def fake_verify(*args):
             args[13].copy_(args[2])
 
-        with (
-            patch("vllm_ascend.ops.gdn.replayssm_sd_verify", side_effect=fake_verify) as verify,
-            patch("vllm_ascend.ops.gdn.replayssm_sd_compact") as compact,
-        ):
-            result = AscendGatedDeltaNetAttention._replayssm_sd_decode(
-                layer, query=query, key=query, value=value, g=gate, beta=gate, attn_metadata=metadata
-            )
-        torch.testing.assert_close(result, value)
-        self.assertEqual(verify.call_args.args[-4:-1], (128, 40, 13))
-        self.assertEqual(compact.call_args.args[-4:-1], (32, 40, 1))
-        torch.testing.assert_close(verify.call_args.args[-1], metadata.replayssm_sd_ring_slots)
-        torch.testing.assert_close(compact.call_args.args[-1], metadata.replayssm_sd_ring_slots)
+        for variant in (13, 20):
+            layer._replayssm_sd_verify_variant = variant
+            with (
+                patch("vllm_ascend.ops.gdn.replayssm_sd_verify", side_effect=fake_verify) as verify,
+                patch("vllm_ascend.ops.gdn.replayssm_sd_compact") as compact,
+            ):
+                result = AscendGatedDeltaNetAttention._replayssm_sd_decode(
+                    layer, query=query, key=query, value=value, g=gate, beta=gate, attn_metadata=metadata
+                )
+            torch.testing.assert_close(result, value)
+            self.assertEqual(verify.call_args.args[-4:-1], (128, 40, variant))
+            self.assertEqual(compact.call_args.args[-4:-1], (32, 40, 1))
+            torch.testing.assert_close(verify.call_args.args[-1], metadata.replayssm_sd_ring_slots)
+            torch.testing.assert_close(compact.call_args.args[-1], metadata.replayssm_sd_ring_slots)
 
     def test_sd_decode_pads_mtp1_mtp2_without_changing_output_order(self) -> None:
         try:
@@ -176,6 +188,7 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
                 tokens = int(lengths.sum())
                 layer = SimpleNamespace(
                     num_spec=num_spec,
+                    _replayssm_sd_verify_variant=13,
                     num_k_heads=1,
                     num_v_heads=2,
                     tp_size=1,

@@ -1619,6 +1619,13 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_replayssm_sd_verify_variant_is_accepted(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"replayssm_sd": True, "replayssm_sd_verify_variant": 20}
+        self.assertEqual(init_ascend_config(vc).replayssm_sd_verify_variant, 20)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_enable_prefill_mc2_string_false_disables(self, mock_fix):
         vc = VllmConfig()
         vc.additional_config = {"enable_prefill_mc2": "false"}

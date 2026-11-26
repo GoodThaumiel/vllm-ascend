@@ -501,6 +501,7 @@ class NPUPlatform(Platform):
             replayssm_sd_enabled,
             replayssm_sd_ring_capacity,
             replayssm_sd_ring_len,
+            replayssm_sd_verify_variant,
         )
 
         if replayssm_sd_enabled(vllm_config):
@@ -509,6 +510,7 @@ class NPUPlatform(Platform):
                 raise ValueError("additional_config.replayssm_sd requires MTP1/2/3 speculative decoding")
             replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
             replayssm_sd_ring_capacity(vllm_config)
+            replayssm_sd_verify_variant(vllm_config)
             if getattr(spec, "method", None) != "mtp":
                 raise ValueError("Ascend ReplaySSM SD currently supports MTP1/2/3 only")
             if vllm_config.model_config.architecture not in (
