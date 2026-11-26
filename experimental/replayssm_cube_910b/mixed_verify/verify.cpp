@@ -190,6 +190,10 @@ class Consumer {
       }
       for (uint32_t member = 0; member < group; ++member) {
         const uint32_t head = key * group + member;
+        if (valid && pos > 0) {
+          const uint64_t dOffset = (static_cast<uint64_t>(ring) * x.hv + head) * RING * DIM;
+          StageHistory(x.d[dOffset + vStart], base, pos, TILE);
+        }
         CrossCoreWaitFlag(READY);
         if (valid) {
           // The previous head may still have Vector reads of proj_ or the
@@ -232,7 +236,8 @@ class Consumer {
     pipe_.InitBuffer(proj_, PANEL * sizeof(float));
     pipe_.InitBuffer(outer_, PANEL * sizeof(float));
     pipe_.InitBuffer(gather_, 2 * TOKENS * TILE * sizeof(uint32_t));
-    pipe_.InitBuffer(key_, DIM * sizeof(float));
+    pipe_.InitBuffer(historyIn_, 1, HISTORY * DIM * sizeof(half));
+    pipe_.InitBuffer(historyRows_, HISTORY * DIM * sizeof(float));
     pipe_.InitBuffer(delta_, TILE * sizeof(float));
     pipe_.InitBuffer(selected_, TILE * sizeof(float));
     pipe_.InitBuffer(gates_, 2 * RING * sizeof(float));
@@ -296,8 +301,35 @@ class Consumer {
     StoreScalar(x.status[index], value);
   }
 
+  // src starts at physical row zero, already offset to this AIV's lane.
+  // GM rows have DIM elements. Pack just width elements per row into UB.
+  __aicore__ inline void StageHistory(GlobalTensor<half> src, uint32_t base, uint32_t pos, uint32_t width) {
+    auto input = historyIn_.AllocTensor<half>();
+    const uint32_t first = pos < RING - base ? pos : RING - base;
+    DataCopyExtParams cp{static_cast<uint16_t>(first), static_cast<uint32_t>(width * sizeof(half)),
+                         static_cast<uint32_t>((DIM - width) * sizeof(half)), 0, 0};
+    DataCopyPadExtParams<half> pad{false, 0, 0, 0};
+    DataCopyPad(input, src[base * DIM], cp, pad);
+    if (pos > first) {
+      cp.blockCount = static_cast<uint16_t>(pos - first);
+      DataCopyPad(input[first * width], src, cp, pad);
+    }
+    historyIn_.EnQue(input);
+  }
+
+  __aicore__ inline void CastHistory(uint32_t count) {
+    auto input = historyIn_.DeQue<half>();
+    Cast(historyRows_.Get<float>(), input, RoundMode::CAST_NONE, count);
+    PipeBarrier<PIPE_V>();
+    historyIn_.FreeTensor(input);
+  }
+
   __aicore__ inline void MakeDots(Inputs &x, uint32_t row, uint32_t key, uint32_t ring, uint32_t pos,
                                   uint32_t base, uint32_t len) {
+    if (pos) {
+      const uint64_t kOffset = (static_cast<uint64_t>(ring) * x.hk + key) * RING * DIM;
+      StageHistory(x.keys[kOffset], base, pos, DIM);
+    }
     auto rhs = rhs_.Get<float>();
     Duplicate(rhs, 0.0f, COLS * DIM);
     PipeBarrier<PIPE_V>();
@@ -306,11 +338,12 @@ class Consumer {
       LoadCast(rhs[t * DIM], x.k[off + t * x.hk * DIM], DIM);
       LoadCast(rhs[(TOKENS + t) * DIM], x.q[off + t * x.hk * DIM], DIM);
     }
-    const uint64_t kRing = (static_cast<uint64_t>(ring) * x.hk + key) * RING;
-    auto keyRow = key_.Get<float>();
+    if (pos) {
+      CastHistory(pos * DIM);
+    }
+    auto rows = historyRows_.Get<float>();
     for (uint32_t i = 0; i < pos; ++i) {
-      LoadCast(keyRow, x.keys[(kRing + Physical(base, i)) * DIM], DIM);
-      Dot(i, keyRow);
+      Dot(i, rows[i * DIM]);
     }
     for (uint32_t t = 0; t < len; ++t) {
       Dot(pos + t, rhs[t * DIM]);
@@ -363,13 +396,15 @@ class Consumer {
       LoadGates(gates[RING], x.gates[ringHead], pos - first);
     }
     LoadCandidates(x, x.Output(row, 0, head) / DIM, logGate, decay, beta);
+    if (pos) {
+      CastHistory(pos * TILE);
+    }
+    auto rows = historyRows_.Get<float>();
     for (uint32_t i = 0; i < pos; ++i) {
-      const auto record = Physical(base, i);
-      LoadCast(d, x.d[(ringHead + record) * DIM + vStart], TILE);
       const uint32_t gateIndex = i < first ? i : RING + i - first;
       Muls(proj, proj, gates.GetValue(gateIndex), PANEL);
       PipeBarrier<PIPE_V>();
-      Outer(i, d);
+      Outer(i, rows[i * TILE]);
     }
     for (uint32_t t = 0; t < len; ++t) {
       const uint64_t out = x.Output(row, t, head);
@@ -428,9 +463,10 @@ class Consumer {
   }
 
   TPipe pipe_;
-  TQue<TPosition::VECIN, 1> in_;
+  TQue<TPosition::VECIN, 1> in_, historyIn_;
   TQue<TPosition::VECOUT, 1> out_;
-  TBuf<TPosition::VECCALC> rhs_, products_, dot_, proj_, outer_, gather_, key_, delta_, selected_, gates_, candidate_;
+  TBuf<TPosition::VECCALC> rhs_, products_, dot_, proj_, outer_, gather_, historyRows_;
+  TBuf<TPosition::VECCALC> delta_, selected_, gates_, candidate_;
   TBuf<TPosition::VECOUT> scalarOut_;
   event_t projectionReady_, historyReady_, candidatesReady_;
 };

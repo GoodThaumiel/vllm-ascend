@@ -19,7 +19,7 @@ Benchmark 两组沿用 BS1–128、MTP3/T4、pos15、base31、mixed/full flush�
 - `READY=6` 从 PIPE_FIX 发布。两个 AIV 在 MTE2 搬完各自的 tile 后各发一次 `CONSUMED=7`。
   910B 模式 2 在两侧都确认后给 AIC 一个计数。每个 head 恰好一轮握手，包括 padding 和错误 metadata。
   没有全核栅栏。G ring 和 status 由下半 V 切片的单个 AIV 写入，K ring 在一个 K head 组结束后写一次。
-- 每个 AIV 显式 UB 30,368 B，另计 CCE 临时区。历史最多 16，ring 为 32。短窗只消费有效的 K/Q 列。
+- 每个 AIV 显式 UB 42,144 B，另计 CCE 临时区。历史最多 16，ring 为 32。短窗只消费有效的 K/Q 列。
   输入来自固定的 NPU 连续 buffer，含同一 launch 内互不重叠的有效 checkpoint/ring 槽。
   这是独立实验库，当前 runner 使用统一的 T、pos、base 合成工作负载。
 
@@ -38,8 +38,8 @@ Graph 检查会把 workspace 和候选写回位置填 NaN，核验捕获图确�
 ```bash
 set -euo pipefail
 P=experimental/replayssm_cube_910b
-BUILD="$P/mixed_verify/build"
-R=/tmp/replayssm-mix-910b
+BUILD="$P/mixed_verify/build-history"
+R=/tmp/replayssm-mix-910b-history
 mkdir -p "$R"
 cmake -S "$P/mixed_verify" -B "$BUILD" -DSOC_VERSION=Ascend910B4 \
   -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.0 \
@@ -77,6 +77,63 @@ done
 
 回传失败 JSON、`*.mismatch.pt` 和 `sha256sum "$LIB" "$BUILD/lib/libreplayssm_sd_mix_kernel.so"`。
 如果同一几何的 `per-head` 失败，优先定位实际超差的列组。如果只有 `per-core` 失败，优先检查跨核复用时序。
+
+### AIV 历史搬运优化回归
+
+对照组为已在 910B4 上通过的 `f61c9c91c`。使用其原构建目录的实验库和 kernel 库，
+本轮编译单独使用上面的 `build-history`。每次 Python 进程只加载一组库。
+如旧目录已覆盖，可在该 commit 的独立 worktree 中按原清单重建，将下面的 OLD 指向该构建。
+
+一个 AIV 读取 K 的完整 128 维行、D 的前或后 64 维。跨 ring 尾部分两段，
+两段紧排在同一块 FP16 UB，随后一次转换为 FP32。K 搬入提前到准备 Q/K 之前，
+D 搬入提前到等待 READY 之前。队列深度为 1，两次使用的读写由队列管理。
+额外显式 UB 为 11,776 B/AIV。pos15/base31 下每个 27B K head 组、每个 AIV 的历史 K/D
+搬运次数从 60 降至 8，Cast 从 60 降至 4。实际传输的有效 K/D 字节数相同。
+使用投影精度回归检查跨核握手，然后执行以下覆盖正好抵达 ring 尾、跨尾和不跨尾的测试。
+
+```bash
+OLD="$P/mixed_verify/build/libreplayssm_sd_mix_torch.so"
+for lib in "$OLD" "$LIB"; do
+  sha256sum "$lib" "$(dirname "$lib")/lib/libreplayssm_sd_mix_kernel.so"
+done
+for geometry in 27b 9b; do
+  for case in '0 31 1' '1 31 4' '15 17 4' '16 17 4' '16 0 4' '16 31 4'; do
+    read -r pos base length <<< "$case"
+    timeout 180s python3 "$P/run.py" --suite mixed --mixed-library "$LIB" \
+      --geometry "$geometry" --batches 1,2 --pos "$pos" --base "$base" --length "$length" \
+      --path mixed_verify mixed_pair --mixed-dump --mixed-check-repeats 5 --iterations 3 \
+      --output "$R/history-$geometry-p$pos-base$base-t$length.json"
+  done
+done
+```
+
+先在同卡串行比较 27B B32 三条路径，每次独立进程，固定 pos15/base31/T4。
+回传每轮的 graph p50/p90 和目标 kernel 的 op_summary。按同 workload 和 MEASURE 回放
+筛选，统计 task_duration、aiv_time、vec/scalar/mte2/mte3 时间与 ratio，以及可用的 AIC 指标。
+
+```bash
+for round in 1 2 3; do
+  order=(old new native)
+  if [[ "$round" == 2 ]]; then order=(new native old); fi
+  if [[ "$round" == 3 ]]; then order=(native old new); fi
+  for version in "${order[@]}"; do
+    op=mixed_verify
+    library="$LIB"
+    if [[ "$version" == old ]]; then library="$OLD"; fi
+    if [[ "$version" == native ]]; then op=native; fi
+    msprof --task-time=l0 --output="$R/prof-b32-$version-r$round" \
+      python3 "$P/run.py" --suite mixed --geometry 27b --batches 32 --path "$op" \
+      --mixed-library "$library" --flush mixed --length 4 --pos 15 --base 31 --iterations 100 \
+      --output "$R/b32-$version-r$round.json"
+  done
+done
+```
+
+B32 的上一轮 task p50 为 213.8 µs，native 为 194.2 µs。本轮以同卡 native
+的 1.05 倍以内作为“接近”的工程目标（按上轮数据约 204 µs），同时观察
+aiv_vec_ratio 与 0.9 的距离，native 上轮为 0.873。按每轮独立对比，
+用下方 BS1–128 无 profiler 的结果复核时延。另列 mixed_pair，尤其关注 full flush 下的 compact。
+若 vec_ratio 上升而 task 时延增长，性能判定以时延为先。
 
 ### 常规冒烟
 
@@ -117,9 +174,13 @@ for path in native v20 mixed_verify vector_pair mixed_pair; do
       --geometry 27b --batches 32 --flush mixed --path "$path" \
       --iterations 100 --output "$R/prof-b32-$path.json"
 done
-python3 "$P/plot.py" "$R/27b-mixed.json" --out "$R/27b-mixed.svg" \
-  --bandwidth-gbs "$HBM_GBS" --cube-tflops "$CUBE_TFLOPS" \
-  --vector-tflops "$VECTOR_TFLOPS" --roof-source "$CALIBRATION_RUN"
+for geometry in 27b 9b; do
+  for flush in mixed full; do
+    python3 "$P/plot.py" "$R/$geometry-$flush.json" --out "$R/$geometry-$flush.svg" \
+      --bandwidth-gbs "$HBM_GBS" --cube-tflops "$CUBE_TFLOPS" \
+      --vector-tflops "$VECTOR_TFLOPS" --roof-source "$CALIBRATION_RUN"
+  done
+done
 ```
 
 六条默认路径每个场景应有 768 行。Mixed/full 的 verify 使用相同输入。
