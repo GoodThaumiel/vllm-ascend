@@ -54,18 +54,22 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 file(GLOB KERNEL_FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
 
-# Replay AR and non-flush SD verify target only 910B. Other platforms keep their build unchanged.
+# Replay AR has been validated on 910B. Replay SD also targets the
+# Ascend910_9362 used by the single-die Atlas A3 deployment.
 set(VLLM_ASCEND_BUILD_REPLAYSSM_AR FALSE)
 set(VLLM_ASCEND_BUILD_REPLAYSSM_SD FALSE)
 set(VLLM_ASCEND_BUILD_REPLAYSSM_SD_COMPACT FALSE)
 set(VLLM_ASCEND_BUILD_REPLAYSSM_SD_CURSOR FALSE)
 if(SOC_VERSION MATCHES "^[Aa]scend910[Bb]")
     set(VLLM_ASCEND_BUILD_REPLAYSSM_AR TRUE)
+else()
+    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_ar.cpp")
+endif()
+if(SOC_VERSION MATCHES "^[Aa]scend910[Bb]" OR SOC_VERSION STREQUAL "ascend910_9362")
     set(VLLM_ASCEND_BUILD_REPLAYSSM_SD TRUE)
     set(VLLM_ASCEND_BUILD_REPLAYSSM_SD_COMPACT TRUE)
     set(VLLM_ASCEND_BUILD_REPLAYSSM_SD_CURSOR TRUE)
 else()
-    list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_ar.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_reduce.cpp")
     list(REMOVE_ITEM KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/replayssm_sd_verify_bulk.cpp")

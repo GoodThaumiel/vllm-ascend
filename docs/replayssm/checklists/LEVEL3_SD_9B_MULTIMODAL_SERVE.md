@@ -17,6 +17,20 @@ V13 是现有服务路径。V20 已编入主扩展，使用 8 KiB checkpoint 分
 这些数据来自 pos15/T4、mixed flush 的单卡算子实验。V13 和 V20 的多模态服务排名待此轮测量。
 mixed kernel、AIV 历史预取和 verify+compact 融合另有独立算子实验。
 
+## Atlas A3 单 die
+
+本轮 A3 目标为 `Ascend910_9362`。每个进程通过 `ASCEND_RT_VISIBLE_DEVICES` 看到一个逻辑
+设备，使用 TP1。先用 `npu-smi info -m` 确认物理卡、die 与逻辑 ID 的对应，再用运行时
+确认设备名及可用显存。CANN 编译选择 `SOC_VERSION=ascend910_9362`。Blue2 上已用
+CANN 9.2.1、torch-npu 2.10.0.post7、vLLM `0.30.0+empty` 源码构建主扩展。
+
+服务前先跑 [9B 算子检查](LEVEL3_SD_MTP_GEOMETRY.md)，核对 V13/V20 的图回放以及
+Compact v1、MTP3 cursor。服务用下节 TP1 参数，先把 `MAX_SEQS` 设为 4，
+`BATCH_TOKENS` 设为 4096，验证一条文本和一条真实图文请求。看到 ReplaySD
+启用、图捕获完成及 MTP draft 计数增长后，再测 4k/400 和高并发。
+报告随附 SoC、CANN、运行时包版本、主扩展 hash、KV blocks 和 TPOT。A3 使用自己的
+同镜像 native MTP3 对照。
+
 ## 启动及冒烟
 
 从仓库根目录执行。主扩展须包含 V20 launcher，已在该环境运行过 V20 算子测试的主扩展可复用。
