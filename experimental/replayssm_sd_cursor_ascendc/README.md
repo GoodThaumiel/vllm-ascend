@@ -13,6 +13,7 @@ The first implementation uses one AIV core and 32-byte UB staging for every scal
 ```bash
 cmake -S experimental/replayssm_sd_cursor_ascendc \
   -B experimental/replayssm_sd_cursor_ascendc/build \
+  -DCMAKE_BUILD_TYPE=Release \
   -DSOC_VERSION=Ascend910B4 \
   -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.0 \
   -DPython3_EXECUTABLE="$(command -v python3)"
@@ -29,3 +30,28 @@ python3 experimental/replayssm_sd_cursor_ascendc/run.py \
 ```
 
 Check all JSON `status=PASSED`, each case's exact int32/int8 cursor values and graph replay behavior, and `RUNPATH` containing `$ORIGIN/lib`. Compare B1/B32/B64 p50/p90 with the SD verify and flush costs. The timing excludes CPU-side reset and `torch.npu.Event` setup. Report source commit, CANN/torch_npu versions, build log, first failing JSON/log, and NPU health. Stop at the first compile, precision, or graph failure; do not enable MTP serving from these isolated results.
+
+## First-window staggering
+
+The experimental binding accepts `stagger_first=True`. With `P = 1 +
+(L - 2*T) // T`, each reset request gets a first-window threshold of
+`L - phase*T`. Consecutive groups of P ring slots rotate their phase
+assignments. The first folded window clears the pending phase and later
+windows use L. A zero acceptance keeps the existing cursor and flags.
+A reset starts a new first window even if the physical ring wraps.
+
+The cursor stores the pending phase in bit 1 of `is_flush`. Its caller
+passes only bit 0 to verify and compact. The experimental service masks
+the flag for both sides of the comparison to hold that dispatch cost
+constant. Both modes use the same grouped fused verify binary.
+
+```bash
+python3 experimental/replayssm_sd_cursor_ascendc/run.py \
+  --stage perf --batch 128 --mtp-size 3 --iterations 25 --stagger-first \
+  --output /tmp/replayssm-sd-cursor-stagger-b128.json
+```
+
+The graph probe also replays 40 successive windows, compares every cursor
+field with the CPU reference, records simultaneous flush counts and checks
+that the first-window bit clears. On Blue2 910C use
+`-DSOC_VERSION=ascend910_9362` and the matching CANN 9.2.1 path.

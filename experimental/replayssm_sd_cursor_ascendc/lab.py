@@ -7,6 +7,8 @@ from __future__ import annotations
 import torch
 
 MUTABLE = ("write_pos", "cache_base", "is_flush", "status")
+FLUSH_BIT = 1
+FIRST_FLUSH_PENDING = 2
 
 
 def make_case(
@@ -38,9 +40,25 @@ def clone_case(case: dict[str, torch.Tensor], device: str | torch.device = "cpu"
 
 
 def reference_step(
-    case: dict[str, torch.Tensor], *, logical_limit: int = 20, max_spec_len: int = 4, ring_len: int = 32
+    case: dict[str, torch.Tensor],
+    *,
+    logical_limit: int = 20,
+    max_spec_len: int = 4,
+    ring_len: int = 32,
+    stagger_first: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Match the device kernel; operate only on CPU tensors."""
+    if stagger_first and logical_limit < 2 * max_spec_len:
+        raise ValueError("Staggering requires room for two verify windows")
+
+    def next_flags(slot: int, pos: int, pending: bool) -> int:
+        limit = logical_limit
+        if pending:
+            phases = 1 + (logical_limit - 2 * max_spec_len) // max_spec_len
+            index = slot - 1
+            limit -= ((index + index // phases) % phases) * max_spec_len
+        return (FIRST_FLUSH_PENDING if pending else 0) | int(pos + 2 * max_spec_len > limit)
+
     out = clone_case(case)
     out["status"].zero_()
     num_slots = out["write_pos"].numel()
@@ -54,7 +72,7 @@ def reference_step(
         if int(out["do_reset"][row]):
             out["write_pos"][slot] = 0
             out["cache_base"][slot] = 0
-            out["is_flush"][slot] = int(2 * max_spec_len > logical_limit)
+            out["is_flush"][slot] = next_flags(slot, 0, stagger_first)
             continue
         old_pos = int(out["write_pos"][slot])
         old_base = int(out["cache_base"][slot])
@@ -63,18 +81,20 @@ def reference_step(
         if accepted < 0 or accepted > max_spec_len:
             out["status"][row] = 2
             continue
-        if not 0 <= old_pos <= logical_limit or not 0 <= old_base < ring_len or old_flush not in (0, 1):
+        max_flags = FLUSH_BIT | FIRST_FLUSH_PENDING if stagger_first else FLUSH_BIT
+        if not 0 <= old_pos <= logical_limit or not 0 <= old_base < ring_len or not 0 <= old_flush <= max_flags:
             out["status"][row] = 3
             continue
         if accepted == 0:
             continue
-        next_pos = (0 if old_flush else old_pos) + accepted
+        folded = bool(old_flush & FLUSH_BIT)
+        next_pos = (0 if folded else old_pos) + accepted
         if next_pos > logical_limit:
             out["status"][row] = 4
             continue
-        out["cache_base"][slot] = ((old_base + old_pos) & (ring_len - 1)) if old_flush else old_base
+        out["cache_base"][slot] = ((old_base + old_pos) & (ring_len - 1)) if folded else old_base
         out["write_pos"][slot] = next_pos
-        out["is_flush"][slot] = int(next_pos + 2 * max_spec_len > logical_limit)
+        out["is_flush"][slot] = next_flags(slot, next_pos, not folded and bool(old_flush & FIRST_FLUSH_PENDING))
     return out
 
 
@@ -84,6 +104,7 @@ def invoke(
     max_spec_len: int = 4,
     ring_len: int = 32,
     backend: str = "lab",
+    stagger_first: bool = False,
 ) -> None:
     if backend == "lab":
         op = torch.ops.replayssm_sd_cursor_lab.step_
@@ -93,6 +114,9 @@ def invoke(
         op = replayssm_sd_cursor
     else:
         raise ValueError(f"Unknown backend: {backend}")
+    if stagger_first and backend != "lab":
+        raise ValueError("Staggered cursor is available through the experimental binding")
+    kwargs = {"stagger_first": True} if stagger_first else {}
     op(
         case["write_pos"],
         case["cache_base"],
@@ -104,4 +128,5 @@ def invoke(
         logical_limit,
         max_spec_len,
         ring_len,
+        **kwargs,
     )

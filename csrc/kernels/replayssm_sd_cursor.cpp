@@ -6,6 +6,9 @@
 using namespace AscendC;
 
 namespace {
+constexpr int32_t FLUSH_BIT = 1;
+constexpr int32_t FIRST_FLUSH_PENDING = 2;
+
 // Cursor work is O(B) scalar metadata. One AIV core owns every update so
 // different cores never write different words of one GM cache line. The caller
 // guarantees each positive physical slot appears once in the row list.
@@ -15,7 +18,7 @@ class ReplaySDCursor {
                               GM_ADDR accepted, GM_ADDR slots, GM_ADDR doReset,
                               GM_ADDR status, uint32_t batch, uint32_t numSlots,
                               uint32_t logicalLimit, uint32_t maxSpecLen,
-                              uint32_t ringLen) {
+                              uint32_t ringLen, uint32_t staggerFirst) {
     wp_.SetGlobalBuffer((__gm__ int32_t*)writePos);
     base_.SetGlobalBuffer((__gm__ int32_t*)cacheBase);
     flush_.SetGlobalBuffer((__gm__ int8_t*)isFlush);
@@ -28,6 +31,8 @@ class ReplaySDCursor {
     logicalLimit_ = logicalLimit;
     maxSpecLen_ = maxSpecLen;
     ringLen_ = ringLen;
+    staggerFirst_ = staggerFirst != 0;
+    phaseCount_ = staggerFirst_ ? 1 + (logicalLimit_ - 2 * maxSpecLen_) / maxSpecLen_ : 1;
     if (UseBatchTransfers()) {
       const uint32_t rowBytes = Align32(batch_ * sizeof(int32_t));
       const uint32_t slotBytes = Align32(numSlots_ * sizeof(int32_t));
@@ -44,7 +49,6 @@ class ReplaySDCursor {
       ProcessBatched();
       return;
     }
-    const int32_t initialFlush = 2 * maxSpecLen_ > logicalLimit_ ? 1 : 0;
     for (uint32_t row = 0; row < batch_; ++row) {
       const int32_t slot = Read(slots_, row);
       if (slot == 0) {
@@ -60,7 +64,7 @@ class ReplaySDCursor {
       if (Read(reset_, row) != 0) {
         Write(wp_, slot, 0);
         Write(base_, slot, 0);
-        Write(flush_, slot, static_cast<int8_t>(initialFlush));
+        Write(flush_, slot, NextFlags(slot, 0, staggerFirst_));
         Write(status_, row, 0);
         continue;
       }
@@ -75,7 +79,7 @@ class ReplaySDCursor {
       }
       if (oldWp < 0 || oldWp > static_cast<int32_t>(logicalLimit_) ||
           oldBase < 0 || oldBase >= static_cast<int32_t>(ringLen_) ||
-          (oldFlush != 0 && oldFlush != 1)) {
+          !ValidFlags(oldFlush)) {
         Write(status_, row, 3);
         continue;
       }
@@ -84,20 +88,40 @@ class ReplaySDCursor {
         continue;
       }
 
-      const int32_t newWp = (oldFlush != 0 ? 0 : oldWp) + n;
+      const bool folded = (oldFlush & FLUSH_BIT) != 0;
+      const int32_t newWp = (folded ? 0 : oldWp) + n;
       if (newWp > static_cast<int32_t>(logicalLimit_)) {
         Write(status_, row, 4);
         continue;
       }
-      const int32_t newBase = oldFlush != 0 ? (oldBase + oldWp) & (ringLen_ - 1) : oldBase;
+      const int32_t newBase = folded ? (oldBase + oldWp) & (ringLen_ - 1) : oldBase;
       Write(base_, slot, newBase);
       Write(wp_, slot, newWp);
-      Write(flush_, slot, static_cast<int8_t>(newWp + 2 * maxSpecLen_ > logicalLimit_));
+      Write(flush_, slot, NextFlags(slot, newWp, !folded && (oldFlush & FIRST_FLUSH_PENDING)));
       Write(status_, row, 0);
     }
   }
 
  private:
+  __aicore__ inline bool ValidFlags(int32_t flags) const {
+    const int32_t validBits = staggerFirst_ ? FLUSH_BIT | FIRST_FLUSH_PENDING : FLUSH_BIT;
+    return flags >= 0 && (flags & ~validBits) == 0;
+  }
+
+  __aicore__ inline int8_t NextFlags(uint32_t slot, uint32_t pos, bool firstPending) const {
+    uint32_t limit = logicalLimit_;
+    if (firstPending) {
+      // Shorten only the first window. The pending bit is independent of
+      // the physical ring base, which can wrap back to zero later.
+      const uint32_t index = slot - 1;
+      // Rotate assignments across consecutive groups so a phase cohort
+      // does not repeatedly align with the same Cube block interval.
+      limit -= ((index + index / phaseCount_) % phaseCount_) * maxSpecLen_;
+    }
+    return static_cast<int8_t>((firstPending ? FIRST_FLUSH_PENDING : 0) |
+                               (pos + 2 * maxSpecLen_ > limit ? FLUSH_BIT : 0));
+  }
+
   __aicore__ inline bool UseBatchTransfers() const {
     return batch_ >= 32 && batch_ <= 1024 && numSlots_ <= 1024;
   }
@@ -151,11 +175,13 @@ class ReplaySDCursor {
       int32_t status = 0;
       int32_t newPos = 0;
       int32_t newBase = 0;
+      bool firstPending = false;
       bool write = false;
       if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
         status = 1;
       } else if (slot != 0) {
         if (resets.GetValue(row) != 0) {
+          firstPending = staggerFirst_;
           write = true;
         } else if (n < 0 || n > static_cast<int32_t>(maxSpecLen_)) {
           status = 2;
@@ -165,11 +191,13 @@ class ReplaySDCursor {
           const int32_t oldFlush = flushes.GetValue(slot);
           if (oldPos < 0 || oldPos > static_cast<int32_t>(logicalLimit_) ||
               oldBase < 0 || oldBase >= static_cast<int32_t>(ringLen_) ||
-              (oldFlush != 0 && oldFlush != 1)) {
+              !ValidFlags(oldFlush)) {
             status = 3;
           } else if (n != 0) {
-            newPos = (oldFlush != 0 ? 0 : oldPos) + n;
-            newBase = oldFlush != 0 ? (oldBase + oldPos) & (ringLen_ - 1) : oldBase;
+            const bool folded = (oldFlush & FLUSH_BIT) != 0;
+            newPos = (folded ? 0 : oldPos) + n;
+            newBase = folded ? (oldBase + oldPos) & (ringLen_ - 1) : oldBase;
+            firstPending = !folded && (oldFlush & FIRST_FLUSH_PENDING);
             if (newPos > static_cast<int32_t>(logicalLimit_)) {
               status = 4;
             } else {
@@ -183,7 +211,7 @@ class ReplaySDCursor {
       if (write) {
         newPositions.SetValue(row * 8, newPos);
         newBases.SetValue(row * 8, newBase);
-        newFlushes.SetValue(row * 32, static_cast<int8_t>(newPos + 2 * maxSpecLen_ > logicalLimit_));
+        newFlushes.SetValue(row * 32, NextFlags(slot, newPos, firstPending));
       }
     }
 
@@ -240,7 +268,8 @@ class ReplaySDCursor {
   TBuf<QuePosition::VECCALC> batchInput_, batchOutput_;
   GlobalTensor<int32_t> wp_, base_, accepted_, slots_, status_;
   GlobalTensor<int8_t> flush_, reset_;
-  uint32_t batch_, numSlots_, logicalLimit_, maxSpecLen_, ringLen_;
+  uint32_t batch_, numSlots_, logicalLimit_, maxSpecLen_, ringLen_, phaseCount_;
+  bool staggerFirst_;
 };
 }  // namespace
 
@@ -248,10 +277,10 @@ extern "C" __global__ __aicore__ void replayssm_sd_cursor(
     GM_ADDR writePos, GM_ADDR cacheBase, GM_ADDR isFlush, GM_ADDR accepted,
     GM_ADDR slots, GM_ADDR doReset, GM_ADDR status, uint32_t batch,
     uint32_t numSlots, uint32_t logicalLimit, uint32_t maxSpecLen,
-    uint32_t ringLen) {
+    uint32_t ringLen, uint32_t staggerFirst) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   ReplaySDCursor op;
   op.Init(writePos, cacheBase, isFlush, accepted, slots, doReset, status,
-          batch, numSlots, logicalLimit, maxSpecLen, ringLen);
+          batch, numSlots, logicalLimit, maxSpecLen, ringLen, staggerFirst);
   op.Process();
 }

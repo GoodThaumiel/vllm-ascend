@@ -16,7 +16,7 @@ void replayssm_sd_cursor(const at::Tensor& write_pos, const at::Tensor& cache_ba
                          const at::Tensor& is_flush, const at::Tensor& accepted,
                          const at::Tensor& slots, const at::Tensor& do_reset,
                          const at::Tensor& status, int64_t logical_limit,
-                         int64_t max_spec_len, int64_t ring_len) {
+                         int64_t max_spec_len, int64_t ring_len, bool stagger_first) {
   TORCH_CHECK(write_pos.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   TORCH_CHECK(write_pos.dim() == 1 && write_pos.numel() > 1 && write_pos.is_contiguous() &&
                   write_pos.scalar_type() == at::kInt,
@@ -49,6 +49,8 @@ void replayssm_sd_cursor(const at::Tensor& write_pos, const at::Tensor& cache_ba
                   ring_len >= logical_limit && ring_len <= 128 &&
                   (ring_len & (ring_len - 1)) == 0,
               "Invalid logical_limit/max_spec_len/ring_len");
+  TORCH_CHECK(!stagger_first || logical_limit >= 2 * max_spec_len,
+              "Staggering requires room for two verify windows");
   TORCH_CHECK(batch <= std::numeric_limits<uint32_t>::max() &&
                   num_slots <= std::numeric_limits<uint32_t>::max(),
               "Tensor geometry exceeds uint32 range");
@@ -59,7 +61,7 @@ void replayssm_sd_cursor(const at::Tensor& write_pos, const at::Tensor& cache_ba
       accepted.data_ptr(), slots.data_ptr(), do_reset.data_ptr(), status.data_ptr(),
       static_cast<uint32_t>(batch), static_cast<uint32_t>(num_slots),
       static_cast<uint32_t>(logical_limit), static_cast<uint32_t>(max_spec_len),
-      static_cast<uint32_t>(ring_len));
+      static_cast<uint32_t>(ring_len), static_cast<uint32_t>(stagger_first));
   TORCH_CHECK(result == ACL_SUCCESS, "Replay SD cursor launch failed: ", result);
 }
 }  // namespace vllm_ascend

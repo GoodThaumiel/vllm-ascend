@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 
 import torch
-from lab import MUTABLE, clone_case, invoke, make_case, reference_step
+from lab import FIRST_FLUSH_PENDING, FLUSH_BIT, MUTABLE, clone_case, invoke, make_case, reference_step
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -100,6 +100,7 @@ def main() -> None:
     parser.add_argument("--backend", choices=("lab", "framework"), default="lab")
     parser.add_argument("--mtp-size", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--stagger-first", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     max_tokens = args.mtp_size + 1
@@ -107,7 +108,11 @@ def main() -> None:
     if args.batch < 1 or args.batch > 256 or args.iterations < 1:
         parser.error("batch must be 1..256 and iterations must be positive")
 
+    if args.stagger_first and args.backend != "lab":
+        parser.error("Use --backend lab for --stagger-first")
+    policy = {"stagger_first": args.stagger_first}
     report = {
+        "stagger_first": args.stagger_first,
         "stage": args.stage,
         "device": args.device,
         "batch": args.batch,
@@ -150,25 +155,54 @@ def main() -> None:
                 capacity = source["write_pos"].numel()
                 if capacity not in allocations:
                     allocated = clone_case(source, device)
-                    invoke(allocated, logical_limit, max_tokens, backend=args.backend)
+                    invoke(allocated, logical_limit, max_tokens, backend=args.backend, **policy)
                     torch.npu.synchronize()
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph):
-                        invoke(allocated, logical_limit, max_tokens, backend=args.backend)
+                        invoke(allocated, logical_limit, max_tokens, backend=args.backend, **policy)
                     allocations[capacity] = allocated, graph
 
         for name, source in scenarios:
             if args.stage == "smoke":
                 allocated = clone_case(source, device)
-                invoke(allocated, logical_limit, max_tokens, backend=args.backend)
+                invoke(allocated, logical_limit, max_tokens, backend=args.backend, **policy)
             else:
                 allocated, graph = allocations[source["write_pos"].numel()]
                 for key, tensor in source.items():
                     allocated[key].copy_(tensor.to(device))
                 graph.replay()
             torch.npu.synchronize()
-            compare(allocated, reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens))
+            compare(allocated, reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens, **policy))
             report["cases"].append({"name": name, "status": "PASSED"})
+
+        if args.stagger_first:
+            source = make_case(batch=args.batch, slots=args.batch + 1)
+            source["do_reset"].fill_(1)
+            source["accepted"].fill_(max_tokens)
+            allocated = clone_case(source, device)
+            graph = None
+            if args.stage != "smoke":
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    invoke(allocated, logical_limit, max_tokens, backend=args.backend, **policy)
+            flush_counts = []
+            for step in range(40):
+                allocated["do_reset"].fill_(int(step == 0))
+                source["do_reset"].fill_(int(step == 0))
+                source = reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens, **policy)
+                if graph is None:
+                    invoke(allocated, logical_limit, max_tokens, backend=args.backend, **policy)
+                else:
+                    graph.replay()
+                compare(allocated, source)
+                flags = source["is_flush"][1:]
+                flush_counts.append(int((flags & FLUSH_BIT).sum()))
+            assert not (flags & FIRST_FLUSH_PENDING).any(), "first flush pending after 40 windows"
+            phases = 1 + (logical_limit - 2 * max_tokens) // max_tokens
+            assert max(flush_counts) <= (args.batch + phases - 1) // phases, "flush cohorts were not staggered"
+            report["cases"].append(
+                {"name": "stagger_wrap_and_restore_threshold", "status": "PASSED", "flush_counts": flush_counts}
+            )
 
         if args.stage == "perf":
             timings = {}
@@ -188,7 +222,9 @@ def main() -> None:
                     end.record()
                     end.synchronize()
                     samples.append(start.elapsed_time(end) * 1000)
-                compare(allocated, reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens))
+                compare(
+                    allocated, reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens, **policy)
+                )
                 ordered = sorted(samples)
                 timings[name] = {
                     "device_us_p50": statistics.median(samples),

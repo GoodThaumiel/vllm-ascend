@@ -747,3 +747,31 @@ V25 为 150.58/151.91 ms，混合整组为 134.17/137.36 ms，
 活跃行数，不能据此验收同活跃 batch 的 forward。长文本
 p50 的回退以及按活跃行数对齐后的 forward 仍需查明。
 原始结果位于 Blue2 的 `serve-mixed-packed.GHPMH4/results-long`。
+
+### 首次 flush 错峰的算子探针
+
+有同步重步的根因证据来自 9B 短文本实测的 **124/128 行同时
+flush**。实验 cursor 在请求重置时按 ring slot 分配首次折叠
+阈值，MTP3 的四档为 20/16/12/8。每档仍保留两个 verify
+窗口的原容量约束。首次折叠完成后恢复 20，后续 ring
+绕回物理 0 也不会重做错峰。实验使用 cursor 私有状态的高位，
+在传入 verify 前只取 flush 位。
+
+Blue2 Ascend910_9362 die 13，CANN 9.2.1。MTP3
+B1/B32/B128/B256 每组默认与实验均通过标量或批量读写、状态
+校验和图回放。实验组捕获后连续回放 40 个满接受窗口，
+全部与 CPU cursor 参考逐元素一致。B32/B128/B256 单步
+最多有 8/32/64 行 flush。MTP1、MTP2 B32 的峰值为 4、7 行。
+首个窗口之后持续触发重放和环绕，状态位均能清除。
+4 项 CPU cursor 单测通过。
+
+B128 的 reset 图时延 p50 为默认 65.20 µs、错峰 69.56 µs，
+B256 为 60.30 和 58.02 µs。各 25 次回放，运行中常规
+分支约 50–71 µs，样本波动足以覆盖数微秒的差异。
+这些图只运行 cursor，未计入服务侧取 flush 位的成本。
+结果证明同步满接受场景下可在 cursor 层分散峰值，真实请求
+是否仍保持收益取决于接受长度、请求补入和 checkpoint
+重舍入。服务独立 A/B 通过同一个实验 cursor 库及同一个
+整组轮转 verify，数据存于
+`/home/lmt_infer/replayssm/serve-stagger.qZP3qP`。
+算子报告位于 `cursor-stagger.o9PMAu/results`。
