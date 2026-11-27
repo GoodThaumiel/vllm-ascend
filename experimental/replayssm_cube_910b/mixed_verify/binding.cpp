@@ -6,6 +6,7 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include "aclrtlaunch_replayssm_sd_verify_mix_910b.h"
 
 namespace {
@@ -15,7 +16,8 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& slots, const at::Tensor& ringSlots, const at::Tensor& pos,
             const at::Tensor& base, const at::Tensor& length, const at::Tensor& out,
             const at::Tensor& status, const at::Tensor& zeros, const at::Tensor& scratch,
-            int64_t cores, bool packed_panel, bool suffix_history, bool bulk_qkv, bool balance_heads, int64_t aiv_ablation) {
+            int64_t cores, bool packed_panel, bool suffix_history, bool bulk_qkv, bool balance_heads, int64_t aiv_ablation,
+            std::optional<at::Tensor> flush) {
   TORCH_CHECK(q.device().is_privateuseone() && q.dim() == 4, "q must be a rank-4 NPU tensor");
   const auto b = q.size(0), hk = q.size(2);
   TORCH_CHECK(v.dim() == 4, "v must be rank-4");
@@ -25,7 +27,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(cores >= 1 && cores <= 20, "cores must be 1..20 on 910B4");
   TORCH_CHECK(packed_panel || (!suffix_history && !bulk_qkv), "AIV ablations require the packed panel");
   TORCH_CHECK(!suffix_history || !bulk_qkv, "Run suffix history and bulk QKV as separate ablations");
-  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= 3, "Invalid AIV ablation");
+  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= 4, "Invalid AIV ablation");
   TORCH_CHECK(aiv_ablation == 0 || (packed_panel && bulk_qkv && !suffix_history),
               "AIV ablations require the bulk-QKV packed baseline");
   TORCH_CHECK(checkpoint.dim() == 4 && d.dim() == 4, "checkpoint/D must be rank-4");
@@ -51,6 +53,10 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   for (auto& t : {slots, ringSlots, pos, base, length}) {
     expect(t, {b}, at::kInt, "metadata");
   }
+  TORCH_CHECK((aiv_ablation == 4) == flush.has_value(), "Fused Compact requires a flush tensor");
+  if (flush.has_value()) {
+    expect(*flush, {b}, at::kInt, "flush");
+  }
   expect(status, {b * hv}, at::kInt, "status");
   expect(zeros, {16, 128}, at::kBFloat16, "zero RHS");
   TORCH_CHECK(scratch.dim() == 3, "scratch must be rank-3");
@@ -66,7 +72,8 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       static_cast<uint32_t>(blocks), stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
       beta.data_ptr(), checkpoint.data_ptr(), d.data_ptr(), keys.data_ptr(), gates.data_ptr(), slots.data_ptr(),
       ringSlots.data_ptr(), pos.data_ptr(), base.data_ptr(), length.data_ptr(), out.data_ptr(), status.data_ptr(),
-      zeros.data_ptr(), scratch.data_ptr(), static_cast<uint32_t>(b), static_cast<uint32_t>(hk),
+      zeros.data_ptr(), scratch.data_ptr(), flush.has_value() ? flush->data_ptr() : slots.data_ptr(),
+      static_cast<uint32_t>(b), static_cast<uint32_t>(hk),
       static_cast<uint32_t>(hv), static_cast<uint32_t>(numSlots), static_cast<uint32_t>(numRingSlots),
       static_cast<uint32_t>(blocks), static_cast<uint32_t>(perHeadWorkspace), panel_mode, static_cast<uint32_t>(balance_heads));
   TORCH_CHECK(rc == ACL_SUCCESS, "910B mixed verify launch failed: ", rc);
@@ -74,11 +81,11 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
 }  // namespace
 
 TORCH_LIBRARY(replayssm_mix_910b, m) {
-  m.def("verify_(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor checkpoint, "
+  m.def("verify_(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor(g!) checkpoint, "
         "Tensor(a!) d, Tensor(b!) keys, Tensor(c!) gates, Tensor slots, Tensor ring_slots, "
         "Tensor positions, Tensor bases, Tensor lengths, Tensor(d!) out, Tensor(e!) status, "
         "Tensor zeros, Tensor(f!) scratch, int cores, bool packed_panel=False, "
-        "bool suffix_history=False, bool bulk_qkv=False, bool balance_heads=False, int aiv_ablation=0) -> ()");
+        "bool suffix_history=False, bool bulk_qkv=False, bool balance_heads=False, int aiv_ablation=0, Tensor? flush=None) -> ()");
 }
 TORCH_LIBRARY_IMPL(replayssm_mix_910b, PrivateUse1, m) {
   m.impl("verify_", &Verify);

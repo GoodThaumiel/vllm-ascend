@@ -449,3 +449,64 @@ head 均分后，tile64 组合为 224.24 µs，进一步减到 16 Cube 为
 246.04 µs。无 flush 的单独 Compact 图约 48.44 µs，其中包括
 图回放固定开销，不能直接从组合时延中扣减。这组数据不支持继续
 用这些 tile、核数或任务均分配置消除剩余差距。
+
+### 混合 verify 内融合 AIV checkpoint 折叠
+
+`mixed_fused_fold` 以整窗历史修正为基线。AIC 仍按 key-head 分组
+计算 checkpoint 投影。两个 AIV 各拥有 64 行，收到 READY 并
+读完投影后，仅对 flush 行预取自己的 BF16 checkpoint tile。
+候选输出完成后，用 UB 内已有的后缀加权 D、历史 K 和总衰减折叠
+checkpoint。计算为 FP32，写回为 BF16。折叠复用整窗历史的乘积
+缓冲区。非 flush 和 pos0 均跳过 checkpoint 搬入和写回。
+实验算子在图内提交一次。Torch schema 标记了 checkpoint mutation，
+旧实验 variant 仍可按原接口调用。
+
+用上一节的混合核编译方式，测试时加入 `mixed_fused_fold`。
+例如复现 27B B32 的随机轻 flush 对照。
+
+```bash
+python3 experimental/replayssm_cube_910b/run.py --suite mixed --geometry 27b \
+  --batches 32 --layers 48 --pos 16 --nonflush-pos 7 --base 31 \
+  --flush-count 4 --flush-layout random --mixed-qkv \
+  --path native mixed_history_panel mixed_fused_fold fused_v25 \
+  --mixed-library build-mix/libreplayssm_sd_mix_torch.so \
+  --compact-library "$compact" --verify-library "$verify" --iterations 20 \
+  --output /tmp/replay-mixed-fused-fold.json
+```
+
+Blue2 910C 单 die，CANN 9.2.1，torch-npu 2.10.0.post7。
+基于 `d727cf8` 的本次实验。20 AIC、40 AIV，T4、base31，
+非 flush pos7，flush pos16。旧整窗组合用 Compact V6 tile64。
+以下为随机 12.5% flush 的 GDN stack 图回放 p50，单位 ms。
+
+| 几何和 batch | Native | 整窗历史 + Compact V6 | 整窗历史内融合折叠 | V25 |
+|---|---:|---:|---:|---:|
+| 27B TP4 B32，48 层 | 9.064 | 9.955 | 9.082 | 11.592 |
+| 27B TP4 B64，48 层 | 17.741 | 17.781 | 16.462 | 21.922 |
+| 9B TP1 B128，24 层 | 44.790 | 41.458 | 38.849 | 56.078 |
+| 9B TP1 B256，24 层 | 88.958 | 80.459 | 75.801 | 110.734 |
+
+27B B32 F4 的独立 msprof 采样用同一形状和布局。末尾 35 次
+任务的中位时延中，独立混合 verify 为 149.22 µs，Compact V6 为
+54.12 µs。融合的混合任务为 185.32 µs，图中没有独立的 Compact
+任务。这个结果与 stack 图回放少约 0.87 ms 的方向一致。
+
+| 几何和 batch | 50% flush 的摆放 | Native | 整窗历史 + V6 | 融合 | V25 |
+|---|---|---:|---:|---:|---:|
+| 27B TP4 B32 | prefix / random | 204 / 198 | 297 / 332 | 279 / 283 | 288 / 298 |
+| 27B TP4 B64 | prefix / random | 376 / 376 | 519 / 542 | 474 / 494 | 531 / 537 |
+| 9B TP1 B128 | prefix / random | 1874 / 1874 | 2657 / 2729 | 2365 / 2427 | 2733 / 2772 |
+| 9B TP1 B256 | prefix / random | 3710 / 3710 | 5265 / 5323 | 4657 / 4724 | 5420 / 5471 |
+
+半 flush 表为单层图 p50，单位 µs。融合改善了重路径和摆放造成的
+波动，仍显著慢于 native。27B 两个相邻 batch 在同样 spread F2 下，
+B16/B18 分别为融合 137/146 µs，native 108/125 µs。这个范围仍
+比 native 慢，B16 到 B18 的相对差距没有扩大。当前证据支持低
+flush 的融合路径，但单 die 的算子图无法验证真实服务收益。
+
+本轮 34 份设备报告和 15 项 CPU 单测通过。B4 精度专项覆盖
+T1–T4、pos0 和跨环尾的 pos16。捕获后原地将 flush 清零再回放，
+候选输出仍满足同一参考，两个 checkpoint tile 都保持原始值。
+专项最大绝对差为 checkpoint 2.44e-4、候选输出 1.53e-5。
+服务接入的当前依赖是让混合算子消费紧凑 token offset 和实际
+checkpoint page stride，随后复测目标 forward 和 HTTP。

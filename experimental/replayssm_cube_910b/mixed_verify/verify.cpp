@@ -37,7 +37,7 @@ struct Inputs {
   GlobalTensor<bfloat16_t> q, k, v, checkpoint, out, zeros;
   GlobalTensor<half> d, keys;
   GlobalTensor<float> g, beta, gates, scratch;
-  GlobalTensor<int32_t> slots, ringSlots, pos, base, length, status;
+  GlobalTensor<int32_t> slots, ringSlots, pos, base, length, status, flush;
   uint32_t batch, hk, hv, numSlots, numRingSlots, blocks;
   bool perHeadWorkspace, balanceHeads;
 
@@ -190,11 +190,12 @@ class Projector {
 
 #ifdef __DAV_C220_VEC__
 template <uint32_t PanelCols, bool SuffixHistory = false, bool BulkQkv = false,
-          bool BatchHistory = false, bool TriangularSolve = false>
+          bool BatchHistory = false, bool TriangularSolve = false, bool FuseFold = false>
 class Consumer {
   static constexpr uint32_t PANEL = TILE * PanelCols;
   static_assert(!BatchHistory || (PanelCols == 2 * TOKENS && SuffixHistory));
   static_assert(!TriangularSolve || (PanelCols == 2 * TOKENS && BulkQkv));
+  static_assert(!FuseFold || (BatchHistory && !TriangularSolve));
 
  public:
   __aicore__ inline void Run(Inputs &x) {
@@ -214,7 +215,15 @@ class Consumer {
       const int32_t pos = x.pos.GetValue(row);
       const int32_t base = x.base.GetValue(row);
       const int32_t len = x.length.GetValue(row);
-      const int32_t error = Validate(x, slot, ring, pos, base, len);
+      int32_t error = Validate(x, slot, ring, pos, base, len);
+      bool fold = false;
+      if constexpr (FuseFold) {
+        const int32_t flush = x.flush.GetValue(row);
+        if (error == 0 && (flush < 0 || flush > 1 || (slot == 0 && flush != 0))) {
+          error = 6;
+        }
+        fold = error == 0 && slot != 0 && flush == 1 && pos > 0;
+      }
       const bool valid = error == 0 && slot != 0;
       if (valid) {
         MakeDots(x, row, key, ring, pos, base, len);
@@ -245,7 +254,22 @@ class Consumer {
         // After the read, the projection lives in this AIV's private UB.
         CrossCoreSetFlag<MIX_MODE, PIPE_MTE2>(CONSUMED);
         if (valid) {
-          Correct(x, row, head, ring, pos, base, len, vStart);
+          uint64_t stateTile = 0;
+          if constexpr (FuseFold) {
+            if (fold) {
+              stateTile = ((static_cast<uint64_t>(slot) * x.hv + head) * DIM + vStart) * DIM;
+              // READY covers the AIC's checkpoint read for this head.
+              auto dst = foldIn_.AllocTensor<bfloat16_t>();
+              DataCopy(dst, x.checkpoint[stateTile], TILE * DIM);
+              foldIn_.EnQue(dst);
+            }
+          }
+          const float alpha = Correct(x, row, head, ring, pos, base, len, vStart);
+          if constexpr (FuseFold) {
+            if (fold) {
+              FoldCheckpoint(x.checkpoint[stateTile], pos, alpha);
+            }
+          }
         }
         if (!valid || len < TOKENS) {
           ZeroTail(x, row, head, vStart, valid ? len : 0);
@@ -293,6 +317,12 @@ class Consumer {
     }
     if constexpr (TriangularSolve) {
       pipe_.InitBuffer(solvedDeltas_, TOKENS * TILE * sizeof(float));
+    }
+    if constexpr (FuseFold) {
+      pipe_.InitBuffer(historyKeys_, HISTORY * DIM * sizeof(float));
+      pipe_.InitBuffer(foldState_, TILE * DIM * sizeof(float));
+      pipe_.InitBuffer(foldIn_, 1, TILE * DIM * sizeof(bfloat16_t));
+      pipe_.InitBuffer(foldOut_, 1, TILE * DIM * sizeof(bfloat16_t));
     }
     pipe_.InitBuffer(scalarOut_, 32);
     // MTE2 can enqueue gate copies while the V wait on the projection is
@@ -383,9 +413,9 @@ class Consumer {
     historyIn_.EnQue(input);
   }
 
-  __aicore__ inline void CastHistory(uint32_t count) {
+  __aicore__ inline void CastHistory(LocalTensor<float> dst, uint32_t count) {
     auto input = historyIn_.DeQue<half>();
-    Cast(historyRows_.Get<float>(), input, RoundMode::CAST_NONE, count);
+    Cast(dst, input, RoundMode::CAST_NONE, count);
     PipeBarrier<PIPE_V>();
     historyIn_.FreeTensor(input);
   }
@@ -409,10 +439,13 @@ class Consumer {
         LoadCast(rhs[(TOKENS + t) * DIM], x.q[off + t * x.hk * DIM], DIM);
       }
     }
-    if (pos) {
-      CastHistory(pos * DIM);
-    }
     auto rows = historyRows_.Get<float>();
+    if constexpr (FuseFold) {
+      rows = historyKeys_.Get<float>();
+    }
+    if (pos) {
+      CastHistory(rows, pos * DIM);
+    }
     for (uint32_t i = 0; i < pos; ++i) {
       Dot(i, rows[i * DIM]);
     }
@@ -566,7 +599,7 @@ class Consumer {
     }
   }
 
-  __aicore__ inline void Correct(Inputs &x, uint32_t row, uint32_t head, uint32_t ring, uint32_t pos,
+  __aicore__ inline float Correct(Inputs &x, uint32_t row, uint32_t head, uint32_t ring, uint32_t pos,
                                  uint32_t base, uint32_t len, uint32_t vStart) {
     auto proj = proj_.Get<float>();
     auto d = delta_.Get<float>();
@@ -590,10 +623,11 @@ class Consumer {
     if constexpr (BulkQkv) {
       LoadCandidateRows(values_.Get<float>(), x.v[x.Output(row, 0, head) + vStart], len, TILE, x.hv * DIM);
     }
-    if (pos) {
-      CastHistory(pos * TILE);
-    }
     auto rows = historyRows_.Get<float>();
+    if (pos) {
+      CastHistory(rows, pos * TILE);
+    }
+    float historyDecay = 1.0f;
     if constexpr (SuffixHistory) {
       if (pos != 0) {
         // Move the per-history gate scales to D and scale the whole panel
@@ -605,7 +639,8 @@ class Consumer {
           Muls(delta, delta, suffix, TILE);
           suffix *= gates.GetValue(i < first ? i : RING + i - first);
         }
-        Muls(proj, proj, suffix, PANEL);
+        historyDecay = suffix;
+        Muls(proj, proj, historyDecay, PANEL);
         PipeBarrier<PIPE_V>();
       }
     }
@@ -623,7 +658,7 @@ class Consumer {
     }
     if constexpr (TriangularSolve) {
       SolveCandidates(x, x.Output(row, 0, head), ringHead, base, pos, len, vStart, decay, beta, logGate);
-      return;
+      return historyDecay;
     }
     for (uint32_t t = 0; t < len; ++t) {
       const uint64_t out = x.Output(row, t, head);
@@ -654,6 +689,39 @@ class Consumer {
         StoreScalar(x.gates[ringHead + record], logGate.GetValue(lane));
       }
     }
+    return historyDecay;
+  }
+
+  __aicore__ inline void FoldCheckpoint(GlobalTensor<bfloat16_t> dst, uint32_t pos, float alpha) {
+    auto state = foldState_.Get<float>();
+    auto input = foldIn_.DeQue<bfloat16_t>();
+    Cast(state, input, RoundMode::CAST_NONE, TILE * DIM);
+    PipeBarrier<PIPE_V>();
+    foldIn_.FreeTensor(input);
+
+    auto products = historyPanels_.Get<float>();
+    auto keys = historyKeys_.Get<float>();
+    auto weightedD = historyRows_.Get<float>();
+    constexpr uint32_t dstShape[2] = {TILE, DIM};
+    constexpr uint32_t srcShape[2] = {TILE, 1};
+    Muls(state, state, alpha, TILE * DIM);
+    for (uint32_t i = 0; i < pos; ++i) {
+      Broadcast<float, 2, 1>(products, weightedD[i * TILE], dstShape, srcShape);
+      PipeBarrier<PIPE_V>();
+      auto key = keys[i * DIM];
+      Mul(products, products, key, 64, TILE, {1, 1, 1, 16, 16, 0});
+      Mul(products[64], products[64], key[64], 64, TILE, {1, 1, 1, 16, 16, 0});
+      PipeBarrier<PIPE_V>();
+      Add(state, state, products, TILE * DIM);
+      PipeBarrier<PIPE_V>();
+    }
+
+    auto output = foldOut_.AllocTensor<bfloat16_t>();
+    Cast(output, state, RoundMode::CAST_RINT, TILE * DIM);
+    foldOut_.EnQue(output);
+    output = foldOut_.DeQue<bfloat16_t>();
+    DataCopy(dst, output, TILE * DIM);
+    foldOut_.FreeTensor(output);
   }
 
   __aicore__ inline void LoadCandidates(Inputs &x, uint64_t offset, LocalTensor<float> logGate,
@@ -688,11 +756,11 @@ class Consumer {
   }
 
   TPipe pipe_;
-  TQue<TPosition::VECIN, 1> in_, historyIn_;
-  TQue<TPosition::VECOUT, 1> out_;
+  TQue<TPosition::VECIN, 1> in_, historyIn_, foldIn_;
+  TQue<TPosition::VECOUT, 1> out_, foldOut_;
   TBuf<TPosition::VECCALC> rhs_, products_, dot_, proj_, outer_, gather_, historyRows_;
   TBuf<TPosition::VECCALC> delta_, selected_, gates_, candidate_, values_;
-  TBuf<TPosition::VECCALC> historyPanels_, solvedDeltas_;
+  TBuf<TPosition::VECCALC> historyPanels_, solvedDeltas_, historyKeys_, foldState_;
   TBuf<TPosition::VECOUT> scalarOut_;
   event_t projectionReady_, historyReady_, candidatesReady_;
 };
@@ -703,7 +771,7 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
     GM_ADDR d, GM_ADDR keys, GM_ADDR gates, GM_ADDR slots, GM_ADDR ringSlots,
     GM_ADDR pos, GM_ADDR base, GM_ADDR length, GM_ADDR out, GM_ADDR status, GM_ADDR zeros,
-    GM_ADDR scratch, uint32_t batch, uint32_t hk, uint32_t hv, uint32_t numSlots,
+    GM_ADDR scratch, GM_ADDR flush, uint32_t batch, uint32_t hk, uint32_t hv, uint32_t numSlots,
     uint32_t numRingSlots, uint32_t blocks, uint32_t perHeadWorkspace, uint32_t panelMode, uint32_t balanceHeads) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
   Inputs x;
@@ -721,6 +789,7 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   x.pos.SetGlobalBuffer((__gm__ int32_t *)pos);
   x.base.SetGlobalBuffer((__gm__ int32_t *)base);
   x.length.SetGlobalBuffer((__gm__ int32_t *)length);
+  x.flush.SetGlobalBuffer((__gm__ int32_t *)flush);
   x.out.SetGlobalBuffer((__gm__ bfloat16_t *)out);
   x.status.SetGlobalBuffer((__gm__ int32_t *)status);
   x.zeros.SetGlobalBuffer((__gm__ bfloat16_t *)zeros);
@@ -737,7 +806,10 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   Projector op;
   op.Run(x);
 #elif defined(__DAV_C220_VEC__)
-  if (panelMode == 6) {
+  if (panelMode == 7) {
+    Consumer<2 * TOKENS, true, true, true, false, true> op;
+    op.Run(x);
+  } else if (panelMode == 6) {
     Consumer<2 * TOKENS, true, true> op;
     op.Run(x);
   } else if (panelMode == 5) {
