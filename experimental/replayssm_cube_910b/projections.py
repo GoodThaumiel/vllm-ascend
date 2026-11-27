@@ -81,3 +81,21 @@ def compact(case, active, pos, base, status):
         update = torch.bmm(lhs, rhs).view_as(state).float()
         state.copy_(state.float() * alpha[..., None, None] + update)
     status.zero_()
+
+
+def cube_fold_operands(case, ring_ids, physical, position):
+    # Keep the ring gather, suffix scaling and [V, history] packing in the
+    # timed path. The historical GEMM uses FP16 inputs and an FP16 result.
+    def gather(name):
+        return case[name].index_select(0, ring_ids).index_select(2, physical)
+
+    g = gather("g_cache")
+    total = g.sum(dim=2)
+    scale = (total.unsqueeze(2) - g.cumsum(dim=2)).exp()
+    weighted_d = gather("d_cache").float() * scale.unsqueeze(-1)
+    k = gather("k_cache")
+    group = weighted_d.size(1) // k.size(1)
+    k = k.repeat_interleave(group, dim=1)
+    lhs = F.pad(weighted_d.half().transpose(2, 3), (0, PANEL - position)).flatten(0, 1).contiguous()
+    rhs = F.pad(k, (0, 0, 0, PANEL - position)).flatten(0, 1).contiguous()
+    return total.exp(), lhs, rhs

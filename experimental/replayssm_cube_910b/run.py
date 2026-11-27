@@ -19,6 +19,7 @@ from experimental.replayssm_cube_910b.projections import (  # noqa: E402
     checkpoint_projection,
     compact,
     compact_inputs,
+    cube_fold_operands,
     panel,
     verify,
 )
@@ -31,7 +32,15 @@ from scripts.replayssm.profile_sd_operator_compare import (  # noqa: E402
 
 VECTOR_PATHS = ("native", "v20", "compact_v1", "vector_pair")
 MIXED_PATHS = ("mixed_verify", "mixed_pair")
-MIXED_FOLD_PATHS = ("mixed_packed_compact_v5", "mixed_packed_compact_v6")
+MIXED_AIV_ABLATIONS = {"mixed_history_panel": 1, "mixed_triangular": 2, "mixed_suffix_reference": 3}
+MIXED_CUBE_FOLD_PATH = "mixed_cube_fold"
+CUBE_FOLD_ONLY_PATHS = ("cube_fold_path", "cube_fold_gemm")
+MIXED_FOLD_PATHS = (
+    "mixed_packed_compact_v5",
+    "mixed_packed_compact_v6",
+    *MIXED_AIV_ABLATIONS,
+    MIXED_CUBE_FOLD_PATH,
+)
 PACKED_PANEL_PATHS = ("mixed_packed", *MIXED_FOLD_PATHS)
 ALL_MIXED_PATHS = (*MIXED_PATHS, *PACKED_PANEL_PATHS)
 CUBE_PATHS = (
@@ -49,7 +58,8 @@ COMPACT_PATHS = (*COMPACT_ONLY_PATHS, "v20_compact_v5", "v23_compact_v5", *MIXED
 WIDE_PATHS = ("v23", "v23_compact_v5")
 FUSED_PATH = "fused_v24"
 FUSED_PACK_PATH = "fused_v24_with_pack"
-FUSED_PATHS = (FUSED_PATH, FUSED_PACK_PATH)
+FUSED_FOLD_FIRST_PATH = "fused_v25"
+FUSED_PATHS = (FUSED_PATH, FUSED_PACK_PATH, FUSED_FOLD_FIRST_PATH)
 STACK_PATHS = ("native", "vector_pair", "v20_compact_v5", "v23_compact_v5", *MIXED_FOLD_PATHS, *FUSED_PATHS)
 DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
 PROJECTION_ATOL = 2e-5
@@ -334,8 +344,16 @@ def trial(args, b, dev):
         names = ("q", "k", "v", "g", "beta")
         identity_pack = torch.arange(b * t, device=dev, dtype=torch.int64) if FUSED_PACK_PATH in args.path else None
 
-        def fused(cache=c, with_pack=False):
+        token_offsets = (
+            torch.arange(b + 1, device=dev, dtype=torch.int32) * t if FUSED_FOLD_FIRST_PATH in args.path else None
+        )
+
+        def fused(cache=c, with_pack=False, fold_first=False):
             inputs = [cache[name] for name in names]
+            output = c["out"]
+            if fold_first:
+                inputs = [tensor.flatten(0, 1) for tensor in inputs]
+                output = output.flatten(0, 1)
             if with_pack:
                 packed = [tensor.new_zeros(tensor.shape) for tensor in inputs]
                 for dest, src in zip(packed, inputs):
@@ -349,14 +367,15 @@ def trial(args, b, dev):
                 c["bases"],
                 c["lengths"],
                 flush,
-                c["out"],
+                output,
                 c["status"],
                 status,
                 128**-0.5,
                 128,
                 40,
                 ring,
-                24,
+                25 if fold_first else 24,
+                *((token_offsets,) if fold_first else ()),
             )
             if with_pack:
                 return c["out"].flatten(0, 1).index_select(0, identity_pack)
@@ -364,6 +383,7 @@ def trial(args, b, dev):
 
         calls[FUSED_PATH] = fused
         calls[FUSED_PACK_PATH] = lambda: fused(with_pack=True)
+        calls[FUSED_FOLD_FIRST_PATH] = lambda: fused(fold_first=True)
     if any(path in COMPACT_PATHS for path in args.path):
         status_v5 = torch.empty(b * value_heads * (128 // args.compact_tile), dtype=torch.int32, device=dev)
 
@@ -387,6 +407,25 @@ def trial(args, b, dev):
             v20_compact_v5=lambda: (vector(), fold_candidate()),
             v23_compact_v5=lambda: (vector(23), fold_candidate()),
         )
+    if any(path in (*CUBE_FOLD_ONLY_PATHS, MIXED_CUBE_FOLD_PATH) for path in args.path):
+        ring_ids = ring.index_select(0, flush_rows.to(dev)).long()
+        history_records = (torch.arange(p, device=dev, dtype=torch.int64) + base) % 32
+
+        def cube_fold(cache=c):
+            alpha, lhs, rhs = cube_fold_operands(cache, ring_ids, history_records, p)
+            update = torch.bmm(lhs, rhs).view(active, value_heads, 128, 128)
+            state = cache["checkpoint"].index_select(0, restore_slots)
+            folded = state.float() * alpha[..., None, None] + update.float()
+            cache["checkpoint"].index_copy_(0, restore_slots, folded.to(state.dtype))
+
+        if active and p:
+            calls["cube_fold_path"] = cube_fold
+            if "cube_fold_gemm" in args.path:
+                _, lhs, rhs = cube_fold_operands(c, ring_ids, history_records, p)
+                calls["cube_fold_gemm"] = lambda: torch.bmm(lhs, rhs)
+        else:
+            raise ValueError("Cube folding requires at least one flushing request with committed history")
+
     if "cursor" in args.path:
         from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_cursor
 
@@ -493,7 +532,7 @@ def trial(args, b, dev):
                 summary = projection_error_summary(actual, expected_projection)
                 raise AssertionError(f"{exc}\nProjection mismatch by column group: {json.dumps(summary)}") from None
 
-        def verify_mixed(packed=False, cache=c):
+        def verify_mixed(packed=False, cache=c, ablation=0):
             panel_options = (True,) if packed else ()
             if packed and args.mixed_suffix:
                 panel_options += (True,)
@@ -501,6 +540,8 @@ def trial(args, b, dev):
                 panel_options += (False, True)
             if args.mixed_balanced:
                 panel_options = (packed, packed and args.mixed_suffix, packed and args.mixed_qkv, True)
+            if ablation:
+                panel_options = (True, False, True, args.mixed_balanced, ablation)
             torch.ops.replayssm_mix_910b.verify_(
                 *(cache[n] for n in ("q", "k", "v", "g", "beta", "checkpoint", "d_cache", "k_cache", "g_cache")),
                 slots,
@@ -516,14 +557,17 @@ def trial(args, b, dev):
                 *panel_options,
             )
 
-        for paths, packed in ((MIXED_PATHS, False), (PACKED_PANEL_PATHS, True)):
-            if not any(path in paths for path in args.path):
-                continue
+        mixed_checks = [
+            (path, path in PACKED_PANEL_PATHS, MIXED_AIV_ABLATIONS.get(path, 0))
+            for path in args.path
+            if path in ALL_MIXED_PATHS
+        ]
+        for path, packed, ablation in mixed_checks:
             for iteration in range(args.mixed_check_repeats):
                 poison()
                 scratch.fill_(float("nan"))
-                verify_mixed(packed)
-                label = f"{paths[0]} eager run {iteration + 1}"
+                verify_mixed(packed, ablation=ablation)
+                label = f"{path} eager run {iteration + 1}"
                 check_projection(label)
                 check_outputs(label, "mixed_eager_", dump=dump)
         torch.testing.assert_close(c["checkpoint"], initial, atol=0, rtol=0)
@@ -534,8 +578,17 @@ def trial(args, b, dev):
         )
         if "mixed_packed_compact_v5" in args.path:
             calls["mixed_packed_compact_v5"] = lambda: (verify_mixed(True), fold_candidate())
-        if "mixed_packed_compact_v6" in args.path:
-            calls["mixed_packed_compact_v6"] = lambda: (verify_mixed(True), fold_candidate(variant=6))
+
+        def mixed_with_fold(path, cache=c):
+            verify_mixed(True, cache, ablation=MIXED_AIV_ABLATIONS.get(path, 0))
+            if path == MIXED_CUBE_FOLD_PATH:
+                cube_fold(cache)
+            else:
+                fold_candidate(cache, variant=5 if path == "mixed_packed_compact_v5" else 6)
+
+        for path in MIXED_FOLD_PATHS:
+            if path in args.path:
+                calls[path] = lambda path=path: mixed_with_fold(path)
 
     def measure_gdn_stack(path, label):
         stack_label = f"{label}/gdn_stack_{args.layers}"
@@ -562,16 +615,15 @@ def trial(args, b, dev):
             def call_stack():
                 for cache in layers:
                     if path in FUSED_PATHS:
-                        fused(cache, with_pack=path == FUSED_PACK_PATH)
-                        continue
-                    if path in MIXED_FOLD_PATHS:
-                        verify_mixed(True, cache)
+                        fused(cache, with_pack=path == FUSED_PACK_PATH, fold_first=path == FUSED_FOLD_FIRST_PATH)
+                    elif path in MIXED_FOLD_PATHS:
+                        mixed_with_fold(path, cache)
                     else:
                         vector(23 if path == "v23_compact_v5" else 20, cache)
-                    if path == "vector_pair":
-                        fold(cache)
-                    else:
-                        fold_candidate(cache, 6 if path == "mixed_packed_compact_v6" else 5)
+                        if path == "vector_pair":
+                            fold(cache)
+                        else:
+                            fold_candidate(cache)
 
             def reset_stack():
                 for cache in layers:
@@ -604,6 +656,7 @@ def trial(args, b, dev):
                 "compact_v1",
                 "cube_pair",
                 "cube_compact",
+                "cube_fold_path",
                 "mixed_pair",
                 *COMPACT_PATHS,
                 *FUSED_PATHS,
@@ -617,9 +670,9 @@ def trial(args, b, dev):
             compact_status = None
             if path == "mixed_pair":
                 compact_status = status
-            elif path in MIXED_FOLD_PATHS:
+            elif path in MIXED_FOLD_PATHS and path != MIXED_CUBE_FOLD_PATH:
                 compact_status = status_v5
-            expected_state = checkpoint if compact_status is not None else initial.cpu()
+            expected_state = checkpoint if compact_status is not None or path == MIXED_CUBE_FOLD_PATH else initial.cpu()
 
             def check_graph(
                 graph, reset=reset, path=path, expected_state=expected_state, compact_status=compact_status
@@ -634,8 +687,13 @@ def trial(args, b, dev):
                     label = f"{path} graph run {iteration + 1}"
                     check_projection(label)
                     check_outputs(label, "mixed_graph_", dump=dump)
-                    if path == "mixed_packed_compact_v6":
-                        torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0.001, rtol=0.015)
+                    if path in MIXED_FOLD_PATHS and path != "mixed_packed_compact_v5":
+                        actual_state = c["checkpoint"].cpu()
+                        torch.testing.assert_close(actual_state, expected_state, atol=0.001, rtol=0.015)
+                        if path == MIXED_CUBE_FOLD_PATH:
+                            errors["cube_fold_checkpoint"] = (
+                                (actual_state.float() - expected_state.float()).abs().max().item()
+                            )
                     else:
                         torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
                     if compact_status is not None and compact_status.cpu().any():
@@ -648,8 +706,12 @@ def trial(args, b, dev):
                 workspace_bytes=scratch.nbytes,
                 workspace_layout=args.mixed_workspace,
                 aiv_panel_cols=8 if path in PACKED_PANEL_PATHS else 16,
-                aiv_history_suffix=path in PACKED_PANEL_PATHS and args.mixed_suffix,
-                aiv_bulk_qkv=path in PACKED_PANEL_PATHS and args.mixed_qkv,
+                aiv_history_suffix=(
+                    path in ("mixed_history_panel", "mixed_suffix_reference")
+                    or (path not in MIXED_AIV_ABLATIONS and path in PACKED_PANEL_PATHS and args.mixed_suffix)
+                ),
+                aiv_bulk_qkv=(path in PACKED_PANEL_PATHS and args.mixed_qkv) or path in MIXED_AIV_ABLATIONS,
+                aiv_ablation=MIXED_AIV_ABLATIONS.get(path, 0),
                 mixed_balanced=args.mixed_balanced,
             )
         elif path in (*COMPACT_PATHS, "v23", *FUSED_PATHS):
@@ -676,13 +738,24 @@ def trial(args, b, dev):
                 if path not in COMPACT_ONLY_PATHS:
                     if c["status"].cpu().any():
                         raise RuntimeError(f"Captured {path} returned nonzero verify status")
-                    torch.testing.assert_close(c["out"][:, :t].float().cpu(), expected_out, atol=0, rtol=0)
+                    if path != FUSED_FOLD_FIRST_PATH:
+                        torch.testing.assert_close(c["out"][:, :t].float().cpu(), expected_out, atol=0, rtol=0)
                 if path in FUSED_PATHS:
-                    check_outputs("Captured V24", "fused_v24_")
+                    check_outputs(f"Captured {path}", f"{path}_")
 
             timings = measure(calls[path], reset, args.iterations, label, check_graph=check_graph)
             if path in COMPACT_PATHS:
                 mix_metadata = {"compact_tile": args.compact_tile}
+        elif path == "cube_fold_path":
+
+            def check_cube_fold(graph):
+                reset_state()
+                graph.replay()
+                actual = c["checkpoint"].cpu()
+                torch.testing.assert_close(actual, checkpoint, atol=0.001, rtol=0.015)
+                errors["cube_fold_checkpoint"] = (actual.float() - checkpoint.float()).abs().max().item()
+
+            timings = measure(calls[path], reset, args.iterations, label, check_graph=check_cube_fold)
         else:
             timings = measure(calls[path], reset, args.iterations, label)
         if args.compare_eager:
@@ -728,7 +801,17 @@ def parse_args(argv=None):
         "--path",
         nargs="+",
         choices=tuple(
-            dict.fromkeys((*PATHS, *ALL_MIXED_PATHS, *EXTRA_PATHS, *COMPACT_PATHS, *WIDE_PATHS, *FUSED_PATHS))
+            dict.fromkeys(
+                (
+                    *PATHS,
+                    *ALL_MIXED_PATHS,
+                    *EXTRA_PATHS,
+                    *COMPACT_PATHS,
+                    *WIDE_PATHS,
+                    *FUSED_PATHS,
+                    *CUBE_FOLD_ONLY_PATHS,
+                )
+            )
         ),
     )
     ap.add_argument("--compact-library", type=Path, help="Path to the standalone Compact Torch binding")
@@ -774,8 +857,8 @@ def parse_args(argv=None):
         ap.error("Compact candidate paths require --compact-library")
     if any(path in (*WIDE_PATHS, *FUSED_PATHS) for path in args.path) and not args.verify_library:
         ap.error("V23 and V24 paths require --verify-library")
-    if FUSED_PACK_PATH in args.path and args.length != 4:
-        ap.error("the identity pack ablation requires four tokens per request")
+    if any(path in args.path for path in (FUSED_FOLD_FIRST_PATH, FUSED_PACK_PATH)) and args.length != 4:
+        ap.error("the identity pack or V25 view path requires four tokens per request")
     if args.suite == "vector" and any(path in ALL_MIXED_PATHS for path in args.path):
         ap.error("use --suite mixed for AIC/AIV paths")
     if max(args.batches) > 128 and any(path in CUBE_PATHS for path in args.path):

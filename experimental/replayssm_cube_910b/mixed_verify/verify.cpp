@@ -189,9 +189,12 @@ class Projector {
 #endif
 
 #ifdef __DAV_C220_VEC__
-template <uint32_t PanelCols, bool SuffixHistory = false, bool BulkQkv = false>
+template <uint32_t PanelCols, bool SuffixHistory = false, bool BulkQkv = false,
+          bool BatchHistory = false, bool TriangularSolve = false>
 class Consumer {
   static constexpr uint32_t PANEL = TILE * PanelCols;
+  static_assert(!BatchHistory || (PanelCols == 2 * TOKENS && SuffixHistory));
+  static_assert(!TriangularSolve || (PanelCols == 2 * TOKENS && BulkQkv));
 
  public:
   __aicore__ inline void Run(Inputs &x) {
@@ -284,6 +287,12 @@ class Consumer {
     pipe_.InitBuffer(candidate_, 3 * CANDIDATE_SCALARS * sizeof(float));
     if constexpr (BulkQkv) {
       pipe_.InitBuffer(values_, TOKENS * TILE * sizeof(float));
+    }
+    if constexpr (BatchHistory) {
+      pipe_.InitBuffer(historyPanels_, HISTORY * PANEL * sizeof(float));
+    }
+    if constexpr (TriangularSolve) {
+      pipe_.InitBuffer(solvedDeltas_, TOKENS * TILE * sizeof(float));
     }
     pipe_.InitBuffer(scalarOut_, 32);
     // MTE2 can enqueue gate copies while the V wait on the projection is
@@ -438,6 +447,125 @@ class Consumer {
     PipeBarrier<PIPE_V>();
   }
 
+  __aicore__ inline void CorrectHistoryPanel(LocalTensor<float> rows, uint32_t pos) {
+    if (pos == 0) {
+      return;
+    }
+    auto expanded = historyPanels_.Get<float>();
+    const uint32_t depth = pos <= 4 ? 4 : pos <= 8 ? 8 : HISTORY;
+    const uint32_t dstShape[2] = {pos * TILE, PanelCols};
+    const uint32_t srcShape[2] = {pos * TILE, 1};
+    Broadcast<float, 2, 1>(expanded, rows, dstShape, srcShape);
+    PipeBarrier<PIPE_V>();
+    constexpr uint32_t rowStride = PanelCols / FLOAT_LANES_PER_BLOCK;
+    for (uint32_t i = 0; i < pos; ++i) {
+      auto panel = expanded[i * PANEL];
+      Mul(panel, panel, dot_.Get<float>()[i * PanelCols], PanelCols, TILE,
+          {1, 1, 1, rowStride, rowStride, 0});
+    }
+    if (pos < depth) {
+      Duplicate(expanded[pos * PANEL], 0.0f, (depth - pos) * PANEL);
+    }
+    PipeBarrier<PIPE_V>();
+    for (uint32_t step = depth / 2; step > 0; step /= 2) {
+      Add(expanded, expanded, expanded[step * PANEL], step * PANEL);
+      PipeBarrier<PIPE_V>();
+    }
+    auto proj = proj_.Get<float>();
+    Add(proj, proj, expanded, PANEL);
+    PipeBarrier<PIPE_V>();
+  }
+
+  __aicore__ inline void AddCandidate(LocalTensor<float> selected, LocalTensor<float> delta,
+                                       float coefficient) {
+    auto tmp = delta_.Get<float>();
+    Muls(tmp, delta, coefficient, TILE);
+    PipeBarrier<PIPE_V>();
+    Add(selected, selected, tmp, TILE);
+    PipeBarrier<PIPE_V>();
+  }
+
+  template <uint32_t Step>
+  __aicore__ inline void SolveToken(Inputs &x, uint64_t output, uint64_t ringHead, uint32_t base,
+                                    uint32_t pos, uint32_t vStart, float prefix, const float *kWeights,
+                                    const float *qWeights, float beta, float logGate) {
+    auto panel = outer_.Get<float>();
+    auto deltas = solvedDeltas_.Get<float>();
+    auto selected = selected_.Get<float>();
+    auto delta = deltas[Step * TILE];
+
+    Muls(selected, panel[Step * TILE], prefix, TILE);
+    PipeBarrier<PIPE_V>();
+#pragma unroll
+    for (uint32_t j = 0; j < Step; ++j) {
+      AddCandidate(selected, deltas[j * TILE], kWeights[j]);
+    }
+    Sub(delta, values_.Get<float>()[Step * TILE], selected, TILE);
+    PipeBarrier<PIPE_V>();
+    Muls(delta, delta, beta, TILE);
+    PipeBarrier<PIPE_V>();
+    const uint32_t record = Physical(base, pos + Step);
+    StoreCast(x.d[(ringHead + record) * DIM + vStart], delta, TILE);
+
+    Muls(selected, panel[(TOKENS + Step) * TILE], prefix, TILE);
+    PipeBarrier<PIPE_V>();
+#pragma unroll
+    for (uint32_t j = 0; j <= Step; ++j) {
+      AddCandidate(selected, deltas[j * TILE], qWeights[j]);
+    }
+    Muls(selected, selected, SCALE, TILE);
+    PipeBarrier<PIPE_V>();
+    StoreCast(x.out[output + Step * x.hv * DIM + vStart], selected, TILE);
+    if (vStart == 0) {
+      StoreScalar(x.gates[ringHead + record], logGate);
+    }
+  }
+
+  __aicore__ inline void SolveCandidates(Inputs &x, uint64_t output, uint64_t ringHead, uint32_t base,
+                                         uint32_t pos, uint32_t len, uint32_t vStart,
+                                         LocalTensor<float> decay, LocalTensor<float> beta,
+                                         LocalTensor<float> logGate) {
+    // One transpose/gather replaces two per candidate. The projected panel
+    // then stays read-only while the four FP32 candidate deltas are solved.
+    Gather(outer_.Get<float>(), proj_.Get<float>(), gather_.Get<uint32_t>(), 0, PANEL);
+    PipeBarrier<PIPE_V>();
+    Fence<HardEvent::V_S>();
+    const auto dot = dot_.Get<float>();
+    float kWeights[TOKENS][TOKENS];
+    float qWeights[TOKENS][TOKENS];
+    float prefix[TOKENS];
+    float product = 1.0f;
+    for (uint32_t t = 0; t < len; ++t) {
+      product *= decay.GetValue(t * FLOAT_LANES_PER_BLOCK);
+      prefix[t] = product;
+      float suffix = 1.0f;
+      for (uint32_t j = t + 1; j > 0; --j) {
+        const uint32_t prior = j - 1;
+        const uint32_t offset = (pos + prior) * PanelCols;
+        if (prior < t) {
+          kWeights[t][prior] = suffix * dot.GetValue(offset + t);
+        }
+        qWeights[t][prior] = suffix * dot.GetValue(offset + TOKENS + t);
+        suffix *= decay.GetValue(prior * FLOAT_LANES_PER_BLOCK);
+      }
+    }
+
+    SolveToken<0>(x, output, ringHead, base, pos, vStart, prefix[0], kWeights[0], qWeights[0],
+                  beta.GetValue(0), logGate.GetValue(0));
+    if (len > 1) {
+      SolveToken<1>(x, output, ringHead, base, pos, vStart, prefix[1], kWeights[1], qWeights[1],
+                    beta.GetValue(FLOAT_LANES_PER_BLOCK), logGate.GetValue(FLOAT_LANES_PER_BLOCK));
+    }
+    if (len > 2) {
+      SolveToken<2>(x, output, ringHead, base, pos, vStart, prefix[2], kWeights[2], qWeights[2],
+                    beta.GetValue(2 * FLOAT_LANES_PER_BLOCK), logGate.GetValue(2 * FLOAT_LANES_PER_BLOCK));
+    }
+    if (len > 3) {
+      SolveToken<3>(x, output, ringHead, base, pos, vStart, prefix[3], kWeights[3], qWeights[3],
+                    beta.GetValue(3 * FLOAT_LANES_PER_BLOCK), logGate.GetValue(3 * FLOAT_LANES_PER_BLOCK));
+    }
+  }
+
   __aicore__ inline void Correct(Inputs &x, uint32_t row, uint32_t head, uint32_t ring, uint32_t pos,
                                  uint32_t base, uint32_t len, uint32_t vStart) {
     auto proj = proj_.Get<float>();
@@ -481,13 +609,21 @@ class Consumer {
         PipeBarrier<PIPE_V>();
       }
     }
-    for (uint32_t i = 0; i < pos; ++i) {
-      if constexpr (!SuffixHistory) {
-        const uint32_t gateIndex = i < first ? i : RING + i - first;
-        Muls(proj, proj, gates.GetValue(gateIndex), PANEL);
-        PipeBarrier<PIPE_V>();
+    if constexpr (BatchHistory) {
+      CorrectHistoryPanel(rows, pos);
+    } else {
+      for (uint32_t i = 0; i < pos; ++i) {
+        if constexpr (!SuffixHistory) {
+          const uint32_t gateIndex = i < first ? i : RING + i - first;
+          Muls(proj, proj, gates.GetValue(gateIndex), PANEL);
+          PipeBarrier<PIPE_V>();
+        }
+        Outer(i, rows[i * TILE]);
       }
-      Outer(i, rows[i * TILE]);
+    }
+    if constexpr (TriangularSolve) {
+      SolveCandidates(x, x.Output(row, 0, head), ringHead, base, pos, len, vStart, decay, beta, logGate);
+      return;
     }
     for (uint32_t t = 0; t < len; ++t) {
       const uint64_t out = x.Output(row, t, head);
@@ -556,6 +692,7 @@ class Consumer {
   TQue<TPosition::VECOUT, 1> out_;
   TBuf<TPosition::VECCALC> rhs_, products_, dot_, proj_, outer_, gather_, historyRows_;
   TBuf<TPosition::VECCALC> delta_, selected_, gates_, candidate_, values_;
+  TBuf<TPosition::VECCALC> historyPanels_, solvedDeltas_;
   TBuf<TPosition::VECOUT> scalarOut_;
   event_t projectionReady_, historyReady_, candidatesReady_;
 };
@@ -600,7 +737,16 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   Projector op;
   op.Run(x);
 #elif defined(__DAV_C220_VEC__)
-  if (panelMode == 3) {
+  if (panelMode == 6) {
+    Consumer<2 * TOKENS, true, true> op;
+    op.Run(x);
+  } else if (panelMode == 5) {
+    Consumer<2 * TOKENS, false, true, false, true> op;
+    op.Run(x);
+  } else if (panelMode == 4) {
+    Consumer<2 * TOKENS, true, true, true> op;
+    op.Run(x);
+  } else if (panelMode == 3) {
     Consumer<2 * TOKENS, false, true> op;
     op.Run(x);
   } else if (panelMode == 2) {

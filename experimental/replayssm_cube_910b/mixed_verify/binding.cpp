@@ -15,7 +15,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& slots, const at::Tensor& ringSlots, const at::Tensor& pos,
             const at::Tensor& base, const at::Tensor& length, const at::Tensor& out,
             const at::Tensor& status, const at::Tensor& zeros, const at::Tensor& scratch,
-            int64_t cores, bool packed_panel, bool suffix_history, bool bulk_qkv, bool balance_heads) {
+            int64_t cores, bool packed_panel, bool suffix_history, bool bulk_qkv, bool balance_heads, int64_t aiv_ablation) {
   TORCH_CHECK(q.device().is_privateuseone() && q.dim() == 4, "q must be a rank-4 NPU tensor");
   const auto b = q.size(0), hk = q.size(2);
   TORCH_CHECK(v.dim() == 4, "v must be rank-4");
@@ -25,6 +25,9 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(cores >= 1 && cores <= 20, "cores must be 1..20 on 910B4");
   TORCH_CHECK(packed_panel || (!suffix_history && !bulk_qkv), "AIV ablations require the packed panel");
   TORCH_CHECK(!suffix_history || !bulk_qkv, "Run suffix history and bulk QKV as separate ablations");
+  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= 3, "Invalid AIV ablation");
+  TORCH_CHECK(aiv_ablation == 0 || (packed_panel && bulk_qkv && !suffix_history),
+              "AIV ablations require the bulk-QKV packed baseline");
   TORCH_CHECK(checkpoint.dim() == 4 && d.dim() == 4, "checkpoint/D must be rank-4");
   const auto numSlots = checkpoint.size(0), numRingSlots = d.size(0);
   TORCH_CHECK(numSlots > 1 && numSlots <= 1024 && numRingSlots > 1 && numRingSlots <= 1024,
@@ -56,7 +59,9 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
   const uint32_t panel_mode =
-      static_cast<uint32_t>(packed_panel) + static_cast<uint32_t>(suffix_history) + 2 * static_cast<uint32_t>(bulk_qkv);
+      aiv_ablation > 0
+      ? static_cast<uint32_t>(3 + aiv_ablation)
+      : static_cast<uint32_t>(packed_panel) + static_cast<uint32_t>(suffix_history) + 2 * static_cast<uint32_t>(bulk_qkv);
   const auto rc = aclrtlaunch_replayssm_sd_verify_mix_910b(
       static_cast<uint32_t>(blocks), stream, q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
       beta.data_ptr(), checkpoint.data_ptr(), d.data_ptr(), keys.data_ptr(), gates.data_ptr(), slots.data_ptr(),
@@ -73,7 +78,7 @@ TORCH_LIBRARY(replayssm_mix_910b, m) {
         "Tensor(a!) d, Tensor(b!) keys, Tensor(c!) gates, Tensor slots, Tensor ring_slots, "
         "Tensor positions, Tensor bases, Tensor lengths, Tensor(d!) out, Tensor(e!) status, "
         "Tensor zeros, Tensor(f!) scratch, int cores, bool packed_panel=False, "
-        "bool suffix_history=False, bool bulk_qkv=False, bool balance_heads=False) -> ()");
+        "bool suffix_history=False, bool bulk_qkv=False, bool balance_heads=False, int aiv_ablation=0) -> ()");
 }
 TORCH_LIBRARY_IMPL(replayssm_mix_910b, PrivateUse1, m) {
   m.impl("verify_", &Verify);

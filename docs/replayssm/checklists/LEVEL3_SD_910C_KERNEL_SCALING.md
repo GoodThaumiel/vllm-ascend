@@ -304,3 +304,148 @@ GPU 的两个 kernel 分别负责非 flush 和 flush，均能独立完成各自�
 并重复读路由元数据。V25 在一个 kernel 内复用 UB，但执行资源和任务
 切分需要兼容两种行。上述数字比较的是两版合一 kernel 的算法顺序，
 双 kernel 的 Ascend 性能需用同算法、同 flush 行分布另测。
+
+### 9B TP1 的紧凑 V24/V25 服务对照
+
+Blue2 910C 单 die、Qwen3.5-9B BF16、MTP3，
+`--max-num-seqs 256 --max-num-batched-tokens 8192`，显存利用率
+0.85，异步调度关闭。三路用同一份短文本，输出上限 64 token。
+Replay 在隔离服务副本中通过实验 binding 调用紧凑算子，保持原有
+双槽和批量 cursor，跳过固定槽 pack/unpack。两版紧凑路径都预先
+清零输出，以定义图容量中的 padding。HTTP 吞吐为实际输出 token
+除以整次客户端测试时长，包含客户端进程和指标读取消耗。
+
+| 客户端并发 | 路径 | 成功请求 | 输出 tok/s | HTTP p50/p90 (s) | 观测峰值 waiting |
+|---:|---|---:|---:|---:|---:|
+| 128 | Native | 256/256 | 2,160 | 3.625 / 3.917 | 0 |
+| 128 | 紧凑 V24 | 256/256 | 2,030 | 3.901 / 4.024 | 0 |
+| 128 | 紧凑 V25 | 256/256 | 2,008 | 3.861 / 4.075 | 0 |
+| 256 | Native | 512/512 | 2,078 | 5.097 / 9.568 | 89 |
+| 256 | 紧凑 V24 | 512/512 | 2,295 | 6.928 / 7.033 | 0 |
+| 256 | 紧凑 V25 | 512/512 | 2,317 | 6.895 / 7.015 | 0 |
+
+| 目标 forward 的 graph batch | Native p50/p90 (ms) | 紧凑 V24 (ms) | 紧凑 V25 (ms) |
+|---:|---:|---:|---:|
+| B128 | 98.62 / 98.68 | 103.50 / 122.79 | 106.92 / 114.50 |
+| 最大实测 graph | B192，132.26 / 132.35 | B256，190.89 / 215.87 | B256，191.91 / 207.77 |
+
+目标 forward 以日志记录的 graph batch 归组，计时使用 NPU Event，
+覆盖服务完成的整个 target graph。Replay 日志额外记录了 flush 元数据，
+位于设备计时区间外。C256 的 Native 和 Replay 目标图实际形状不同。
+Native 的估计可用 KV 为 387,873 token，V24/V25 均为 585,728 token。
+C256 的 V25 相比 Native 输出吞吐增加 11.5%，HTTP p90 降低 26.7%，
+HTTP p50 增加 35.3%。C128 无排队，此时 V25 相比 Native 的目标图
+p50 慢 8.4%，输出吞吐低 7.0%。V25 对 V24 在 C256 的输出吞吐约
+增加 1%，在 C128 略降，这组服务数据不足以宣布默认切换 V25。
+27B TP4 本轮仅覆盖单 die 算子几何，未得到四 die 的服务对照。
+
+### GPU 计算组织的三项消融
+
+用同一批输入对比 native GDR、单 launch V25、以及此前低 flush 的
+最快混合基线 `mixed_packed_compact_v6 --mixed-qkv`。混合基线
+用 Cube 做 checkpoint 的 Q/K 投影，AIV 分别处理两个 tile64，再调用
+Compact V6。新变体复用同一 Cube 投影、核数、切分和缓存。
+
+- `mixed_history_panel` 将历史 D 按后缀衰减加权，一次扩展活跃
+  D 行，形成每个历史行的八列乘积，并树归约到投影。辅助对照
+  `mixed_suffix_reference` 使用同样的 D 后缀衰减和 QKV 批量加载，
+  但仍逐行更新投影。批量归约额外占用 32 KiB AIV UB。
+- `mixed_triangular` 仍使用基线历史修正。一次 Gather 将八列
+  checkpoint + 历史投影改为列连续。预备衰减系数后在 AIV 展开
+  四步前代，减少整块 panel 的更新。候选 D 仍在 FP32 UB 内参与
+  后续候选计算，写 ring 时再转 FP16。
+- `cube_fold_gemm` 测已经备好的 FP16 `[128,16]×[16,128]`。
+  `cube_fold_path` 一并计入 ring 读取、FP32 衰减、转 FP16 和
+  布局调整、BMM 结果回到 Vector 路径、checkpoint 写回。
+  `mixed_cube_fold` 用该链路替换基线的 Compact V6。该探针
+  通过 Torch NPU BMM 连接独立算子，已知 active rows 在计时前准备。
+  生产实现若在一个混合核内交接，需要独立测量。
+
+在空闲 910C die 上编译混合核。Compact V6 与 V25 的实验库按前面的
+清单构建。使用与服务一致的 vendor 算子库。
+
+```bash
+cmake -S experimental/replayssm_cube_910b/mixed_verify -B build-mix \
+  -DSOC_VERSION=ascend910_9362 -DASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH" \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build build-mix -j 6
+run=experimental/replayssm_cube_910b/run.py
+python3 "$run" --suite mixed --geometry 9b --batches 256 --layers 24 \
+  --pos 16 --nonflush-pos 7 --base 31 --flush-count 32 --flush-layout random \
+  --mixed-qkv --mixed-library build-mix/libreplayssm_sd_mix_torch.so \
+  --compact-library "$compact" --verify-library "$verify" --iterations 15 \
+  --path native fused_v25 mixed_packed_compact_v6 mixed_suffix_reference \
+      mixed_history_panel mixed_triangular mixed_cube_fold \
+  --output /tmp/replay-mixed-ablations-stack.json
+for layout in prefix spread random; do
+  python3 "$run" --suite mixed --geometry 9b --batches 256 \
+    --pos 16 --nonflush-pos 7 --base 31 --flush-count 128 --flush-layout "$layout" \
+    --mixed-qkv --mixed-library build-mix/libreplayssm_sd_mix_torch.so \
+    --compact-library "$compact" --verify-library "$verify" --iterations 30 \
+    --path native fused_v25 mixed_packed_compact_v6 mixed_suffix_reference \
+        mixed_history_panel mixed_triangular compact_v6 cube_fold_gemm cube_fold_path mixed_cube_fold \
+    --output "/tmp/replay-mixed-ablations-$layout.json"
+done
+```
+
+每条混合路径会在 eager 和图回放中核对 Cube 投影、候选输出、
+D/K/G 和状态。折叠结果与向量 compact 比较，测试覆盖 T1–T4、
+跨 ring 尾及独立 checkpoint/ring 槽。
+
+Blue2 910C 单 die、CANN 9.2.1、torch-npu 2.10.0.post7、BF16 checkpoint
+和 FP16 D/K、FP32 G。Cube 投影最多 20 个 AIC，配对 40 个 AIV。
+Compact V6 tile64，V25 tile128。以下是随机摆放 12.5% flush 的 stack
+图回放 p50，单位 ms。非 flush pos7，flush pos16，base31，T4。
+每组回放 15 次，定位到 `c5715bf` 上这一提交的混合核改动。
+
+| 几何和 batch | Native | V25 | Cur best 混合 + V6 | 同衰减逐行参考 | 整窗历史 | 四步前代 | 混合 + Cube 折叠 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 27B TP4 B32，48 层 | 9.09 | 11.49 | 10.15 | 10.12 | 10.02 | 10.51 | 19.69 |
+| 27B TP4 B64，48 层 | 17.81 | 22.13 | 17.91 | 17.68 | 17.40 | 18.62 | 28.07 |
+| 9B TP1 B128，24 层 | 44.78 | 55.83 | 42.48 | 42.03 | 41.00 | 44.12 | 51.83 |
+| 9B TP1 B256，24 层 | 89.01 | 111.00 | 82.84 | 81.85 | 79.92 | 86.36 | 108.49 |
+
+整窗历史修正在四组都快于 Cur best，降幅约 1.2%–3.6%。同样使用
+后缀衰减的逐行对照也慢于整窗实现，说明收益既来自后缀加权，也来自
+批量扩展和归约。高并发 9B 的收益最大。全非 flush 的 9B B256
+单层从 2.770 ms 降到 2.668 ms，native 为 3.711 ms。27B B32
+在 12.5% flush 时仍慢于 native 约 10.3%，虽然全非 flush 的整窗
+实现为 0.164 ms，快于 native 0.204 ms。这个形状应优先定位低 flush
+时的 compact 固定开销和尾部核负载。
+
+四步前代把每候选两次 Gather 改为每窗一次，并通过了 27B 和 9B
+的 T1–T4 校验。代表性的 T4 stack 比 Cur best 慢 3.6%–4.3%。
+它减少了 Gather，但同时改变了每个候选的向量累加和系数准备方式，
+当前数据不能把回退归因到单条指令。暂保留为消融对照。
+
+以下为每组 50% flush 时，prefix、spread、random 三种摆放的单层图
+p50 范围，单位 ms。每 case 30 次。各列范围用于展示摆放敏感度。
+
+| 几何和 batch | Native | Cur best | 整窗历史 | V25 | 裸 Cube BMM | AIV Compact V6 | Cube 完整折叠 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 27B TP4 B32 | 0.197–0.205 | 0.293–0.337 | 0.285–0.329 | 0.276–0.295 | 0.034–0.041 | 0.132–0.165 | 0.411–0.434 |
+| 27B TP4 B64 | 0.376–0.379 | 0.530–0.595 | 0.511–0.579 | 0.529–0.562 | 0.040–0.057 | 0.227–0.293 | 0.599–0.620 |
+| 9B TP1 B128 | 1.872–1.875 | 2.733–2.806 | 2.630–2.707 | 2.730–2.755 | 0.054–0.060 | 1.124–1.187 | 2.949–3.022 |
+| 9B TP1 B256 | 3.710–3.712 | 5.437–5.503 | 5.242–5.301 | 5.396–5.472 | 0.151–0.152 | 2.265–2.323 | 6.063–6.737 |
+
+固定 flush 数后，27B B32 的整窗历史仍可因摆放浮动约 44 µs。
+9B B256 半数 flush 的最好结果仍比 native 慢约 41%。单独的
+FP16 BMM 在小探针中由 `msprof` 确认为 `BatchMatMulV2` 的
+`KERNEL_AICORE`，replay 中该任务约 13 µs。9B B256、F128 的
+裸 BMM p50 约 0.15 ms，整个折叠链路却要 6.06–6.74 ms，高于 AIV
+Compact V6 的 2.27–2.32 ms。该结果说明现有 GM 物化方式的整体
+开销大，尚未测量同一个混合 kernel 内的折叠与投影复用。Cube 路径
+checkpoint 相对向量参考的最大绝对差为 4.88e-4。
+
+主矩阵 28 组均通过，相关 CPU 单测 15 项通过。整窗历史变体可作为
+下一轮低 flush 的候选，仍需接入服务测整体收益。高 flush 应先
+定位折叠的数据流和尾部核负载，避免依据裸 Cube 吞吐选型。
+
+27B TP4 B32 的后续探针固定随机 F4、pos16/7、T4，45 次回放。
+20 Cube、按 key-head 分组、Compact V6 tile64 仍是该组最快组合，
+单层 219.98 µs，native 201.52 µs。只改 Compact 到 tile32 后，
+Compact 从 62.36 增至 78.32 µs，组合增至 234.54 µs。开启按 V
+head 均分后，tile64 组合为 224.24 µs，进一步减到 16 Cube 为
+246.04 µs。无 flush 的单独 Compact 图约 48.44 µs，其中包括
+图回放固定开销，不能直接从组合时延中扣减。这组数据不支持继续
+用这些 tile、核数或任务均分配置消除剩余差距。
