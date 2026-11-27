@@ -247,3 +247,60 @@ die 上分别重新测量，各有效 token 的 state slot 随 token 排列。
 长度和 padding 也省掉输入 scatter 和输出 gather。混合长度的绝对时延
 还受有效 token 数影响。Native 的 T4 测值可用于同形状差距，混合长度
 应另测对应 native 下发方式。上述测试只包含 GDN 算子图。
+
+### V25 在 flush 行先折叠 checkpoint
+
+V25 沿用紧凑 V24 的单次 launch、tile128、40 核、双 slot 和候选 ring
+地址。有效 flush 行先在同一 FP32 UB tile 折叠已提交的历史，再用
+该状态做候选 Q/K 投影，跳过逐候选的历史点积和加权归约。候选输出
+后仍然只写回一次 BF16 checkpoint。没有增加 UB buffer 或写入额外
+checkpoint。V25 通过 `variant=25` 和 `token_offsets` 显式选择。
+
+构建方式与上一节相同。以下是窄烟测及图回放矩阵，需在空闲 die 上运行。
+
+```bash
+run=experimental/replayssm_cube_910b/run_token_layout.py
+verify=build-verify/libreplayssm_sd_torch.so
+python3 "$run" --geometry 27b --batches 4,32 --layout ragged --flush-fraction .5 \
+  --iterations 15 --path compact fold_first --verify-library "$verify" \
+  --output /tmp/replay-fold-first-smoke.json
+python3 "$run" --geometry 9b --batches 4,32 --layout padded --flush-fraction .5 \
+  --iterations 15 --path compact fold_first --verify-library "$verify" \
+  --output /tmp/replay-fold-first-padded.json
+for fraction in 0 .125 .625 1; do
+  python3 "$run" --geometry 27b --batches 32,64 --layers 48 --layout uniform \
+    --flush-fraction "$fraction" --path compact fold_first --iterations 35 \
+    --verify-library "$verify" --output "/tmp/replay-fold-first-27b-$fraction.json"
+  python3 "$run" --geometry 9b --batches 128,256 --layers 24 --layout uniform \
+    --flush-fraction "$fraction" --path compact fold_first --iterations 35 \
+    --verify-library "$verify" --output "/tmp/replay-fold-first-9b-$fraction.json"
+done
+```
+
+精度对照以相同初始状态的紧凑 V24 为参照。非 flush 行、已提交的 D
+历史、K/G ring、两组状态码与 checkpoint 要求逐元素一致。flush 行
+的候选输出和 D 可因浮点计算顺序变化而不同，容差为
+`atol=2e-5, rtol=0.008`，JSON 同时记录最大绝对差。混合长度烟测
+在图捕获后重写 offset，并检查无效跨度的状态和 cache 写入保护。
+
+Blue2 单 die，CANN 9.2.1。表内每格为 V24 → V25 的 GDN stack
+图回放 p50，单位 ms。每个 case 35 次，非 flush 行 pos7，flush 行
+pos15，base31，T4，checkpoint 重置在计时区间外。
+
+| 场景 | 0% flush | 12.5% flush | 62.5% flush | 100% flush |
+|---|---:|---:|---:|---:|
+| 27B TP4，B32，48 层 | 10.57 → 10.64 | 11.87 → 11.47 | 15.34 → 13.92 | 17.61 → 15.29 |
+| 27B TP4，B64，48 层 | 20.05 → 20.37 | 22.03 → 21.72 | 28.52 → 26.03 | 34.25 → 29.76 |
+| 9B TP1，B128，24 层 | 51.12 → 52.14 | 56.63 → 55.83 | 75.78 → 68.55 | 87.63 → 76.05 |
+| 9B TP1，B256，24 层 | 102.05 → 103.29 | 111.69 → 110.31 | 148.01 → 135.24 | 173.99 → 151.77 |
+
+V25 在全非 flush 慢 0.7%–2.0%，约 1/8 flush 时快 1.2%–3.3%，
+全 flush 快 12.8%–13.2%。最大观测误差为输出 1.53e-5、候选 D
+6.10e-5，checkpoint 与 V24 逐元素一致。服务 dispatch 保持现有
+版本，V25 的端到端收益取决于真实 flush 分布、延迟尾部和多轮精度。
+
+GPU 的两个 kernel 分别负责非 flush 和 flush，均能独立完成各自行
+的 verify。这样可分别调 tile 和核数，代价是固定图多一个设备 launch，
+并重复读路由元数据。V25 在一个 kernel 内复用 UB，但执行资源和任务
+切分需要兼容两种行。上述数字比较的是两版合一 kernel 的算法顺序，
+双 kernel 的 Ascend 性能需用同算法、同 flush 行分布另测。

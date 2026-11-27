@@ -22,7 +22,7 @@ constexpr uint32_t MAX_VALUE_HEADS = 32;
 // correction solve is evaluated in token order with the earlier corrections
 // held in UB; this is algebraically the same unit-triangular solve as Eq. 10
 // of the paper, but is not yet the final performance tiling.
-template <int VARIANT, bool PACKED_TOKENS = false>
+template <int VARIANT, bool PACKED_TOKENS = false, bool FOLD_FIRST = false>
 class ReplaySDVerify {
   static constexpr bool BULK_QKV = VARIANT == 11 || VARIANT == 13 || VARIANT == 14 ||
                                    (VARIANT >= 15 && VARIANT <= 24);
@@ -32,6 +32,7 @@ class ReplaySDVerify {
   static constexpr bool FUSED = VARIANT == 14 || VARIANT == 24;
 
   static_assert(!PACKED_TOKENS || VARIANT == 24);
+  static_assert(!FOLD_FIRST || PACKED_TOKENS);
 
  public:
   __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
@@ -423,6 +424,11 @@ class ReplaySDVerify {
         continue;
       }
 
+      const bool foldFirst = FOLD_FIRST && flush == 1 && pos > 0 &&
+                             CompactError(slot, ringSlot, pos, base, flush) == 0;
+      // A folded state already includes the committed window. The physical
+      // candidate write addresses still use the original ring position.
+      const int32_t projectionHistory = foldFirst ? 0 : pos;
       const uint64_t dOffset = static_cast<uint64_t>(ringSlot) * dStride_ +
                                static_cast<uint64_t>(head) * ringLen_ * V_DIM;
       const uint64_t kOffset = static_cast<uint64_t>(ringSlot) * kStride_ +
@@ -453,7 +459,9 @@ class ReplaySDVerify {
       for (int32_t i = 0; i < pos; ++i) {
         const uint32_t phys = Physical(base, i);
         historyAlpha[i] = historyGate_.GetValue(phys);
-        historyProduct *= historyAlpha[i];
+        if (!foldFirst) {
+          historyProduct *= historyAlpha[i];
+        }
         if constexpr (!BULK_HISTORY) {
           Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
         }
@@ -473,15 +481,17 @@ class ReplaySDVerify {
         }
       }
       if constexpr (VARIANT >= 7) {
-        // Suffix(i) = product of gates after history row i. It is shared by
-        // every candidate token and V tile; only specProduct changes per token.
-        float suffix = 1.0f;
-        for (int32_t i = pos - 1; i >= 0; --i) {
-          historySuffix_.SetValue(i, suffix);
-          suffix *= historyAlpha[i];
+        if (!foldFirst) {
+          // Suffix(i) = product of gates after history row i. It is shared by
+          // every candidate token and V tile; only specProduct changes per token.
+          float suffix = 1.0f;
+          for (int32_t i = pos - 1; i >= 0; --i) {
+            historySuffix_.SetValue(i, suffix);
+            suffix *= historyAlpha[i];
+          }
+          SetFlag<HardEvent::S_V>(EVENT_ID0);
+          WaitFlag<HardEvent::S_V>(EVENT_ID0);
         }
-        SetFlag<HardEvent::S_V>(EVENT_ID0);
-        WaitFlag<HardEvent::S_V>(EVENT_ID0);
       }
       for (int32_t s = 0; s < length; ++s) {
         const uint32_t gateIndex = s * valueHeads_ + head;
@@ -548,13 +558,13 @@ class ReplaySDVerify {
         if constexpr (VARIANT >= 5) {
           // Reduce all history rows together. V7 keeps history results in UB;
           // earlier variants convert each batched result to Scalar once.
-          if (pos > 0) {
+          if (projectionHistory > 0) {
             if constexpr (VARIANT >= 7) {
-              DotRowsToUB(historyK_, qVec, historyQDot_[s * MAX_HISTORY], pos);
-              DotRowsToUB(historyK_, kVec, historyKDot_[s * MAX_HISTORY], pos);
+              DotRowsToUB(historyK_, qVec, historyQDot_[s * MAX_HISTORY], projectionHistory);
+              DotRowsToUB(historyK_, kVec, historyKDot_[s * MAX_HISTORY], projectionHistory);
             } else {
-              DotRows(historyK_, qVec, historyQDot[s], pos);
-              DotRows(historyK_, kVec, historyKDot[s], pos);
+              DotRows(historyK_, qVec, historyQDot[s], projectionHistory);
+              DotRows(historyK_, kVec, historyKDot[s], projectionHistory);
             }
           }
           if constexpr (VARIANT == 8 || VARIANT == 17) {
@@ -631,7 +641,11 @@ class ReplaySDVerify {
                  historyD_[i * tileV_], tileV_);
           }
         }
-        if constexpr (VARIANT >= 7) {
+        if (foldFirst) {
+          // Only old ring records contribute. Keep the folded state in FP32
+          // through projection; the BF16 writeback remains after verify.
+          FoldHistoryInUB(historyAlpha, pos);
+        } else if constexpr (VARIANT >= 7) {
           // Broadcast requires an aligned leading dimension. Keep the
           // reduction at 16 rows, with absent history explicitly zeroed.
           if (pos < static_cast<int32_t>(MAX_HISTORY)) {
@@ -667,11 +681,11 @@ class ReplaySDVerify {
           Muls(prevK_, prevK_, historyProduct * specProduct, tileV_);
           PipeBarrier<PIPE_V>();
           if constexpr (VARIANT >= 7) {
-            if (pos > 0) {
-              Muls(scaledSuffix_, historySuffix_, specProduct, pos);
+            if (projectionHistory > 0) {
+              Muls(scaledSuffix_, historySuffix_, specProduct, projectionHistory);
               PipeBarrier<PIPE_V>();
-              AccumulateHistory(prevQ_, historyQDot_[s * MAX_HISTORY], pos);
-              AccumulateHistory(prevK_, historyKDot_[s * MAX_HISTORY], pos);
+              AccumulateHistory(prevQ_, historyQDot_[s * MAX_HISTORY], projectionHistory);
+              AccumulateHistory(prevK_, historyKDot_[s * MAX_HISTORY], projectionHistory);
             }
           } else {
             float suffix = specProduct;
@@ -755,9 +769,11 @@ class ReplaySDVerify {
       if constexpr (FUSED) {
         const int32_t compactError = CompactError(slot, ringSlot, pos, base, flush);
         if (compactError == 0 && flush == 1 && pos > 0) {
-          // The tile128 checkpoint and committed history remain in UB after
-          // verify. Fold only old records after all draft outputs are written.
-          FoldHistoryInUB(historyAlpha, pos);
+          // V24 folds after verification; fold-first already holds the
+          // updated FP32 checkpoint in the same UB tile.
+          if (!foldFirst) {
+            FoldHistoryInUB(historyAlpha, pos);
+          }
           if constexpr (WIDE_CHECKPOINT) {
             StoreCheckpointInProduct(stateOffset);
           } else {

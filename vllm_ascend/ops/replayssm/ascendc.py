@@ -132,7 +132,8 @@ def replayssm_sd_verify_compact_fused(
 ) -> None:
     """Run MTP3 verify and compact in one launch.
 
-    V24 can consume compact token-major inputs and write token-major output.
+    V24 and V25 can consume compact token-major inputs and write token-major
+    output. V25 folds committed history before projection on flush rows.
     In this mode token_offsets is the int32 prefix sum of valid lengths,
     including repeated offsets for graph padding. Only the valid token prefix
     is defined in out. Offsets must match the current Q/K/V, g and beta layout.

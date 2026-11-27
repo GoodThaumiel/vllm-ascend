@@ -17,6 +17,8 @@ from scripts.replayssm.profile_sd_operator_compare import package_versions  # no
 
 INPUTS = ("q", "k", "v", "g", "beta")
 PATHS = ("fixed", "pack_unpack", "compact")
+FOLD_FIRST_PATH = "fold_first"
+PACKED_PATHS = ("compact", FOLD_FIRST_PATH)
 RING_LEN = 32
 TILE_V = 128
 CORES = 40
@@ -84,7 +86,7 @@ def trial(args, batch, device):
     compact_out = torch.empty_like(compact_inputs[2])
     op = torch.ops.replayssm_sd_lab.fused_
 
-    def invoke(cache, inputs, out, token_offsets=None):
+    def invoke(cache, inputs, out, token_offsets=None, *, variant=24):
         op(
             *inputs,
             *(cache[name] for name in CACHE_NAMES),
@@ -100,7 +102,7 @@ def trial(args, batch, device):
             TILE_V,
             CORES,
             case["slots"],
-            24,
+            variant,
             token_offsets,
         )
 
@@ -133,24 +135,48 @@ def trial(args, batch, device):
         for cache in layers:
             reset_cache(cache)
 
-    def check_cache(cache, reference):
-        for name in CACHE_NAMES:
-            torch.testing.assert_close(cache[name].cpu(), reference[name], atol=0, rtol=0, equal_nan=True, msg=name)
+    def check_arithmetic(actual, reference, changed, name, errors):
+        torch.testing.assert_close(actual[~changed], reference[~changed], atol=0, rtol=0, equal_nan=True, msg=name)
+        actual, reference = actual[changed], reference[changed]
+        torch.testing.assert_close(actual, reference, atol=2e-5, rtol=0.008, msg=name)
+        if actual.numel():
+            errors[name] = max(errors.get(name, 0), (actual.float() - reference.float()).abs().max().item())
 
-    def check_compact(out, reference):
+    def check_cache(cache, reference, path, query_lengths, errors):
+        for name in CACHE_NAMES:
+            if path == FOLD_FIRST_PATH and name == "d_cache" and flush_count:
+                # Only the newly generated D in a flushed row can change.
+                changed = torch.zeros(cache[name].shape[0], RING_LEN, dtype=torch.bool)
+                for row in flush_rows.tolist():
+                    start = int(cpu["bases"][row]) + int(cpu["positions"][row])
+                    positions = (torch.arange(int(query_lengths[row])) + start) % RING_LEN
+                    changed[cpu["slots"][row], positions] = True
+                check_arithmetic(
+                    cache[name].cpu().transpose(1, 2), reference[name].transpose(1, 2), changed, name, errors
+                )
+            else:
+                torch.testing.assert_close(cache[name].cpu(), reference[name], atol=0, rtol=0, equal_nan=True, msg=name)
+
+    def check_compact(out, reference, path, query_lengths, errors):
         check_status()
-        torch.testing.assert_close(out[:tokens].cpu(), reference, atol=0, rtol=0)
+        actual = out[:tokens].cpu()
+        if path == FOLD_FIRST_PATH and flush_count:
+            rows = torch.repeat_interleave(torch.arange(batch), query_lengths)
+            check_arithmetic(actual, reference, torch.isin(rows, flush_rows), "out", errors)
+        else:
+            torch.testing.assert_close(actual, reference, atol=0, rtol=0)
         if out.size(0) > tokens:
             assert torch.isnan(out[tokens:]).all().item(), "compact output wrote into padding"
 
     rows = []
     outputs = []
-    for path in PATHS:
-        if path == "compact":
+    for path in args.path:
+        errors = {}
+        if path in PACKED_PATHS:
 
-            def call_stack():
+            def call_stack(variant=25 if path == FOLD_FIRST_PATH else 24):
                 for cache in layers:
-                    invoke(cache, compact_inputs, compact_out, offsets)
+                    invoke(cache, compact_inputs, compact_out, offsets, variant=variant)
 
         elif path == "fixed":
 
@@ -172,23 +198,23 @@ def trial(args, batch, device):
                     else:
                         outputs[index] = unpacked
 
-        def check_stack(graph, path=path):
+        def check_stack(graph, path=path, errors=errors):
             reset_stack()
             reset_status()
             compact_out.fill_(float("nan"))
             fixed_out.fill_(float("nan"))
             graph.replay()
-            if path == "compact":
-                check_compact(compact_out, expected_out)
+            if path in PACKED_PATHS:
+                check_compact(compact_out, expected_out, path, lengths, errors)
             else:
                 check_status()
                 result = outputs[-1] if path == "pack_unpack" else fixed_out.flatten(0, 1).index_select(0, pick)
                 torch.testing.assert_close(result.cpu(), expected_out, atol=0, rtol=0)
-            check_cache(layers[0], expected_cache)
+            check_cache(layers[0], expected_cache, path, lengths, errors)
             if len(layers) > 1:
-                check_cache(layers[-1], expected_cache)
+                check_cache(layers[-1], expected_cache, path, lengths, errors)
 
-            if path == "compact" and args.layout == "ragged" and batch > 1:
+            if path in PACKED_PATHS and args.layout == "ragged" and batch > 1:
                 # Keep the same number of tokens and buffer addresses, but change
                 # their request boundaries after capture. Rebuild the fixed oracle
                 # using those same flat Q/K/V/g/beta values.
@@ -198,6 +224,12 @@ def trial(args, batch, device):
                 case["lengths"].copy_(changed_lengths)
                 for dest, src in zip(fixed_inputs, compact_inputs):
                     dest.flatten(0, 1).index_copy_(0, changed_pick, src)
+                if path == FOLD_FIRST_PATH:
+                    # Both graphs start from the same previous ring bytes,
+                    # including candidates outside the changed window.
+                    for cache in layers:
+                        for name in CACHE_NAMES[1:]:
+                            cache[name].copy_(expected_cache[name])
                 changed_expected, changed_cache = capture_expected(changed_pick)
                 # The positive check also compares bytes outside the new valid
                 # history. Restore the fixed oracle's input ring before replay.
@@ -207,14 +239,16 @@ def trial(args, batch, device):
                 reset_status()
                 compact_out.fill_(float("nan"))
                 graph.replay()
-                check_compact(compact_out, changed_expected)
-                check_cache(layers[0], changed_cache)
+                check_compact(compact_out, changed_expected, path, changed_lengths, errors)
+                check_cache(layers[0], changed_cache, path, changed_lengths, errors)
                 if len(layers) > 1:
-                    check_cache(layers[-1], changed_cache)
+                    check_cache(layers[-1], changed_cache, path, changed_lengths, errors)
 
                 if batch == 4:
                     # Make only the last row invalid. It must write a status
                     # without touching its output or checkpoint/ring slots.
+                    bad_ring_slot = int(cpu["slots"][-1])
+                    ring_snapshot = {name: layers[-1][name][bad_ring_slot].cpu() for name in CACHE_NAMES[1:]}
                     offsets[-1] = tokens + 1
                     reset_stack()
                     reset_status()
@@ -229,11 +263,10 @@ def trial(args, batch, device):
                     bad_checkpoint_slot = int(cpu["slots"][-1]) + 1
                     last_initial = cpu["checkpoint"][bad_checkpoint_slot - 1]
                     torch.testing.assert_close(layers[-1]["checkpoint"][bad_checkpoint_slot].cpu(), last_initial)
-                    bad_ring_slot = int(cpu["slots"][-1])
                     for name in CACHE_NAMES[1:]:
                         torch.testing.assert_close(
                             layers[-1][name][bad_ring_slot].cpu(),
-                            changed_cache[name][bad_ring_slot],
+                            ring_snapshot[name],
                             atol=0,
                             rtol=0,
                             equal_nan=True,
@@ -241,7 +274,17 @@ def trial(args, batch, device):
 
         label = f"{args.geometry}/b{batch}/{args.layout}/f{flush_count}/{path}/layers{args.layers}"
         timing = measure(call_stack, reset_stack, args.iterations, label, check_graph=check_stack)
-        rows.append(dict(path=path, batch=batch, tokens=tokens, flush_rows=flush_count, **timing))
+        rows.append(dict(path=path, batch=batch, tokens=tokens, flush_rows=flush_count, errors=errors, **timing))
+        if path in PACKED_PATHS and args.layout == "ragged" and batch > 1:
+            # Each variant's timing must start from the same request boundaries.
+            initial_offsets, _ = layout_tensors(lengths, device)
+            offsets.copy_(initial_offsets)
+            case["lengths"].copy_(lengths)
+            for name, original in zip(INPUTS, fixed_inputs):
+                original.copy_(cpu[name])
+            for cache in layers:
+                for name in CACHE_NAMES[1:]:
+                    cache[name].copy_(expected_cache[name])
     return rows
 
 
@@ -251,6 +294,7 @@ def main():
     parser.add_argument("--batches", type=batches, required=True)
     parser.add_argument("--layout", choices=("uniform", "ragged", "padded"), default="ragged")
     parser.add_argument("--flush-fraction", type=float, default=0.125)
+    parser.add_argument("--path", nargs="+", choices=(*PATHS, FOLD_FIRST_PATH), default=PATHS)
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--device", type=int, default=0)

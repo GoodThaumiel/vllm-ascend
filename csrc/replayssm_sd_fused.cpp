@@ -9,6 +9,7 @@
 #include "aclrtlaunch_replayssm_sd_verify_compact_fused.h"
 #include "aclrtlaunch_replayssm_sd_verify_compact_fused_v24.h"
 #include "aclrtlaunch_replayssm_sd_verify_compact_fused_packed.h"
+#include "aclrtlaunch_replayssm_sd_verify_compact_fused_fold_first.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,8 +33,9 @@ void replayssm_sd_verify_compact_fused(
     TORCH_CHECK(t.device() == q.device(), "All tensors must be on one NPU");
   }
   const bool packed = token_offsets.has_value();
-  TORCH_CHECK(variant == 14 || variant == 24, "Fused verify variant must be 14 or 24");
-  TORCH_CHECK(!packed || variant == 24, "Token offsets require fused verify variant 24");
+  TORCH_CHECK(variant == 14 || variant == 24 || variant == 25, "Fused verify variant must be 14, 24 or 25");
+  TORCH_CHECK(!packed || variant != 14, "Token offsets require fused verify variant 24 or 25");
+  TORCH_CHECK(variant != 25 || packed, "Fold-first verify requires token offsets");
   const int64_t rank = packed ? 3 : 4;
   const int64_t batch = slots.numel();
   TORCH_CHECK(batch > 0 && batch <= 1024, "Invalid batch dimension");
@@ -51,8 +53,8 @@ void replayssm_sd_verify_compact_fused(
   TORCH_CHECK(heads > 0 && value_heads > 0 && value_heads <= 32 && value_heads % heads == 0,
               "Invalid head dimensions");
   TORCH_CHECK((heads == 4 && value_heads == 12) || (heads == 2 && value_heads == 6) ||
-                  (variant == 24 && heads == 16 && value_heads == 32),
-              "Fusion supports 27B TP4/TP8 and 9B TP1 (V24)");
+                  (variant != 14 && heads == 16 && value_heads == 32),
+              "Fusion supports 27B TP4/TP8 and 9B TP1 (V24/V25)");
   TORCH_CHECK(g.sizes() == v.sizes().slice(0, rank - 1) &&
                   beta.sizes() == g.sizes() && g.scalar_type() == at::kFloat &&
                   beta.scalar_type() == at::kFloat && g.is_contiguous() && beta.is_contiguous(),
@@ -124,7 +126,8 @@ void replayssm_sd_verify_compact_fused(
         static_cast<float>(scale), extra...);
   };
   const auto result = packed
-      ? dispatch(&aclrtlaunch_replayssm_sd_verify_compact_fused_packed, *token_offsets,
+      ? dispatch(variant == 25 ? &aclrtlaunch_replayssm_sd_verify_compact_fused_fold_first
+                               : &aclrtlaunch_replayssm_sd_verify_compact_fused_packed, *token_offsets,
                  static_cast<uint32_t>(q.size(0)))
       : dispatch(variant == 24 ? &aclrtlaunch_replayssm_sd_verify_compact_fused_v24
                                : &aclrtlaunch_replayssm_sd_verify_compact_fused, lengths);
