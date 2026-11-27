@@ -37,8 +37,9 @@ struct Inputs {
   GlobalTensor<bfloat16_t> q, k, v, checkpoint, out, zeros;
   GlobalTensor<half> d, keys;
   GlobalTensor<float> g, beta, gates, scratch;
-  GlobalTensor<int32_t> slots, ringSlots, pos, base, length, status, flush;
-  uint32_t batch, hk, hv, numSlots, numRingSlots, blocks;
+  GlobalTensor<int32_t> slots, ringSlots, pos, base, length, status, flush, tokenOffsets;
+  uint32_t batch, hk, hv, numSlots, numRingSlots, blocks, tokenCount;
+  uint64_t checkpointStride;
   bool perHeadWorkspace, balanceHeads;
 
   __aicore__ inline uint32_t FirstTask(uint32_t block, uint32_t group) const {
@@ -61,11 +62,31 @@ struct Inputs {
     return balanceHeads ? groupEnd : task + blocks * group;
   }
 
-  __aicore__ inline uint64_t KeyInput(uint32_t row, uint32_t key) const {
-    return (static_cast<uint64_t>(row) * TOKENS * hk + key) * DIM;
+  __aicore__ inline int32_t ReadWindow(uint32_t row, uint32_t &tokenStart) {
+    const int32_t len = length.GetValue(row);
+    if (tokenCount == 0) {
+      tokenStart = row * TOKENS;
+      return len;
+    }
+    const int32_t begin = tokenOffsets.GetValue(row);
+    const int32_t end = tokenOffsets.GetValue(row + 1);
+    if (begin < 0 || end < begin || static_cast<uint32_t>(end) > tokenCount ||
+        end - begin != len) {
+      return -1;
+    }
+    tokenStart = begin;
+    return len;
   }
-  __aicore__ inline uint64_t Output(uint32_t row, uint32_t t, uint32_t head) const {
-    return ((static_cast<uint64_t>(row) * TOKENS + t) * hv + head) * DIM;
+
+  __aicore__ inline uint64_t KeyInput(uint32_t tokenStart, uint32_t key) const {
+    return (static_cast<uint64_t>(tokenStart) * hk + key) * DIM;
+  }
+  __aicore__ inline uint64_t Output(uint32_t tokenStart, uint32_t t, uint32_t head) const {
+    return ((static_cast<uint64_t>(tokenStart) + t) * hv + head) * DIM;
+  }
+
+  __aicore__ inline uint64_t Checkpoint(uint32_t slot, uint32_t head, uint32_t vStart = 0) const {
+    return slot * checkpointStride + (head * DIM + vStart) * DIM;
   }
 
   __aicore__ inline uint64_t Projection(uint32_t block, uint32_t row, uint32_t head) const {
@@ -92,13 +113,16 @@ class Projector {
       const uint32_t key = firstHead / group;
       const uint32_t groupEnd = x.GroupEnd(task, end, group);
       const int32_t slot = x.slots.GetValue(row);
-      const bool valid = slot > 0 && static_cast<uint32_t>(slot) < x.numSlots;
+      uint32_t tokenStart = row * TOKENS;
+      const int32_t len = x.tokenCount ? x.ReadWindow(row, tokenStart) : TOKENS;
+      const bool valid = slot > 0 && static_cast<uint32_t>(slot) < x.numSlots &&
+                         len > 0 && len <= TOKENS;
       if (valid) {
-        StageRhs(x, row, key);
+        StageRhs(x, tokenStart, key, len);
       }
       for (uint32_t head = firstHead; head < firstHead + groupEnd - task; ++head) {
         if (valid) {
-          const uint64_t stateOff = (static_cast<uint64_t>(slot) * x.hv + head) * DIM * DIM;
+          const uint64_t stateOff = x.Checkpoint(slot, head);
           Project(x, stateOff, x.Projection(block, row, head), head == firstHead);
         }
         // Pad/error rows have the same handshakes. The AIVs skip the read.
@@ -123,15 +147,18 @@ class Projector {
     DataCopy(dst, src, p);
   }
 
-  __aicore__ inline void StageRhs(Inputs &x, uint32_t row, uint32_t key) {
+  __aicore__ inline void StageRhs(Inputs &x, uint32_t tokenStart, uint32_t key, uint32_t len) {
     // NZ for [N,K]. Each tile has 16 rows; K goes in 0..3 and Q in 4..7.
     // Clear only the unused lanes. A full L1 clear would overlap the K/Q
     // destinations, and successive MTE2 writes can be in flight together.
     auto b1 = b1_.Get<bfloat16_t>();
-    const auto off = x.KeyInput(row, key);
-    ToL1(b1, x.k[off], TOKENS, x.hk * DIM, COLS);
-    ToL1(b1[TOKENS * 16], x.q[off], TOKENS, x.hk * DIM, COLS);
-    ToL1(b1[2 * TOKENS * 16], x.zeros, COLS - 2 * TOKENS, DIM, COLS);
+    const auto off = x.KeyInput(tokenStart, key);
+    ToL1(b1, x.k[off], len, x.hk * DIM, COLS);
+    ToL1(b1[TOKENS * 16], x.q[off], len, x.hk * DIM, COLS);
+    if (len < TOKENS) {
+      ToL1(b1[len * 16], x.zeros, TOKENS - len, DIM, COLS);
+    }
+    ToL1(b1[(TOKENS + len) * 16], x.zeros, COLS - TOKENS - len, DIM, COLS);
   }
 
   __aicore__ inline void LoadRhsFromL1() {
@@ -214,8 +241,9 @@ class Consumer {
       const int32_t ring = x.ringSlots.GetValue(row);
       const int32_t pos = x.pos.GetValue(row);
       const int32_t base = x.base.GetValue(row);
-      const int32_t len = x.length.GetValue(row);
-      int32_t error = Validate(x, slot, ring, pos, base, len);
+      uint32_t tokenStart = 0;
+      const int32_t len = x.ReadWindow(row, tokenStart);
+      int32_t error = x.tokenCount && len < 0 ? 6 : Validate(x, slot, ring, pos, base, len);
       bool fold = false;
       if constexpr (FuseFold) {
         const int32_t flush = x.flush.GetValue(row);
@@ -226,7 +254,7 @@ class Consumer {
       }
       const bool valid = error == 0 && slot != 0;
       if (valid) {
-        MakeDots(x, row, key, ring, pos, base, len);
+        MakeDots(x, tokenStart, key, ring, pos, base, len);
       }
       for (uint32_t head = firstHead; head < firstHead + groupEnd - task; ++head) {
         if (valid && pos > 0) {
@@ -257,22 +285,22 @@ class Consumer {
           uint64_t stateTile = 0;
           if constexpr (FuseFold) {
             if (fold) {
-              stateTile = ((static_cast<uint64_t>(slot) * x.hv + head) * DIM + vStart) * DIM;
+              stateTile = x.Checkpoint(slot, head, vStart);
               // READY covers the AIC's checkpoint read for this head.
               auto dst = foldIn_.AllocTensor<bfloat16_t>();
               DataCopy(dst, x.checkpoint[stateTile], TILE * DIM);
               foldIn_.EnQue(dst);
             }
           }
-          const float alpha = Correct(x, row, head, ring, pos, base, len, vStart);
+          const float alpha = Correct(x, tokenStart, head, ring, pos, base, len, vStart);
           if constexpr (FuseFold) {
             if (fold) {
               FoldCheckpoint(x.checkpoint[stateTile], pos, alpha);
             }
           }
         }
-        if (!valid || len < TOKENS) {
-          ZeroTail(x, row, head, vStart, valid ? len : 0);
+        if (x.tokenCount == 0 && (!valid || len < TOKENS)) {
+          ZeroTail(x, tokenStart, head, vStart, valid ? len : 0);
         }
         if (sub == 0) {
           StoreStatus(x, row * x.hv + head, error);
@@ -420,7 +448,7 @@ class Consumer {
     historyIn_.FreeTensor(input);
   }
 
-  __aicore__ inline void MakeDots(Inputs &x, uint32_t row, uint32_t key, uint32_t ring, uint32_t pos,
+  __aicore__ inline void MakeDots(Inputs &x, uint32_t tokenStart, uint32_t key, uint32_t ring, uint32_t pos,
                                   uint32_t base, uint32_t len) {
     if (pos) {
       const uint64_t kOffset = (static_cast<uint64_t>(ring) * x.hk + key) * RING * DIM;
@@ -429,7 +457,7 @@ class Consumer {
     auto rhs = rhs_.Get<float>();
     Duplicate(rhs, 0.0f, PanelCols * DIM);
     PipeBarrier<PIPE_V>();
-    const uint64_t off = x.KeyInput(row, key);
+    const uint64_t off = x.KeyInput(tokenStart, key);
     if constexpr (BulkQkv) {
       LoadCandidateRows(rhs, x.k[off], len, DIM, x.hk * DIM);
       LoadCandidateRows(rhs[TOKENS * DIM], x.q[off], len, DIM, x.hk * DIM);
@@ -599,7 +627,7 @@ class Consumer {
     }
   }
 
-  __aicore__ inline float Correct(Inputs &x, uint32_t row, uint32_t head, uint32_t ring, uint32_t pos,
+  __aicore__ inline float Correct(Inputs &x, uint32_t tokenStart, uint32_t head, uint32_t ring, uint32_t pos,
                                  uint32_t base, uint32_t len, uint32_t vStart) {
     auto proj = proj_.Get<float>();
     auto d = delta_.Get<float>();
@@ -619,9 +647,9 @@ class Consumer {
     if (pos > first) {
       LoadGates(gates[RING], x.gates[ringHead], pos - first);
     }
-    LoadCandidates(x, x.Output(row, 0, head) / DIM, logGate, decay, beta);
+    LoadCandidates(x, x.Output(tokenStart, 0, head) / DIM, logGate, decay, beta, x.tokenCount ? len : TOKENS);
     if constexpr (BulkQkv) {
-      LoadCandidateRows(values_.Get<float>(), x.v[x.Output(row, 0, head) + vStart], len, TILE, x.hv * DIM);
+      LoadCandidateRows(values_.Get<float>(), x.v[x.Output(tokenStart, 0, head) + vStart], len, TILE, x.hv * DIM);
     }
     auto rows = historyRows_.Get<float>();
     if (pos) {
@@ -657,11 +685,11 @@ class Consumer {
       }
     }
     if constexpr (TriangularSolve) {
-      SolveCandidates(x, x.Output(row, 0, head), ringHead, base, pos, len, vStart, decay, beta, logGate);
+      SolveCandidates(x, x.Output(tokenStart, 0, head), ringHead, base, pos, len, vStart, decay, beta, logGate);
       return historyDecay;
     }
     for (uint32_t t = 0; t < len; ++t) {
-      const uint64_t out = x.Output(row, t, head);
+      const uint64_t out = x.Output(tokenStart, t, head);
       const auto record = Physical(base, pos + t);
       const uint32_t lane = t * FLOAT_LANES_PER_BLOCK;
       Muls(proj, proj, decay.GetValue(lane), PANEL);
@@ -725,14 +753,14 @@ class Consumer {
   }
 
   __aicore__ inline void LoadCandidates(Inputs &x, uint64_t offset, LocalTensor<float> logGate,
-                                        LocalTensor<float> decay, LocalTensor<float> beta) {
+                                        LocalTensor<float> decay, LocalTensor<float> beta, uint32_t len) {
     // One FP32 scalar per token, padded to eight FP32 lanes in UB.
-    DataCopyExtParams p{TOKENS, sizeof(float), static_cast<uint32_t>((x.hv - 1) * sizeof(float)), 0, 0};
+    DataCopyExtParams p{static_cast<uint16_t>(len), sizeof(float), static_cast<uint32_t>((x.hv - 1) * sizeof(float)), 0, 0};
     DataCopyPadExtParams<float> padding{true, 0, FLOAT_LANES_PER_BLOCK - 1, 0.0f};
     DataCopyPad(logGate, x.g[offset], p, padding);
     DataCopyPad(beta, x.beta[offset], p, padding);
     Fence<HardEvent::MTE2_V>(candidatesReady_);
-    Exp(decay, logGate, CANDIDATE_SCALARS);
+    Exp(decay, logGate, len * FLOAT_LANES_PER_BLOCK);
     Fence<HardEvent::V_S>();
   }
 
@@ -745,13 +773,13 @@ class Consumer {
     Fence<HardEvent::V_S>();
   }
 
-  __aicore__ inline void ZeroTail(Inputs &x, uint32_t row, uint32_t head, uint32_t vStart,
+  __aicore__ inline void ZeroTail(Inputs &x, uint32_t tokenStart, uint32_t head, uint32_t vStart,
                                   uint32_t len) {
     auto zero = selected_.Get<float>();
     Duplicate(zero, 0.0f, TILE);
     PipeBarrier<PIPE_V>();
     for (uint32_t t = len; t < TOKENS; ++t) {
-      StoreCast(x.out[x.Output(row, t, head) + vStart], zero, TILE);
+      StoreCast(x.out[x.Output(tokenStart, t, head) + vStart], zero, TILE);
     }
   }
 
@@ -771,7 +799,8 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
     GM_ADDR d, GM_ADDR keys, GM_ADDR gates, GM_ADDR slots, GM_ADDR ringSlots,
     GM_ADDR pos, GM_ADDR base, GM_ADDR length, GM_ADDR out, GM_ADDR status, GM_ADDR zeros,
-    GM_ADDR scratch, GM_ADDR flush, uint32_t batch, uint32_t hk, uint32_t hv, uint32_t numSlots,
+    GM_ADDR scratch, GM_ADDR flush, GM_ADDR tokenOffsets, uint32_t tokenCount,
+    uint64_t checkpointStride, uint32_t batch, uint32_t hk, uint32_t hv, uint32_t numSlots,
     uint32_t numRingSlots, uint32_t blocks, uint32_t perHeadWorkspace, uint32_t panelMode, uint32_t balanceHeads) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
   Inputs x;
@@ -790,10 +819,13 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   x.base.SetGlobalBuffer((__gm__ int32_t *)base);
   x.length.SetGlobalBuffer((__gm__ int32_t *)length);
   x.flush.SetGlobalBuffer((__gm__ int32_t *)flush);
+  x.tokenOffsets.SetGlobalBuffer((__gm__ int32_t *)tokenOffsets);
   x.out.SetGlobalBuffer((__gm__ bfloat16_t *)out);
   x.status.SetGlobalBuffer((__gm__ int32_t *)status);
   x.zeros.SetGlobalBuffer((__gm__ bfloat16_t *)zeros);
   x.scratch.SetGlobalBuffer((__gm__ float *)scratch);
+  x.tokenCount = tokenCount;
+  x.checkpointStride = checkpointStride;
   x.batch = batch;
   x.hk = hk;
   x.hv = hv;

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare fixed-slot and compact V24 on the same data and NPU graph."""
+"""Compare fixed-slot, compact vector and mixed verify on the same NPU graph inputs."""
 
 import argparse
 import hashlib
@@ -18,7 +18,8 @@ from scripts.replayssm.profile_sd_operator_compare import package_versions  # no
 INPUTS = ("q", "k", "v", "g", "beta")
 PATHS = ("fixed", "pack_unpack", "compact")
 FOLD_FIRST_PATH = "fold_first"
-PACKED_PATHS = ("compact", FOLD_FIRST_PATH)
+MIXED_PATH = "mixed_fold"
+PACKED_PATHS = ("compact", FOLD_FIRST_PATH, MIXED_PATH)
 RING_LEN = 32
 TILE_V = 128
 CORES = 40
@@ -106,6 +107,34 @@ def trial(args, batch, device):
             token_offsets,
         )
 
+    if MIXED_PATH in args.path:
+        rhs_zeros = torch.zeros((16, 128), dtype=fixed_inputs[0].dtype, device=device)
+        blocks = min(20, batch * fixed_inputs[0].size(2))
+        scratch = torch.empty((blocks, 128, 16), dtype=torch.float32, device=device)
+
+    def invoke_mixed(cache, inputs, out, token_offsets=None):
+        torch.ops.replayssm_mix_910b.verify_(
+            *inputs,
+            *(cache[name] for name in CACHE_NAMES),
+            slots,
+            case["slots"],
+            case["positions"],
+            case["bases"],
+            case["lengths"],
+            out,
+            verify_status,
+            rhs_zeros,
+            scratch,
+            20,
+            True,
+            False,
+            True,
+            args.mixed_balanced,
+            4,
+            flush,
+            token_offsets,
+        )
+
     def reset_cache(cache):
         if flush_count:
             cache["checkpoint"].index_copy_(0, restore_slots, restore_state)
@@ -114,26 +143,39 @@ def trial(args, batch, device):
         verify_status.fill_(-1)
         compact_status.fill_(-1)
 
-    def check_status():
+    def check_status(path):
         torch.testing.assert_close(verify_status.cpu(), torch.zeros_like(verify_status, device="cpu"))
-        torch.testing.assert_close(compact_status.cpu(), torch.zeros_like(compact_status, device="cpu"))
+        if path != MIXED_PATH:
+            torch.testing.assert_close(compact_status.cpu(), torch.zeros_like(compact_status, device="cpu"))
 
-    def capture_expected(valid_indices=pick):
+    def capture_expected(valid_indices=pick, path="fixed"):
         reset_cache(case)
         reset_status()
-        invoke(case, fixed_inputs, fixed_out)
-        check_status()
+        oracle = invoke_mixed if path == MIXED_PATH else invoke
+        oracle(case, fixed_inputs, fixed_out)
+        check_status(path)
         expected_out = fixed_out.flatten(0, 1).index_select(0, valid_indices).cpu()
         expected_cache = {name: case[name].cpu() for name in CACHE_NAMES}
         reset_cache(case)
         return expected_out, expected_cache
 
-    expected_out, expected_cache = capture_expected()
-    layers = [case] + [{name: case[name].clone() for name in CACHE_NAMES} for _ in range(args.layers - 1)]
+    input_ring = {name: cpu[name] for name in CACHE_NAMES[1:]}
 
-    def reset_stack():
-        for cache in layers:
-            reset_cache(cache)
+    def make_layers(path):
+        layers = []
+        for _ in range(args.layers):
+            cache = {name: case[name].clone() for name in CACHE_NAMES[1:]}
+            initial = case["checkpoint"]
+            if path == MIXED_PATH:
+                # Add a gap between slots to model shared KV pages.
+                strides = (initial.stride(0) + 128, *initial.stride()[1:])
+                cache["checkpoint"] = torch.empty_strided(
+                    initial.shape, strides, dtype=initial.dtype, device=device
+                ).copy_(initial)
+            else:
+                cache["checkpoint"] = initial.clone()
+            layers.append(cache)
+        return layers
 
     def check_arithmetic(actual, reference, changed, name, errors):
         torch.testing.assert_close(actual[~changed], reference[~changed], atol=0, rtol=0, equal_nan=True, msg=name)
@@ -158,7 +200,7 @@ def trial(args, batch, device):
                 torch.testing.assert_close(cache[name].cpu(), reference[name], atol=0, rtol=0, equal_nan=True, msg=name)
 
     def check_compact(out, reference, path, query_lengths, errors):
-        check_status()
+        check_status(path)
         actual = out[:tokens].cpu()
         if path == FOLD_FIRST_PATH and flush_count:
             rows = torch.repeat_interleave(torch.arange(batch), query_lengths)
@@ -168,11 +210,25 @@ def trial(args, batch, device):
         if out.size(0) > tokens:
             assert torch.isnan(out[tokens:]).all().item(), "compact output wrote into padding"
 
-    rows = []
-    outputs = []
-    for path in args.path:
+    def test_path(path):
         errors = {}
-        if path in PACKED_PATHS:
+        outputs = []
+        for name, initial in input_ring.items():
+            case[name].copy_(initial)
+        layers = make_layers(path)
+
+        def reset_stack():
+            for cache in layers:
+                reset_cache(cache)
+
+        expected_out, expected_cache = capture_expected(path=path)
+        if path == MIXED_PATH:
+
+            def call_stack():
+                for cache in layers:
+                    invoke_mixed(cache, compact_inputs, compact_out, offsets)
+
+        elif path in PACKED_PATHS:
 
             def call_stack(variant=25 if path == FOLD_FIRST_PATH else 24):
                 for cache in layers:
@@ -207,7 +263,7 @@ def trial(args, batch, device):
             if path in PACKED_PATHS:
                 check_compact(compact_out, expected_out, path, lengths, errors)
             else:
-                check_status()
+                check_status(path)
                 result = outputs[-1] if path == "pack_unpack" else fixed_out.flatten(0, 1).index_select(0, pick)
                 torch.testing.assert_close(result.cpu(), expected_out, atol=0, rtol=0)
             check_cache(layers[0], expected_cache, path, lengths, errors)
@@ -224,17 +280,13 @@ def trial(args, batch, device):
                 case["lengths"].copy_(changed_lengths)
                 for dest, src in zip(fixed_inputs, compact_inputs):
                     dest.flatten(0, 1).index_copy_(0, changed_pick, src)
-                if path == FOLD_FIRST_PATH:
-                    # Both graphs start from the same previous ring bytes,
-                    # including candidates outside the changed window.
+                # The oracle and replay must see the same ring bytes even
+                # outside the newly assigned candidate window.
+                for name, initial in input_ring.items():
+                    case[name].copy_(initial)
                     for cache in layers:
-                        for name in CACHE_NAMES[1:]:
-                            cache[name].copy_(expected_cache[name])
-                changed_expected, changed_cache = capture_expected(changed_pick)
-                # The positive check also compares bytes outside the new valid
-                # history. Restore the fixed oracle's input ring before replay.
-                for name in CACHE_NAMES[1:]:
-                    case[name].copy_(expected_cache[name])
+                        cache[name].copy_(initial)
+                changed_expected, changed_cache = capture_expected(changed_pick, path)
                 reset_stack()
                 reset_status()
                 compact_out.fill_(float("nan"))
@@ -256,8 +308,9 @@ def trial(args, batch, device):
                     graph.replay()
                     statuses = verify_status.cpu().view(batch, value_heads)
                     assert (statuses[:-1] == 0).all() and (statuses[-1] == 6).all()
-                    statuses = compact_status.cpu().view(batch, value_heads * 4)
-                    assert (statuses[:-1] == 0).all() and (statuses[-1] == 6).all()
+                    if path != MIXED_PATH:
+                        statuses = compact_status.cpu().view(batch, value_heads * 4)
+                        assert (statuses[:-1] == 0).all() and (statuses[-1] == 6).all()
                     last_start = int(changed_lengths[:-1].sum())
                     assert torch.isnan(compact_out[last_start:]).all().item()
                     bad_checkpoint_slot = int(cpu["slots"][-1]) + 1
@@ -274,7 +327,6 @@ def trial(args, batch, device):
 
         label = f"{args.geometry}/b{batch}/{args.layout}/f{flush_count}/{path}/layers{args.layers}"
         timing = measure(call_stack, reset_stack, args.iterations, label, check_graph=check_stack)
-        rows.append(dict(path=path, batch=batch, tokens=tokens, flush_rows=flush_count, errors=errors, **timing))
         if path in PACKED_PATHS and args.layout == "ragged" and batch > 1:
             # Each variant's timing must start from the same request boundaries.
             initial_offsets, _ = layout_tensors(lengths, device)
@@ -282,10 +334,9 @@ def trial(args, batch, device):
             case["lengths"].copy_(lengths)
             for name, original in zip(INPUTS, fixed_inputs):
                 original.copy_(cpu[name])
-            for cache in layers:
-                for name in CACHE_NAMES[1:]:
-                    cache[name].copy_(expected_cache[name])
-    return rows
+        return dict(path=path, batch=batch, tokens=tokens, flush_rows=flush_count, errors=errors, **timing)
+
+    return [test_path(path) for path in args.path]
 
 
 def main():
@@ -294,15 +345,20 @@ def main():
     parser.add_argument("--batches", type=batches, required=True)
     parser.add_argument("--layout", choices=("uniform", "ragged", "padded"), default="ragged")
     parser.add_argument("--flush-fraction", type=float, default=0.125)
-    parser.add_argument("--path", nargs="+", choices=(*PATHS, FOLD_FIRST_PATH), default=PATHS)
+    parser.add_argument("--path", nargs="+", choices=(*PATHS, FOLD_FIRST_PATH, MIXED_PATH), default=PATHS)
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--verify-library", type=Path, required=True)
+    parser.add_argument("--mixed-library", type=Path)
+    parser.add_argument("--mixed-balanced", action="store_true", help="Split key-head groups across Cube blocks")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.flush_fraction <= 1 or not 1 <= args.layers <= 48 or args.iterations < 1:
         parser.error("Expected flush-fraction in [0,1], 1..48 layers, and at least one iteration")
+
+    if MIXED_PATH in args.path and args.mixed_library is None:
+        parser.error("--path mixed_fold requires --mixed-library")
 
     import torch_npu  # noqa: F401
 
@@ -310,6 +366,10 @@ def main():
     device = torch.device(f"npu:{args.device}")
     library = args.verify_library.resolve(strict=True)
     torch.ops.load_library(str(library))
+    mixed_library = None
+    if args.mixed_library is not None:
+        mixed_library = args.mixed_library.resolve(strict=True)
+        torch.ops.load_library(str(mixed_library))
     report = dict(
         status="RUNNING",
         config=vars(args),
@@ -318,6 +378,8 @@ def main():
         library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
         rows=[],
     )
+    if mixed_library is not None:
+        report["mixed_library_sha256"] = hashlib.sha256(mixed_library.read_bytes()).hexdigest()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
         for batch in args.batches:
