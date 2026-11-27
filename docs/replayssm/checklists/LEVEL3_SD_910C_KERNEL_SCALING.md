@@ -106,3 +106,39 @@ done
 在 48/24 层 GDN stack 上，混合 flush 时 native / 最快 Replay p50 为 27B B32 9.06/11.77 ms、B64 17.77/20.68 ms，9B B256 88.98/107.12 ms。全无 flush 时为 9.02/9.73、17.79/17.49、88.95/93.03 ms。每层独立 cache，计时省略模型其余部分。9B HTTP 短文本对照中，native 与 V20 都完成 256 条请求。Native 实际记录的最大 FULL decode 图是 192 行，V20 发出过 256 行的图。两者未形成相同 B256 的完整 forward 对照。
 
 固定两行 flush 的两次复测中，27B packed 路径在 B15→16 从约 140 µs 升至 169–174 µs，B17 回落至 162–164 µs。20 个 Cube 上，key-head 分组的最长队列由 3 个任务变成 4 个，按 value head 分段的消融用于核对这一归因和修复效果。
+
+同一新二进制的 A/B 复测中，按 value head 均分将 B15→16 的增幅从约 6–13% 降至约 2–7%。在 27B B32/B64，均分后约 263/457 µs，同轮 key-head 切分约 258/448 µs。保留均分作为小批次候选，大批保持 key-head 切分。本轮批量搬入候选 Q/K/V 的收益更稳定。在固定历史 15、约 1/8 flush 下，27B B32/B64 与 9B B256 的 verify 为 203/349/3,543 µs，配 Compact V5 的组合为 255/427/4,180 µs。
+
+## 混合 flush 测量与加权
+
+在相同 batch 下扫描实际 flush 行数，并控制 flush 行在 batch 内的摆放。用于对比的合成样本默认将 flush 行的历史设为 15，非 flush 行设为 7。三个布局分别为前缀、均匀分散和固定种子随机。B32 可先用 F=0/1/2/4/8/16/32，B64 用 F=0/2/4/8/16/32/64，B256 用 F=0/4/8/16/32/64/128/256。用单层图扫比例，在 F=0 和 F≈B/8 用独立 cache stack 校准。
+
+```bash
+for f in 0 1 2 4 8 16 32; do
+  python3 "$run" "${libs[@]}" --geometry 27b --batches 32 --mixed-qkv \
+    --pos 15 --nonflush-pos 7 --base 31 --flush-count "$f" --flush-layout random \
+    --path native mixed_packed_compact_v5 mixed_packed_compact_v6 fused_v24 \
+    --iterations 25 --output "/tmp/replay-910c/27b-b32-f$f-random.json"
+done
+python3 experimental/replayssm_cube_910b/model_flush.py /tmp/replay-910c/27b-b32-f*-random.json \
+  --batch 32 --layers 48 --output /tmp/replay-910c/27b-b32-flush-curve.json
+```
+
+在服务按真实或填充后的 graph batch 归组，记录每次 forward 中有多少有效请求需要 flush，再用 `--histogram` 传入该组观测，例如 JSON `{"0":9,"1":21,"2":25,"4":8}`。模型在实测行数之间做分段插值，按各行数出现的频率加权，同一 F 优先使用整个 stack 实测。曲线输出包含每个 F 的 p50/p90，模型加权的是平均值。估计范围为 GDN，端到端 forward 需要在相同 batch 内另计一次 cursor、输入 pack 和其他算子。不同历史长度、不同调度参数、图 padding 和 flush 位置会造成预测偏差。
+
+Blue2 上机结果中，混合随机摆放、F≈B/8 时，native / packed Cube + 批量 QKV + Compact V6 的单层 p50 分别为 B32 205/216 µs、B64 377/383 µs、B256 3.71/3.44 ms。实测 GDN stack 均值分别为 9.12/10.01、17.74/18.07、89.02/82.50 ms。F≈B/2 的单层时间则为 199/333 µs、376/541 µs、3.71/5.37 ms。
+
+## 9B TP1 的服务对照与 eager 诊断
+
+同一 910C die，MTP3、BF16、同一短文本输入、请求输出上限 64、`max-num-seqs=256`、`max-num-batched-tokens=8192`。候选服务使用 V24 融合加批量 cursor。下面的 decode 时延是目标模型 graph 的 NPU Event 测值。B128 客户端并发为 128 并重复两轮，B256 客户端并发为 256。
+
+| 客户端并发 | 路径 | 成功请求 | 目标 graph batch | Graph p50/p90（ms） | HTTP p50/p90（s） |
+|---:|---|---:|---:|---:|---:|
+| 128 | Native | 256 | 128 | 98.77/98.86 | 3.579/3.953 |
+| 128 | V24 + 批量 cursor | 256 | 128 | 112.15/135.19 | 4.308/4.454 |
+| 256 | V20 + Compact V1 | 256 | 256 | 208.66/309.01 | 8.386/8.472 |
+| 256 | V24 + 批量 cursor | 256 | 256 | 200.86/230.33 | 7.590/7.726 |
+
+并发 256 时，native 的最大实际 graph 形状为 B192，因此缺少 B256 同形状目标 forward 对照。V24 采到 22 个有效请求数与 graph 都是 B256 的 forward，平均 flush 比例 18.2%，11 轮只有 0–1 行，5 轮达到 125–160 行。F=0 的 8 轮 p50 为 197.59 ms，F=160 的单轮为 243.70 ms。实际 flush 的历史以 pos13 为主。用这份 F 直方图加权合成网格，packed + Compact V6 的估计平均 GDN 时延与 native 接近，结果对实际 position、摆放及服务 pack 成本敏感。
+
+用 `--compare-eager` 可在同输入、同 flush 布局下补采集 eager NPU Event 和从 host 提交到完成的时间。9B B128、F=16、历史 15/7 的单层结果为 native graph/eager 1.873/1.932 ms、V20+V1 2.922/2.945 ms、V24 2.370/2.388 ms。这组数据中 Replay 的额外时延主要已出现在图内。真实非图 forward 还需检查输入 pack、metadata、采样和其他 host 调用。

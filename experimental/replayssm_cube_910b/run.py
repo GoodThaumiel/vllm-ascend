@@ -8,6 +8,7 @@ import json
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -30,7 +31,8 @@ from scripts.replayssm.profile_sd_operator_compare import (  # noqa: E402
 
 VECTOR_PATHS = ("native", "v20", "compact_v1", "vector_pair")
 MIXED_PATHS = ("mixed_verify", "mixed_pair")
-PACKED_PANEL_PATHS = ("mixed_packed", "mixed_packed_compact_v5")
+MIXED_FOLD_PATHS = ("mixed_packed_compact_v5", "mixed_packed_compact_v6")
+PACKED_PANEL_PATHS = ("mixed_packed", *MIXED_FOLD_PATHS)
 ALL_MIXED_PATHS = (*MIXED_PATHS, *PACKED_PANEL_PATHS)
 CUBE_PATHS = (
     "cube_verify",
@@ -43,10 +45,10 @@ CUBE_PATHS = (
 PATHS = (*VECTOR_PATHS, *CUBE_PATHS)
 EXTRA_PATHS = ("v13", "v13_pair", "cursor")
 COMPACT_ONLY_PATHS = ("compact_v5", "compact_v6")
-COMPACT_PATHS = (*COMPACT_ONLY_PATHS, "v20_compact_v5", "v23_compact_v5", "mixed_packed_compact_v5")
+COMPACT_PATHS = (*COMPACT_ONLY_PATHS, "v20_compact_v5", "v23_compact_v5", *MIXED_FOLD_PATHS)
 WIDE_PATHS = ("v23", "v23_compact_v5")
 FUSED_PATH = "fused_v24"
-STACK_PATHS = ("native", "vector_pair", "v20_compact_v5", "v23_compact_v5", "mixed_packed_compact_v5", FUSED_PATH)
+STACK_PATHS = ("native", "vector_pair", "v20_compact_v5", "v23_compact_v5", *MIXED_FOLD_PATHS, FUSED_PATH)
 DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
 PROJECTION_ATOL = 2e-5
 PROJECTION_RTOL = 1e-3
@@ -89,6 +91,30 @@ def measure(call, reset, iterations, label, check_graph=None):
     if check_graph is not None:
         check_graph(graph)
     return {"graph_us": us, "p50_us": statistics.median(us), "p90_us": sorted(us)[(9 * len(us) - 1) // 10]}
+
+
+def measure_eager(call, reset, iterations):
+    for _ in range(3):
+        reset()
+        call()
+    torch.npu.synchronize()
+    event_us, complete_us = [], []
+    for _ in range(iterations):
+        reset()
+        torch.npu.synchronize()
+        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+        host_start = time.perf_counter_ns()
+        start.record()
+        call()
+        end.record()
+        end.synchronize()
+        complete_us.append((time.perf_counter_ns() - host_start) / 1000)
+        event_us.append(start.elapsed_time(end) * 1000)
+    return {
+        "event_us": event_us,
+        "event_p50_us": statistics.median(event_us),
+        "host_to_complete_p50_us": statistics.median(complete_us),
+    }
 
 
 def last_projections(case, blocks, balanced=False):
@@ -148,6 +174,31 @@ def assert_stage(actual, expected, stage, *, atol, rtol, dump=None, equal_nan=Fa
         raise AssertionError(f"{stage} ({tuple(actual.shape)}): {exc}") from None
 
 
+def select_flush_rows(batch, count, layout, seed):
+    if count == 0 or layout == "prefix":
+        return torch.arange(count)
+    if layout == "spread":
+        return torch.arange(count) * batch // count
+    return torch.randperm(batch, generator=torch.Generator().manual_seed(seed))[:count].sort().values
+
+
+def native_start_with_mixed_history(case):
+    """Roll each request's committed history into the native BF16 entry state."""
+    positions = case["positions"]
+    state = case["checkpoint"][1:].float()
+    group = case["v"].size(2) // case["k"].size(2)
+    base = int(case["bases"][0])
+    for i in range(int(positions.max())):
+        rows = (positions > i).nonzero().flatten()
+        slots = rows + 1
+        physical = (base + i) & 31
+        alpha = case["g_cache"][slots, :, physical].exp()
+        delta = case["d_cache"][slots, :, physical].float()
+        key = case["k_cache"][slots, :, physical].float().repeat_interleave(group, dim=1)
+        state[rows] = alpha[..., None, None] * state[rows] + delta[..., None] * key[..., None, :]
+    return state.bfloat16()
+
+
 def trial(args, b, dev):
     from vllm_ascend.ops.gdn import recurrent_gated_delta_rule
     from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_compact, replayssm_sd_verify
@@ -156,7 +207,20 @@ def trial(args, b, dev):
     active = {"none": 0, "mixed": max(1, b // 8), "full": b}[args.flush]
     if args.flush_count is not None:
         active = args.flush_count
-    cpu = make_case(geometry=args.geometry, tp=args.tp, batch=b, position=p, length=t, base=base, tile_v=128, seed=42)
+    flush_rows = select_flush_rows(b, active, args.flush_layout, args.flush_seed)
+    nonflush_pos = p if args.nonflush_pos is None else args.nonflush_pos
+    cpu = make_case(
+        geometry=args.geometry,
+        tp=args.tp,
+        batch=b,
+        position=max(p, nonflush_pos),
+        length=t,
+        base=base,
+        tile_v=128,
+        seed=42,
+    )
+    cpu["positions"].fill_(nonflush_pos)
+    cpu["positions"][flush_rows] = p
     key_heads, value_heads = cpu["k"].shape[2], cpu["v"].shape[2]
     cpu["beta"] = cpu["beta"].bfloat16().float()
     c = {n: v.to(dev) for n, v in cpu.items()}
@@ -164,10 +228,19 @@ def trial(args, b, dev):
     initial = c["checkpoint"].clone()
     ring = c["slots"]
     slots = ring + 4
-    flush = (torch.arange(b, device=dev) < active).int()
+    mask = torch.zeros(b, dtype=torch.int32)
+    mask[flush_rows] = 1
+    flush = mask.to(dev)
+    restore_slots = (flush_rows + 5).to(dev)
+    restore_values = None
+    if p and active:
+        restore_values = (
+            initial[5 : 5 + active] if args.flush_layout == "prefix" else initial.index_select(0, restore_slots)
+        )
     status = torch.full((b * value_heads * 4,), -1, dtype=torch.int32, device=dev)
     state, state_page_bytes = native_state_page(dev, args.tp, b, t, geometry=args.geometry)
-    start_state = reconstruct_native_start(cpu, p).to(dev)
+    start_cpu = reconstruct_native_start(cpu, p) if p == nonflush_pos else native_start_with_mixed_history(cpu)
+    start_state = start_cpu.to(dev)
     first = state[1::t]
     indices = torch.arange(1, b * t + 1, device=dev, dtype=torch.int32)
     lengths = torch.tensor([0] + [t] * b, device=dev, dtype=torch.int32)
@@ -222,10 +295,13 @@ def trial(args, b, dev):
             ring,
         )
 
-    def reset_state():
-        # Only the active prefix is mutable. Keep the same inputs for every replay.
-        if p and active:
-            c["checkpoint"][5 : 5 + active].copy_(initial[5 : 5 + active])
+    def reset_state(cache=c):
+        # Restore the same starting checkpoint outside the timed region.
+        if restore_values is not None:
+            if args.flush_layout == "prefix":
+                cache["checkpoint"][5 : 5 + active].copy_(restore_values)
+            else:
+                cache["checkpoint"].index_copy_(0, restore_slots, restore_values)
 
     # Native materializes the committed ring in its initial state. Replay reads
     # the same history directly and writes its candidates into disjoint slots.
@@ -241,10 +317,12 @@ def trial(args, b, dev):
     if status.cpu().any():
         raise RuntimeError("Compact V1 returned nonzero status")
     checkpoint = c["checkpoint"].cpu()
+    unchanged = torch.ones(b + 1, dtype=torch.bool)
     if p and active:
-        torch.testing.assert_close(checkpoint[5 : 5 + active], start_state[:active].cpu(), atol=0.001, rtol=0.015)
-    unchanged = 5 + (active if p else 0)
-    torch.testing.assert_close(checkpoint[unchanged:], cpu["checkpoint"][unchanged - 4 :], atol=0, rtol=0)
+        changed = flush_rows + 1
+        torch.testing.assert_close(checkpoint[changed + 4], start_cpu[flush_rows], atol=0.001, rtol=0.015)
+        unchanged[changed] = False
+    torch.testing.assert_close(checkpoint[4:][unchanged], cpu["checkpoint"][unchanged], atol=0, rtol=0)
     reset_state()
 
     calls = dict(native=native, v20=vector, compact_v1=fold, vector_pair=lambda: (vector(), fold()))
@@ -305,7 +383,7 @@ def trial(args, b, dev):
         cursor_accepted = torch.full_like(ring, min(t, 3))
 
         def reset_cursor():
-            cursor_position.fill_(p)
+            cursor_position[1:].copy_(c["positions"])
             cursor_base.fill_(base)
             cursor_flush[1:].copy_(flush)
 
@@ -329,13 +407,18 @@ def trial(args, b, dev):
     if compare_demo or compare_mixed or FUSED_PATH in args.path:
         # Poison destinations so a missing Cube candidate write cannot inherit V20 results.
         golden = {n: c[n].cpu() for n in ("out", "d_cache", "k_cache", "g_cache")}
+        cache_rows = torch.arange(1, b + 1, device=dev, dtype=torch.int64)
+        candidate_records = [(c["positions"].long() + base + s) & 31 for s in range(t)]
 
         def poison():
             c["out"].fill_(float("nan"))
             c["status"].fill_(-1)
-            for s in range(t):
+            for s, record in enumerate(candidate_records):
                 for n in ("d_cache", "k_cache", "g_cache"):
-                    c[n][1:, :, (base + p + s) % 32].fill_(float("nan"))
+                    if p == nonflush_pos:
+                        c[n][1:, :, (base + p + s) % 32].fill_(float("nan"))
+                    else:
+                        c[n][cache_rows, :, record] = float("nan")
 
         def check_outputs(label, error_prefix="", dump=None):
             if c["status"].cpu().any():
@@ -436,6 +519,8 @@ def trial(args, b, dev):
         )
         if "mixed_packed_compact_v5" in args.path:
             calls["mixed_packed_compact_v5"] = lambda: (verify_mixed(True), fold_candidate())
+        if "mixed_packed_compact_v6" in args.path:
+            calls["mixed_packed_compact_v6"] = lambda: (verify_mixed(True), fold_candidate(variant=6))
 
     def measure_gdn_stack(path, label):
         stack_label = f"{label}/gdn_stack_{args.layers}"
@@ -464,19 +549,18 @@ def trial(args, b, dev):
                     if path == FUSED_PATH:
                         fused(cache)
                         continue
-                    if path == "mixed_packed_compact_v5":
+                    if path in MIXED_FOLD_PATHS:
                         verify_mixed(True, cache)
                     else:
                         vector(23 if path == "v23_compact_v5" else 20, cache)
                     if path == "vector_pair":
                         fold(cache)
                     else:
-                        fold_candidate(cache)
+                        fold_candidate(cache, 6 if path == "mixed_packed_compact_v6" else 5)
 
             def reset_stack():
-                if p and active:
-                    for cache in layers:
-                        cache["checkpoint"][5 : 5 + active].copy_(initial[5 : 5 + active])
+                for cache in layers:
+                    reset_state(cache)
 
             def check_stack(graph):
                 reset_stack()
@@ -518,7 +602,7 @@ def trial(args, b, dev):
             compact_status = None
             if path == "mixed_pair":
                 compact_status = status
-            elif path == "mixed_packed_compact_v5":
+            elif path in MIXED_FOLD_PATHS:
                 compact_status = status_v5
             expected_state = checkpoint if compact_status is not None else initial.cpu()
 
@@ -535,7 +619,10 @@ def trial(args, b, dev):
                     label = f"{path} graph run {iteration + 1}"
                     check_projection(label)
                     check_outputs(label, "mixed_graph_", dump=dump)
-                    torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
+                    if path == "mixed_packed_compact_v6":
+                        torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0.001, rtol=0.015)
+                    else:
+                        torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
                     if compact_status is not None and compact_status.cpu().any():
                         raise RuntimeError("Captured compact returned nonzero status")
 
@@ -583,6 +670,8 @@ def trial(args, b, dev):
                 mix_metadata = {"compact_tile": args.compact_tile}
         else:
             timings = measure(calls[path], reset, args.iterations, label)
+        if args.compare_eager:
+            timings["eager"] = measure_eager(calls[path], reset, args.iterations)
         if args.layers > 1:
             timings["gdn_stack"] = measure_gdn_stack(path, label)
         rows.append(
@@ -592,6 +681,9 @@ def trial(args, b, dev):
                 length=t,
                 base=base,
                 active_flush=active,
+                flush_layout=args.flush_layout,
+                flush_seed=args.flush_seed,
+                nonflush_pos=nonflush_pos,
                 key_heads=key_heads,
                 value_heads=value_heads,
                 native_state_page_bytes=state_page_bytes,
@@ -614,6 +706,9 @@ def parse_args(argv=None):
     ap.add_argument("--base", type=int, choices=range(32), default=31)
     ap.add_argument("--flush", choices=("none", "mixed", "full"), default="full")
     ap.add_argument("--flush-count", type=int, help="Hold the number of flushing rows fixed across batches")
+    ap.add_argument("--flush-layout", choices=("prefix", "spread", "random"), default="prefix")
+    ap.add_argument("--flush-seed", type=int, default=42)
+    ap.add_argument("--nonflush-pos", type=int, choices=range(17), help="Use a shorter history for non-flushing rows")
     ap.add_argument(
         "--path",
         nargs="+",
@@ -634,6 +729,7 @@ def parse_args(argv=None):
     ap.add_argument("--mixed-check-repeats", type=int, default=1, help="Untimed eager and graph checks per case")
     ap.add_argument("--mixed-dump", action="store_true", help="Save the first mismatch beside --output")
     ap.add_argument("--iterations", type=int, default=100)
+    ap.add_argument("--compare-eager", action="store_true", help="Also time eager launches on the same input")
     ap.add_argument("--layers", type=int, default=1, help="Also replay a GDN stack with distinct cache pages per layer")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--output", type=Path, required=True)
@@ -665,6 +761,10 @@ def parse_args(argv=None):
         ap.error("use --suite mixed for AIC/AIV paths")
     if max(args.batches) > 128 and any(path in CUBE_PATHS for path in args.path):
         ap.error("batches above 128 are supported by the Ascend C paths")
+    if any(path in CUBE_PATHS for path in args.path) and (
+        args.flush_layout != "prefix" or args.nonflush_pos is not None
+    ):
+        ap.error("mixed flush placement or per-row history requires Ascend C paths")
     if not 1 <= args.layers <= 48 or (args.layers > 1 and any(path not in STACK_PATHS for path in args.path)):
         ap.error("GDN stack supports 1..48 layers; choose native and/or paired Ascend C paths")
     if len(set(args.path)) != len(args.path):

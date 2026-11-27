@@ -56,6 +56,18 @@ class TestVectorBatchProbe(unittest.TestCase):
         self.assertGreater(state.storage_offset(), 0)
         self.assertLessEqual(state.storage_offset() + state[0].numel(), state.stride(0))
 
+    def test_flush_placement_and_per_row_native_start(self):
+        self.assertEqual(run.select_flush_rows(18, 3, "prefix", 42).tolist(), [0, 1, 2])
+        self.assertEqual(run.select_flush_rows(18, 3, "spread", 42).tolist(), [0, 6, 12])
+        random_rows = run.select_flush_rows(18, 3, "random", 42)
+        torch.testing.assert_close(random_rows, run.select_flush_rows(18, 3, "random", 42))
+        self.assertEqual(len(set(random_rows.tolist())), 3)
+        case = run.make_case(geometry="27b", tp=4, batch=2, position=15, base=31)
+        case["positions"][0] = 0
+        expected = run.reconstruct_native_start(case, 15)
+        expected[0] = case["checkpoint"][1]
+        torch.testing.assert_close(run.native_start_with_mixed_history(case), expected, atol=0, rtol=0)
+
     def test_vector_trial_bypasses_cube_and_uses_both_head_geometries(self):
         for geometry, key_heads, value_heads in (("27b", 4, 12), ("9b", 16, 32)):
             with self.subTest(geometry=geometry):
