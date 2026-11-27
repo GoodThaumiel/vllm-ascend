@@ -48,7 +48,9 @@ COMPACT_ONLY_PATHS = ("compact_v5", "compact_v6")
 COMPACT_PATHS = (*COMPACT_ONLY_PATHS, "v20_compact_v5", "v23_compact_v5", *MIXED_FOLD_PATHS)
 WIDE_PATHS = ("v23", "v23_compact_v5")
 FUSED_PATH = "fused_v24"
-STACK_PATHS = ("native", "vector_pair", "v20_compact_v5", "v23_compact_v5", *MIXED_FOLD_PATHS, FUSED_PATH)
+FUSED_PACK_PATH = "fused_v24_with_pack"
+FUSED_PATHS = (FUSED_PATH, FUSED_PACK_PATH)
+STACK_PATHS = ("native", "vector_pair", "v20_compact_v5", "v23_compact_v5", *MIXED_FOLD_PATHS, *FUSED_PATHS)
 DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
 PROJECTION_ATOL = 2e-5
 PROJECTION_RTOL = 1e-3
@@ -328,11 +330,20 @@ def trial(args, b, dev):
     calls = dict(native=native, v20=vector, compact_v1=fold, vector_pair=lambda: (vector(), fold()))
     calls.update(v13=lambda: vector(13), v13_pair=lambda: (vector(13), fold()))
     calls["v23"] = lambda: vector(23)
-    if FUSED_PATH in args.path:
+    if any(path in FUSED_PATHS for path in args.path):
+        names = ("q", "k", "v", "g", "beta")
+        identity_pack = torch.arange(b * t, device=dev, dtype=torch.int64) if FUSED_PACK_PATH in args.path else None
 
-        def fused(cache=c):
+        def fused(cache=c, with_pack=False):
+            inputs = [cache[name] for name in names]
+            if with_pack:
+                packed = [tensor.new_zeros(tensor.shape) for tensor in inputs]
+                for dest, src in zip(packed, inputs):
+                    dest.flatten(0, 1).index_copy_(0, identity_pack, src.flatten(0, 1))
+                inputs = packed
             torch.ops.replayssm_sd_lab.fused_(
-                *(cache[n] for n in ("q", "k", "v", "g", "beta", "checkpoint", "d_cache", "k_cache", "g_cache")),
+                *inputs,
+                *(cache[n] for n in ("checkpoint", "d_cache", "k_cache", "g_cache")),
                 slots,
                 c["positions"],
                 c["bases"],
@@ -347,8 +358,12 @@ def trial(args, b, dev):
                 ring,
                 24,
             )
+            if with_pack:
+                return c["out"].flatten(0, 1).index_select(0, identity_pack)
+            return c["out"].flatten(0, 1)
 
         calls[FUSED_PATH] = fused
+        calls[FUSED_PACK_PATH] = lambda: fused(with_pack=True)
     if any(path in COMPACT_PATHS for path in args.path):
         status_v5 = torch.empty(b * value_heads * (128 // args.compact_tile), dtype=torch.int32, device=dev)
 
@@ -404,7 +419,7 @@ def trial(args, b, dev):
         calls["cursor"] = cursor
     compare_demo = any(path in CUBE_PATHS for path in args.path)
     compare_mixed = any(path in ALL_MIXED_PATHS for path in args.path)
-    if compare_demo or compare_mixed or FUSED_PATH in args.path:
+    if compare_demo or compare_mixed or any(path in FUSED_PATHS for path in args.path):
         # Poison destinations so a missing Cube candidate write cannot inherit V20 results.
         golden = {n: c[n].cpu() for n in ("out", "d_cache", "k_cache", "g_cache")}
         cache_rows = torch.arange(1, b + 1, device=dev, dtype=torch.int64)
@@ -546,8 +561,8 @@ def trial(args, b, dev):
 
             def call_stack():
                 for cache in layers:
-                    if path == FUSED_PATH:
-                        fused(cache)
+                    if path in FUSED_PATHS:
+                        fused(cache, with_pack=path == FUSED_PACK_PATH)
                         continue
                     if path in MIXED_FOLD_PATHS:
                         verify_mixed(True, cache)
@@ -591,7 +606,7 @@ def trial(args, b, dev):
                 "cube_compact",
                 "mixed_pair",
                 *COMPACT_PATHS,
-                FUSED_PATH,
+                *FUSED_PATHS,
             )
             else lambda: None
         )
@@ -637,14 +652,14 @@ def trial(args, b, dev):
                 aiv_bulk_qkv=path in PACKED_PANEL_PATHS and args.mixed_qkv,
                 mixed_balanced=args.mixed_balanced,
             )
-        elif path in (*COMPACT_PATHS, "v23", FUSED_PATH):
+        elif path in (*COMPACT_PATHS, "v23", *FUSED_PATHS):
 
             def check_graph(graph, path=path):
                 reset_state()
-                compact_status = status if path == FUSED_PATH else status_v5 if path in COMPACT_PATHS else None
+                compact_status = status if path in FUSED_PATHS else status_v5 if path in COMPACT_PATHS else None
                 if compact_status is not None:
                     compact_status.fill_(-1)
-                if path == FUSED_PATH:
+                if path in FUSED_PATHS:
                     poison()
                 elif path not in COMPACT_ONLY_PATHS:
                     c["status"].fill_(-1)
@@ -662,7 +677,7 @@ def trial(args, b, dev):
                     if c["status"].cpu().any():
                         raise RuntimeError(f"Captured {path} returned nonzero verify status")
                     torch.testing.assert_close(c["out"][:, :t].float().cpu(), expected_out, atol=0, rtol=0)
-                if path == FUSED_PATH:
+                if path in FUSED_PATHS:
                     check_outputs("Captured V24", "fused_v24_")
 
             timings = measure(calls[path], reset, args.iterations, label, check_graph=check_graph)
@@ -712,7 +727,9 @@ def parse_args(argv=None):
     ap.add_argument(
         "--path",
         nargs="+",
-        choices=tuple(dict.fromkeys((*PATHS, *ALL_MIXED_PATHS, *EXTRA_PATHS, *COMPACT_PATHS, *WIDE_PATHS, FUSED_PATH))),
+        choices=tuple(
+            dict.fromkeys((*PATHS, *ALL_MIXED_PATHS, *EXTRA_PATHS, *COMPACT_PATHS, *WIDE_PATHS, *FUSED_PATHS))
+        ),
     )
     ap.add_argument("--compact-library", type=Path, help="Path to the standalone Compact Torch binding")
     ap.add_argument("--verify-library", type=Path, help="Path to the standalone V23 Torch binding")
@@ -755,8 +772,10 @@ def parse_args(argv=None):
         ap.error("mixed-balanced requires a mixed kernel path")
     if any(path in COMPACT_PATHS for path in args.path) and not args.compact_library:
         ap.error("Compact candidate paths require --compact-library")
-    if any(path in (*WIDE_PATHS, FUSED_PATH) for path in args.path) and not args.verify_library:
+    if any(path in (*WIDE_PATHS, *FUSED_PATHS) for path in args.path) and not args.verify_library:
         ap.error("V23 and V24 paths require --verify-library")
+    if FUSED_PACK_PATH in args.path and args.length != 4:
+        ap.error("the identity pack ablation requires four tokens per request")
     if args.suite == "vector" and any(path in ALL_MIXED_PATHS for path in args.path):
         ap.error("use --suite mixed for AIC/AIV paths")
     if max(args.batches) > 128 and any(path in CUBE_PATHS for path in args.path):

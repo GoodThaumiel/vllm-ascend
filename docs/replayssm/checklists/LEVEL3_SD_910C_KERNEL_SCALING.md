@@ -142,3 +142,40 @@ Blue2 上机结果中，混合随机摆放、F≈B/8 时，native / packed Cube 
 并发 256 时，native 的最大实际 graph 形状为 B192，因此缺少 B256 同形状目标 forward 对照。V24 采到 22 个有效请求数与 graph 都是 B256 的 forward，平均 flush 比例 18.2%，11 轮只有 0–1 行，5 轮达到 125–160 行。F=0 的 8 轮 p50 为 197.59 ms，F=160 的单轮为 243.70 ms。实际 flush 的历史以 pos13 为主。用这份 F 直方图加权合成网格，packed + Compact V6 的估计平均 GDN 时延与 native 接近，结果对实际 position、摆放及服务 pack 成本敏感。
 
 用 `--compare-eager` 可在同输入、同 flush 布局下补采集 eager NPU Event 和从 host 提交到完成的时间。9B B128、F=16、历史 15/7 的单层结果为 native graph/eager 1.873/1.932 ms、V20+V1 2.922/2.945 ms、V24 2.370/2.388 ms。这组数据中 Replay 的额外时延主要已出现在图内。真实非图 forward 还需检查输入 pack、metadata、采样和其他 host 调用。
+
+### Torch Profiler 的稳态 target forward
+
+9B TP1/MTP3，真实 B128、每次 512 token、无混合 prefill。每条路径从第六次同形状 forward 开始抓 5 次，标记 `REPLAY_STEADY_TARGET/<FULL|NONE>/B128/stepN`。Torch NPU Profiler 使用 CPU/NPU activity、Level1 和 PipeUtilization。用 [汇总脚本](../../../scripts/replayssm/summarize_steady_decode_profile.py) 按标记的起止时刻选取设备任务，同时输出设备 span、活跃区间并集和算子组耗时。四组服务均完成 256 条请求，本表用 trace 内五次 p50，单位 ms。
+
+| 路径 | 目标设备 span | GDR 或 V24（24 次） | IndexCopy / IndexSelect |
+|---|---:|---:|---:|
+| Native FULL graph | 98.97 | 44.87 | 0 |
+| Replay V24 FULL graph | 113.20 | 51.39 | 8.42 |
+| Native 强制 eager | 99.39 | 44.86 | 0 |
+| Replay V24 强制 eager | 114.06 | 51.97 | 8.16 |
+
+FULL graph 与强制 eager 的 Replay 差距约为 14.2 ms 和 14.7 ms。非强制 eager 的服务里，观测到的纯 decode forward 全部走 FULL 图，NONE 出现在含 prefill 的轮次。不同 run 的 flush 分布可变，不能用这 0.5 ms 的差值确定 eager 的额外影响。
+
+Replay FULL 图里的 120 次 InplaceIndexCopy 共 8.12 ms，另有 24 次 IndexSelect。前者来自 24 个 GDN 层各打包 Q、K、V、gate、beta 的 5 次 scatter，后者按同一索引取回有效输出。Native 直接消费 token-major 张量、请求长度和 state slot。两条路径都可能有投影输出拆分时的连续化，这笔额外 scatter 由 Replay verify 的固定四槽输入布局引起。
+
+### 输入打包消融
+
+对照同一个 V24 核、相同初始 checkpoint、ring、位置与 flush 行，令 T=4，分别直接传入现成视图，或执行服务同款的 5 次 zero + IndexCopy 以及输出 IndexSelect。设备 graph replay p50 如下，stack 各层使用独立 cache，单位 ms。
+
+| 场景 | Flush 行 | Native | V24 直接 view | V24 含 pack/unpack | 打包开销 |
+|---|---:|---:|---:|---:|---:|
+| 27B TP4 B32，48 层 | 4 | 9.05 | 11.78 | 16.70 | 4.92 |
+| 27B TP4 B64，48 层 | 8 | 17.70 | 22.00 | 29.73 | 7.73 |
+| 9B TP1 B128，24 层 | 0 | 44.82 | 51.94 | 60.41 | 8.47 |
+| 9B TP1 B128，24 层 | 16 | 44.78 | 56.80 | 65.47 | 8.67 |
+| 9B TP1 B128，24 层 | 80 | 44.82 | 75.53 | 85.28 | 9.74 |
+| 9B TP1 B256，24 层 | 32 | 89.02 | 112.34 | 129.50 | 17.15 |
+
+无 flush 的 9B B128 单层，图内 pack/unpack 多 346 µs，同输入 eager 多 474 µs。纯 decode 的真实图仍承担打包。FULL decode 的 T4 恒等映射适合用 view 省去该步骤，服务接入时必须验证 capture 和 replay 都具备相同布局。长度不齐的路径可以用已存在的请求起始偏移定位 token，相关 verify ABI 需单独验证。
+
+```bash
+python3 "$run" --suite vector --geometry 9b --batches 128 --layers 24 \
+  --pos 15 --nonflush-pos 7 --base 31 --flush-count 16 --flush-layout random \
+  --path native fused_v24 fused_v24_with_pack --compare-eager --verify-library "$verify" \
+  --iterations 25 --output /tmp/replay-910c/pack-ablation-b128.json
+```
