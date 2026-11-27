@@ -11,7 +11,14 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from experimental.replayssm_cube_910b.run import batches, measure, select_flush_rows  # noqa: E402
+from experimental.replayssm_cube_910b.run import (  # noqa: E402
+    MIXED_AIV_ABLATIONS,
+    MIXED_FOLD_FMA_PATH,
+    MIXED_FUSED_FOLD_PATH,
+    batches,
+    measure,
+    select_flush_rows,
+)
 from experimental.replayssm_sd_ascendc.lab import CACHE_NAMES, MAX_TOKENS, make_case  # noqa: E402
 from scripts.replayssm.profile_sd_operator_compare import package_versions  # noqa: E402
 
@@ -113,6 +120,7 @@ def trial(args, batch, device):
         scratch = torch.empty((blocks, 128, 16), dtype=torch.float32, device=device)
 
     def invoke_mixed(cache, inputs, out, token_offsets=None):
+        ablation = MIXED_FOLD_FMA_PATH if args.mixed_fold_fma else MIXED_FUSED_FOLD_PATH
         torch.ops.replayssm_mix_910b.verify_(
             *inputs,
             *(cache[name] for name in CACHE_NAMES),
@@ -130,7 +138,7 @@ def trial(args, batch, device):
             False,
             True,
             args.mixed_balanced,
-            4,
+            MIXED_AIV_ABLATIONS[ablation],
             flush,
             token_offsets,
         )
@@ -352,6 +360,7 @@ def main():
     parser.add_argument("--verify-library", type=Path, required=True)
     parser.add_argument("--mixed-library", type=Path)
     parser.add_argument("--mixed-balanced", action="store_true", help="Split key-head groups across Cube blocks")
+    parser.add_argument("--mixed-fold-fma", action="store_true", help="Fuse multiply-add in checkpoint folding")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.flush_fraction <= 1 or not 1 <= args.layers <= 48 or args.iterations < 1:

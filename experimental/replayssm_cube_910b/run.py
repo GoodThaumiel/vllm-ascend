@@ -33,11 +33,14 @@ from scripts.replayssm.profile_sd_operator_compare import (  # noqa: E402
 VECTOR_PATHS = ("native", "v20", "compact_v1", "vector_pair")
 MIXED_PATHS = ("mixed_verify", "mixed_pair")
 MIXED_FUSED_FOLD_PATH = "mixed_fused_fold"
+MIXED_FOLD_FMA_PATH = "mixed_fold_fma"
+IN_KERNEL_FOLD_PATHS = (MIXED_FUSED_FOLD_PATH, MIXED_FOLD_FMA_PATH)
 MIXED_AIV_ABLATIONS = {
     "mixed_history_panel": 1,
     "mixed_triangular": 2,
     "mixed_suffix_reference": 3,
     MIXED_FUSED_FOLD_PATH: 4,
+    MIXED_FOLD_FMA_PATH: 5,
 }
 MIXED_CUBE_FOLD_PATH = "mixed_cube_fold"
 CUBE_FOLD_ONLY_PATHS = ("cube_fold_path", "cube_fold_gemm")
@@ -548,7 +551,7 @@ def trial(args, b, dev):
                 panel_options = (packed, packed and args.mixed_suffix, packed and args.mixed_qkv, True)
             if ablation:
                 panel_options = (True, False, True, args.mixed_balanced, ablation)
-                if ablation == MIXED_AIV_ABLATIONS[MIXED_FUSED_FOLD_PATH]:
+                if ablation >= MIXED_AIV_ABLATIONS[MIXED_FUSED_FOLD_PATH]:
                     panel_options += (flush,)
             torch.ops.replayssm_mix_910b.verify_(
                 *(cache[n] for n in ("q", "k", "v", "g", "beta", "checkpoint", "d_cache", "k_cache", "g_cache")),
@@ -578,7 +581,7 @@ def trial(args, b, dev):
                 label = f"{path} eager run {iteration + 1}"
                 check_projection(label)
                 check_outputs(label, "mixed_eager_", dump=dump)
-                if path == MIXED_FUSED_FOLD_PATH:
+                if path in IN_KERNEL_FOLD_PATHS:
                     torch.testing.assert_close(c["checkpoint"].cpu(), checkpoint, atol=0.001, rtol=0.015)
                     reset_state()
         torch.testing.assert_close(c["checkpoint"], initial, atol=0, rtol=0)
@@ -594,7 +597,7 @@ def trial(args, b, dev):
             verify_mixed(True, cache, ablation=MIXED_AIV_ABLATIONS.get(path, 0))
             if path == MIXED_CUBE_FOLD_PATH:
                 cube_fold(cache)
-            elif path != MIXED_FUSED_FOLD_PATH:
+            elif path not in IN_KERNEL_FOLD_PATHS:
                 fold_candidate(cache, variant=5 if path == "mixed_packed_compact_v5" else 6)
 
         for path in MIXED_FOLD_PATHS:
@@ -681,7 +684,7 @@ def trial(args, b, dev):
             compact_status = None
             if path == "mixed_pair":
                 compact_status = status
-            elif path in MIXED_FOLD_PATHS and path not in (MIXED_CUBE_FOLD_PATH, MIXED_FUSED_FOLD_PATH):
+            elif path in MIXED_FOLD_PATHS and path not in (MIXED_CUBE_FOLD_PATH, *IN_KERNEL_FOLD_PATHS):
                 compact_status = status_v5
             expected_state = checkpoint if path in (*MIXED_FOLD_PATHS, "mixed_pair") else initial.cpu()
 
@@ -701,14 +704,14 @@ def trial(args, b, dev):
                     if path in MIXED_FOLD_PATHS and path != "mixed_packed_compact_v5":
                         actual_state = c["checkpoint"].cpu()
                         torch.testing.assert_close(actual_state, expected_state, atol=0.001, rtol=0.015)
-                        if path in (MIXED_CUBE_FOLD_PATH, MIXED_FUSED_FOLD_PATH):
+                        if path in (MIXED_CUBE_FOLD_PATH, *IN_KERNEL_FOLD_PATHS):
                             name = "cube_fold_checkpoint" if path == MIXED_CUBE_FOLD_PATH else "fused_fold_checkpoint"
                             errors[name] = (actual_state.float() - expected_state.float()).abs().max().item()
                     else:
                         torch.testing.assert_close(c["checkpoint"].cpu(), expected_state, atol=0, rtol=0)
                     if compact_status is not None and compact_status.cpu().any():
                         raise RuntimeError("Captured compact returned nonzero status")
-                if path == MIXED_FUSED_FOLD_PATH and b <= 4 and active:
+                if path in IN_KERNEL_FOLD_PATHS and b <= 4 and active:
                     # Check the captured graph with device-side routing changed
                     # in place. The previous replay must not be folded twice.
                     saved_flush = flush.clone()
@@ -730,7 +733,7 @@ def trial(args, b, dev):
                 workspace_layout=args.mixed_workspace,
                 aiv_panel_cols=8 if path in PACKED_PANEL_PATHS else 16,
                 aiv_history_suffix=(
-                    path in ("mixed_history_panel", "mixed_suffix_reference", MIXED_FUSED_FOLD_PATH)
+                    path in ("mixed_history_panel", "mixed_suffix_reference", *IN_KERNEL_FOLD_PATHS)
                     or (path not in MIXED_AIV_ABLATIONS and path in PACKED_PANEL_PATHS and args.mixed_suffix)
                 ),
                 aiv_bulk_qkv=(path in PACKED_PANEL_PATHS and args.mixed_qkv) or path in MIXED_AIV_ABLATIONS,

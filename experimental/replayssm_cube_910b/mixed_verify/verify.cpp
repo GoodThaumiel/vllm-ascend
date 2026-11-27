@@ -217,7 +217,8 @@ class Projector {
 
 #ifdef __DAV_C220_VEC__
 template <uint32_t PanelCols, bool SuffixHistory = false, bool BulkQkv = false,
-          bool BatchHistory = false, bool TriangularSolve = false, bool FuseFold = false>
+          bool BatchHistory = false, bool TriangularSolve = false, bool FuseFold = false,
+          bool FoldFma = false>
 class Consumer {
   static constexpr uint32_t PANEL = TILE * PanelCols;
   static_assert(!BatchHistory || (PanelCols == 2 * TOKENS && SuffixHistory));
@@ -737,10 +738,17 @@ class Consumer {
       Broadcast<float, 2, 1>(products, weightedD[i * TILE], dstShape, srcShape);
       PipeBarrier<PIPE_V>();
       auto key = keys[i * DIM];
-      Mul(products, products, key, 64, TILE, {1, 1, 1, 16, 16, 0});
-      Mul(products[64], products[64], key[64], 64, TILE, {1, 1, 1, 16, 16, 0});
-      PipeBarrier<PIPE_V>();
-      Add(state, state, products, TILE * DIM);
+      if constexpr (FoldFma) {
+        // All 64 rows share this key. Use two disjoint 64-lane halves
+        // with a zero repeat stride on the key operand.
+        MulAddDst(state, products, key, 64, TILE, {1, 1, 1, 16, 16, 0});
+        MulAddDst(state[64], products[64], key[64], 64, TILE, {1, 1, 1, 16, 16, 0});
+      } else {
+        Mul(products, products, key, 64, TILE, {1, 1, 1, 16, 16, 0});
+        Mul(products[64], products[64], key[64], 64, TILE, {1, 1, 1, 16, 16, 0});
+        PipeBarrier<PIPE_V>();
+        Add(state, state, products, TILE * DIM);
+      }
       PipeBarrier<PIPE_V>();
     }
 
@@ -838,7 +846,10 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   Projector op;
   op.Run(x);
 #elif defined(__DAV_C220_VEC__)
-  if (panelMode == 7) {
+  if (panelMode == 8) {
+    Consumer<2 * TOKENS, true, true, true, false, true, true> op;
+    op.Run(x);
+  } else if (panelMode == 7) {
     Consumer<2 * TOKENS, true, true, true, false, true> op;
     op.Run(x);
   } else if (panelMode == 6) {

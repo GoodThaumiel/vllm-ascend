@@ -682,3 +682,35 @@ value-head 数量均衡更有效。数据支持整组轮转作为当前
 整组轮转的轻路径收益基本消失。这个真实重步为后续 flush
 折叠提供了针对性回归点。原始 trace 及汇总在同一服务副本的
 `profile-steady/graph-{compact-v25,mixed-grouped}` 下。
+
+### 重 flush 的向量乘加消融
+
+`mixed_fold_fma`（`aiv_ablation=5`）沿用整组轮转和 FP32
+checkpoint 折叠。只将每个历史行的两条跨行 `Mul`、一次
+`Add` 和中间 Vector 屏障替换成两条 `MulAddDst`。
+历史 D 广播、输出和 ring 更新顺序相同。对照可用同一个实验库：
+
+```bash
+python3 experimental/replayssm_cube_910b/run.py --suite mixed --geometry 9b \
+  --batches 128 --length 4 --pos 16 --nonflush-pos 7 --base 31 \
+  --flush-count 124 --flush-layout random --iterations 25 \
+  --path native fused_v25 mixed_fused_fold mixed_fold_fma \
+  --mixed-library "$mix" --verify-library "$verify" --compact-library "$compact" \
+  --output /tmp/sd-mixed-fold-fma.json
+```
+
+Blue2 Ascend910_9362 die 13，CANN 9.2.1、torch-npu 2.10.0.post7。
+单层、MTP3 的 T4、随机 flush，其他行 pos7。两种混合核 B4
+精度和图回放均通过。下表为同 die、同输入的 25 次回放 p50，单位 µs。
+
+| 场景 | Native | V25 | 原混合折叠 | 混合乘加 |
+|---|---:|---:|---:|---:|
+| 27B TP4 B32 F31 | 201.08 | 326.00 | 358.70 | 400.04 |
+| 9B TP1 B128 F124 | 1871.70 | 3261.34 | 3347.60 | 3732.22 |
+| 9B TP1 B256 F128 | 3710.48 | 5460.20 | 4737.20 | 5144.48 |
+
+乘加变体三个场景比原混合折叠慢 8.6%–11.5%，保留作消融，
+服务继续使用原混合折叠。减少 API 数量和一处屏障在这个跨行
+步长及累加依赖下未能转化成时延收益。此组是单 die 算子数据，
+测试时同卡另一 die 在跑长文本对照。各路径对照在同一 die 内
+完成。原始报告在 `mixed-packed.FmrhIp/results/fold-fma-early`。
