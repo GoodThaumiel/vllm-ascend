@@ -127,8 +127,16 @@ def replayssm_sd_verify_compact_fused(
     tile_v: int = 128,
     cores: int = 40,
     ring_slots: torch.Tensor | None = None,
+    variant: int = 14,
+    token_offsets: torch.Tensor | None = None,
 ) -> None:
-    """Experimental MTP3 27B verify then compact in one AscendC launch."""
+    """Run MTP3 verify and compact in one launch.
+
+    V24 can consume compact token-major inputs and write token-major output.
+    In this mode token_offsets is the int32 prefix sum of valid lengths,
+    including repeated offsets for graph padding. Only the valid token prefix
+    is defined in out. Offsets must match the current Q/K/V, g and beta layout.
+    """
     torch.ops._C_ascend.replayssm_sd_verify_compact_fused_(
         q,
         k,
@@ -151,6 +159,8 @@ def replayssm_sd_verify_compact_fused(
         tile_v,
         cores,
         ring_slots,
+        variant,
+        token_offsets,
     )
 
 

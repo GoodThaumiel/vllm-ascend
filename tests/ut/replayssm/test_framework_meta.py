@@ -188,6 +188,8 @@ class FrameworkMetaTests(unittest.TestCase):
             [i for i, arg in enumerate(schema.arguments) if arg.alias_info and arg.alias_info.is_write],
             [5, 6, 7, 8, 14, 15, 16],
         )
+        self.assertEqual(schema.arguments[-1].name, "token_offsets")
+        self.assertIsNone(schema.arguments[-1].default_value)
         args = self.sd_arguments("meta")
         compact_status = self.torch.empty(2 * 12 * 4, dtype=self.torch.int32, device="meta")
         self.assertIsNone(
@@ -200,6 +202,26 @@ class FrameworkMetaTests(unittest.TestCase):
                 args[15],
                 128,
                 40,
+            )
+        )
+
+    def test_sd_fused_compact_token_meta_dispatch(self):
+        t = self.torch
+        inputs = [t.empty((5, *arg.shape[2:]), dtype=arg.dtype, device="meta") for arg in self.sd_arguments("meta")[:5]]
+        args = self.sd_arguments("meta")
+        flush = t.empty(2, dtype=t.int32, device="meta")
+        compact_status = t.empty(2 * 12 * 4, dtype=t.int32, device="meta")
+        self.assertIsNone(
+            self.sd_fused_wrapper(
+                *inputs,
+                *args[5:13],
+                flush,
+                t.empty_like(inputs[2]),
+                args[14],
+                compact_status,
+                args[15],
+                variant=24,
+                token_offsets=t.empty(3, dtype=t.int32, device="meta"),
             )
         )
 

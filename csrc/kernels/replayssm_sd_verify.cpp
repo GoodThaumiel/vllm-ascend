@@ -22,7 +22,7 @@ constexpr uint32_t MAX_VALUE_HEADS = 32;
 // correction solve is evaluated in token order with the earlier corrections
 // held in UB; this is algebraically the same unit-triangular solve as Eq. 10
 // of the paper, but is not yet the final performance tiling.
-template <int VARIANT>
+template <int VARIANT, bool PACKED_TOKENS = false>
 class ReplaySDVerify {
   static constexpr bool BULK_QKV = VARIANT == 11 || VARIANT == 13 || VARIANT == 14 ||
                                    (VARIANT >= 15 && VARIANT <= 24);
@@ -30,6 +30,8 @@ class ReplaySDVerify {
   static constexpr bool WIDE_CHECKPOINT = VARIANT == 23 || VARIANT == 24;
   static constexpr bool BATCH_GATE = VARIANT == 19 || VARIANT == 20 || WIDE_CHECKPOINT;
   static constexpr bool FUSED = VARIANT == 14 || VARIANT == 24;
+
+  static_assert(!PACKED_TOKENS || VARIANT == 24);
 
  public:
   __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
@@ -168,6 +170,10 @@ class ReplaySDVerify {
       flush_.SetGlobalBuffer((__gm__ int32_t*)flush);
       compactStatus_.SetGlobalBuffer((__gm__ int32_t*)compactStatus);
     }
+  }
+
+  __aicore__ inline void SetPackedTokenCount(uint32_t numTokens) {
+    numTokens_ = numTokens;
   }
 
   __aicore__ inline void Process() {
@@ -353,6 +359,8 @@ class ReplaySDVerify {
       const uint32_t head = task % valueHeads_;
       const uint32_t keyHead = head / (valueHeads_ / heads_);
       int32_t slot, ringSlot, pos, base, length;
+      uint32_t tokenStart = row * MAX_TOKENS;
+      bool validSpan = true;
       if constexpr (VARIANT == 21) {
         ReadPackedMetadata(row, slot, ringSlot, pos, base, length);
       } else {
@@ -360,14 +368,27 @@ class ReplaySDVerify {
         ringSlot = ReadInt(ringSlots_, row);
         pos = ReadInt(positions_, row);
         base = ReadInt(bases_, row);
-        length = ReadInt(lengths_, row);
+        if constexpr (PACKED_TOKENS) {
+          // The launch passes the prefix offsets in place of row lengths.
+          // One DMA reads both ends, replacing the old row-length DMA.
+          int32_t begin, end;
+          ReadTokenSpan(row, begin, end);
+          validSpan = begin >= 0 && end >= begin && static_cast<uint32_t>(end) <= numTokens_ &&
+                      end - begin <= static_cast<int32_t>(MAX_TOKENS);
+          tokenStart = validSpan ? static_cast<uint32_t>(begin) : 0;
+          length = validSpan ? end - begin : 0;
+        } else {
+          length = ReadInt(lengths_, row);
+        }
       }
       int32_t flush = 0;
       if constexpr (FUSED) {
         flush = ReadInt(flush_, row);
       }
       int32_t error = 0;
-      if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
+      if (!validSpan) {
+        error = 6;
+      } else if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
         error = 1;
       } else if (slot == 0) {
         if (pos != 0 || base != 0 || length != 0) {
@@ -383,17 +404,20 @@ class ReplaySDVerify {
         error = 3;
       }
       if (error != 0 || slot == 0) {
-        Duplicate(result_, 0.0f, tileV_);
-        PipeBarrier<PIPE_V>();
+        const uint32_t clearTokens = PACKED_TOKENS ? static_cast<uint32_t>(length) : MAX_TOKENS;
+        if (clearTokens > 0) {
+          Duplicate(result_, 0.0f, tileV_);
+          PipeBarrier<PIPE_V>();
+        }
         for (uint32_t tile = 0; tile < tiles_; ++tile) {
-          for (uint32_t s = 0; s < MAX_TOKENS; ++s) {
-            Store(out_, OutputOffset(row, s, head, tile * tileV_), result_, tileV_);
+          for (uint32_t s = 0; s < clearTokens; ++s) {
+            Store(out_, TokenOutputOffset(tokenStart, s, head, tile * tileV_), result_, tileV_);
           }
           WriteStatus(task * tiles_ + tile, error);
         }
         if constexpr (FUSED) {
           if (head == 0) {
-            WriteCompactStatus(row, CompactError(slot, ringSlot, pos, base, flush));
+            WriteCompactStatus(row, validSpan ? CompactError(slot, ringSlot, pos, base, flush) : error);
           }
         }
         continue;
@@ -411,14 +435,15 @@ class ReplaySDVerify {
       Load(gCache_, gOffset, historyGate_, ringLen_);
       Exp(historyGate_, historyGate_, ringLen_);
       PipeBarrier<PIPE_V>();
-      Load(g_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateLogGate_,
-           MAX_TOKENS * valueHeads_);
-      DataCopy(candidateGate_, candidateLogGate_, MAX_TOKENS * valueHeads_);
+      const uint64_t gateOffset = static_cast<uint64_t>(tokenStart) * valueHeads_;
+      const uint32_t gateCount = (PACKED_TOKENS ? length : MAX_TOKENS) * valueHeads_;
+      const uint32_t alignedGateCount = (gateCount + FP32_BLOCK - 1) / FP32_BLOCK * FP32_BLOCK;
+      Load(g_, gateOffset, candidateLogGate_, gateCount);
+      DataCopy(candidateGate_, candidateLogGate_, alignedGateCount);
       PipeBarrier<PIPE_V>();
-      Exp(candidateGate_, candidateGate_, MAX_TOKENS * valueHeads_);
+      Exp(candidateGate_, candidateGate_, gateCount);
       PipeBarrier<PIPE_V>();
-      Load(beta_, static_cast<uint64_t>(row) * MAX_TOKENS * valueHeads_, candidateBeta_,
-           MAX_TOKENS * valueHeads_);
+      Load(beta_, gateOffset, candidateBeta_, gateCount);
       SyncVectorToScalar();
       float historyAlpha[MAX_HISTORY];
       float alpha[MAX_TOKENS];
@@ -464,7 +489,7 @@ class ReplaySDVerify {
         beta[s] = candidateBeta_.GetValue(gateIndex);
         logGate[s] = candidateLogGate_.GetValue(gateIndex);
         if constexpr (!BULK_QKV) {
-          const uint64_t qkOffset = (static_cast<uint64_t>(row) * MAX_TOKENS + s) * heads_ * K_DIM +
+          const uint64_t qkOffset = (static_cast<uint64_t>(tokenStart) + s) * heads_ * K_DIM +
                                     static_cast<uint64_t>(keyHead) * K_DIM;
           Load(q_, qkOffset, allQ_[s * K_DIM], K_DIM);
           Muls(allQ_[s * K_DIM], allQ_[s * K_DIM], scale_, K_DIM);
@@ -473,8 +498,8 @@ class ReplaySDVerify {
         }
       }
       if constexpr (BULK_QKV) {
-        // Q/K are [B, 4, H, 128]. Copy the active tokens as packed UB rows.
-        const uint64_t qkOffset = static_cast<uint64_t>(row) * MAX_TOKENS * heads_ * K_DIM +
+        // Copy the active Q/K tokens as packed UB rows.
+        const uint64_t qkOffset = static_cast<uint64_t>(tokenStart) * heads_ * K_DIM +
                                   static_cast<uint64_t>(keyHead) * K_DIM;
         LoadCandidateRows(q_, qkOffset, allQ_, static_cast<uint32_t>(length), K_DIM,
                           heads_ * K_DIM);
@@ -622,13 +647,13 @@ class ReplaySDVerify {
           PipeBarrier<PIPE_V>();
         }
         if constexpr (BULK_QKV) {
-          // V is [B, 4, HV, 128]; each V tile has its own row offset.
-          LoadCandidateRows(v_, OutputOffset(row, 0, head, vStart), allV_,
+          // Each V tile has its own offset into the token-major tensor.
+          LoadCandidateRows(v_, TokenOutputOffset(tokenStart, 0, head, vStart), allV_,
                             static_cast<uint32_t>(length), tileV_, valueHeads_ * V_DIM);
         }
         float specProduct = 1.0f;
         for (int32_t s = 0; s < length; ++s) {
-          const uint64_t vOffset = OutputOffset(row, s, head, vStart);
+          const uint64_t vOffset = TokenOutputOffset(tokenStart, s, head, vStart);
           if constexpr (!BULK_QKV) {
             Load(v_, vOffset, value_, tileV_);
           }
@@ -718,10 +743,12 @@ class ReplaySDVerify {
             WriteGateBatch(gOffset, base, pos, length, logGate);
           }
         }
-        Duplicate(result_, 0.0f, tileV_);
-        PipeBarrier<PIPE_V>();
-        for (int32_t s = length; s < static_cast<int32_t>(MAX_TOKENS); ++s) {
-          Store(out_, OutputOffset(row, s, head, vStart), result_, tileV_);
+        if constexpr (!PACKED_TOKENS) {
+          Duplicate(result_, 0.0f, tileV_);
+          PipeBarrier<PIPE_V>();
+          for (int32_t s = length; s < static_cast<int32_t>(MAX_TOKENS); ++s) {
+            Store(out_, TokenOutputOffset(tokenStart, s, head, vStart), result_, tileV_);
+          }
         }
         WriteStatus(task * tiles_ + tile, 0);
       }
@@ -1306,7 +1333,12 @@ class ReplaySDVerify {
   }
 
   __aicore__ inline uint64_t OutputOffset(uint32_t row, uint32_t token, uint32_t head, uint32_t vStart) const {
-    return ((static_cast<uint64_t>(row) * MAX_TOKENS + token) * valueHeads_ + head) * V_DIM + vStart;
+    return TokenOutputOffset(row * MAX_TOKENS, token, head, vStart);
+  }
+
+  __aicore__ inline uint64_t TokenOutputOffset(uint32_t tokenStart, uint32_t token, uint32_t head,
+                                             uint32_t vStart) const {
+    return ((static_cast<uint64_t>(tokenStart) + token) * valueHeads_ + head) * V_DIM + vStart;
   }
 
   __aicore__ inline void LoadCheckpointInProduct(uint64_t offset) {
@@ -1402,6 +1434,22 @@ class ReplaySDVerify {
     pos = input.GetValue(2);
     base = input.GetValue(3);
     length = input.GetValue(4);
+    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+    in_.FreeTensor(input);
+  }
+
+  __aicore__ inline void ReadTokenSpan(uint32_t row, int32_t& begin, int32_t& end) {
+    auto input = in_.AllocTensor<int32_t>();
+    DataCopyExtParams cp{1, 2 * sizeof(int32_t), 0, 0, 0};
+    DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
+    DataCopyPad(input, lengths_[row], cp, pad);
+    in_.EnQue(input);
+    input = in_.DeQue<int32_t>();
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    begin = input.GetValue(0);
+    end = input.GetValue(1);
     SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
     in_.FreeTensor(input);
@@ -1639,6 +1687,7 @@ class ReplaySDVerify {
   GlobalTensor<half> dCache_, kCache_;
   GlobalTensor<float> g_, beta_, gCache_;
   GlobalTensor<int32_t> slots_, ringSlots_, positions_, bases_, lengths_, status_, flush_, compactStatus_;
+  uint32_t numTokens_;
   uint32_t batch_, numSlots_, numRingSlots_, heads_, valueHeads_, ringLen_, tileV_, tiles_;
   uint64_t checkpointStride_, dStride_, kStride_, gStride_;
   float scale_;

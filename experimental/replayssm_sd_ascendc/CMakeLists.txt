@@ -51,7 +51,8 @@ ascendc_library(replayssm_sd_verify_kernel SHARED
     ../../csrc/kernels/replayssm_sd_verify_v22_grouped_key_heads.cpp
     ../../csrc/kernels/replayssm_sd_verify_v23_wide_checkpoint.cpp
     ../../csrc/kernels/replayssm_sd_verify_compact_fused.cpp
-    ../../csrc/kernels/replayssm_sd_verify_compact_fused_v24.cpp)
+    ../../csrc/kernels/replayssm_sd_verify_compact_fused_v24.cpp
+    ../../csrc/kernels/replayssm_sd_verify_compact_fused_packed.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(

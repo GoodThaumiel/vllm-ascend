@@ -179,3 +179,71 @@ python3 "$run" --suite vector --geometry 9b --batches 128 --layers 24 \
   --path native fused_v24 fused_v24_with_pack --compare-eager --verify-library "$verify" \
   --iterations 25 --output /tmp/replay-910c/pack-ablation-b128.json
 ```
+
+### 紧凑 token 布局的 V24
+
+V24 接受可选的 `token_offsets`。传入时，Q/K/V 和输出为 token-major，
+gate/beta 为 `[T, HV]`。同一请求使用
+`[token_offsets[row], token_offsets[row + 1])`，每个有效请求有 1–4 个
+token。padding 行应使用零长度和空 slot。前缀和以零开始，必须与当轮
+输入顺序一致，末项可以小于图上的 token 缓冲区容量。下游只应消费
+有效前缀。算子按请求读取 checkpoint、ring slot 与 flush。越界或反向
+的局部 span 返回状态码 6，跳过该行输出和 cache 写入。全局单调性和
+跨张量顺序由 metadata 生产者保证。
+
+算子在已有 UB 队列中用一次 DMA 读相邻两个 offset，替代原来的 length
+读取。按有效 token 数读取 gate/beta、写出结果，直接使用原有的 V24
+历史修正和 compact。同一个 `fused_` 接口仍接受未传 offset 的固定槽
+调用。当前验证入口是独立 Torch binding，服务接入另需覆盖 FULL 图的
+padding、混合 prefill/decode 及连续多轮请求交换。
+
+上机时选择空闲的 910C die。Blue2 测试使用 CANN 9.2.1、MTP3 几何、
+tile128、40 核、BF16 checkpoint 以及 FP16 D/K 和 FP32 G。以下命令构建
+并对比固定槽、旧 pack/unpack、紧凑三个路径。恢复被 flush 的 checkpoint
+在计时区间外。
+
+```bash
+cmake -S experimental/replayssm_sd_ascendc -B build-verify \
+  -DSOC_VERSION=ascend910_9362 -DASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH" \
+  -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build build-verify -j 8
+run=experimental/replayssm_cube_910b/run_token_layout.py
+verify=build-verify/libreplayssm_sd_torch.so
+python3 "$run" --geometry 27b --batches 4 --layout ragged --flush-fraction 0.25 \
+  --verify-library "$verify" --output /tmp/replay-layout-ragged.json
+python3 "$run" --geometry 9b --batches 4 --layout padded --flush-fraction 0.25 \
+  --verify-library "$verify" --output /tmp/replay-layout-padded.json
+python3 "$run" --geometry 27b --batches 32,64 --layers 48 --layout uniform \
+  --iterations 25 --verify-library "$verify" --output /tmp/replay-layout-27b.json
+python3 "$run" --geometry 9b --batches 128,256 --layers 24 --layout uniform \
+  --iterations 25 --verify-library "$verify" --output /tmp/replay-layout-9b.json
+```
+
+把最后两个命令的 `--layout` 改为 `ragged`，输出到不同文件，可复测
+每行长 1–4 的混合长度。B4 ragged 会在 capture 后变更请求边界，并验证
+超界的末行在同一个图中只写错误状态。B4 padded 还检查空行和保留容量，
+确认有效前缀以外的输出没有被覆写。比较包含有效输出、D/K/G ring、
+checkpoint、两组状态，且 checkpoint 与 ring 的物理槽号不同。
+
+Blue2 图回放 p50，单位 ms。stack 各层使用独立 cache。位置为 flush
+行 15、其余有效行 7，ring base 为 31。Native 用现有对照脚本在同一
+die 上分别重新测量，各有效 token 的 state slot 随 token 排列。
+
+| 几何 | 布局 | B | Flush 行 | Native | V24 固定槽 | V24 含 pack/unpack | V24 紧凑 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 27B TP4，48 层 | T4 | 32 | 4 | 9.07 | 11.90 | 16.68 | 11.85 |
+| 27B TP4，48 层 | T4 | 64 | 8 | 17.80 | 22.26 | 29.45 | 22.05 |
+| 9B TP1，24 层 | T4 | 128 | 0 | 44.77 | 51.72 | 61.11 | 51.61 |
+| 9B TP1，24 层 | T4 | 128 | 16 | 44.77 | 57.15 | 66.16 | 56.97 |
+| 9B TP1，24 层 | T4 | 128 | 80 | 44.86 | 76.14 | 84.89 | 75.52 |
+| 9B TP1，24 层 | T4 | 256 | 32 | 88.99 | 112.84 | 129.99 | 112.62 |
+| 27B TP4，48 层 | 混合 T1–4 | 32 | 4 | — | 9.14 | 13.41 | 9.11 |
+| 27B TP4，48 层 | 混合 T1–4 | 64 | 8 | — | 17.46 | 23.10 | 17.31 |
+| 9B TP1，24 层 | 混合 T1–4 | 128 | 16 | — | 43.74 | 49.81 | 43.07 |
+| 9B TP1，24 层 | 混合 T1–4 | 256 | 32 | — | 85.98 | 97.71 | 84.88 |
+
+同一布局内，紧凑路径和预先排好的固定槽路径相差约 0.2%–1.5%。
+每行 T4 已可用零拷贝视图作为对照。紧凑 ABI 的主要收益是允许混合
+长度和 padding 也省掉输入 scatter 和输出 gather。混合长度的绝对时延
+还受有效 token 数影响。Native 的 T4 测值可用于同形状差距，混合长度
+应另测对应 native 下发方式。上述测试只包含 GDN 算子图。
