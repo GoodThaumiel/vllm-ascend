@@ -28,11 +28,22 @@ class ReplaySDCursor {
     logicalLimit_ = logicalLimit;
     maxSpecLen_ = maxSpecLen;
     ringLen_ = ringLen;
-    pipe_.InitBuffer(in_, 1, 32);
-    pipe_.InitBuffer(out_, 1, 32);
+    if (UseBatchTransfers()) {
+      const uint32_t rowBytes = Align32(batch_ * sizeof(int32_t));
+      const uint32_t slotBytes = Align32(numSlots_ * sizeof(int32_t));
+      pipe_.InitBuffer(batchInput_, 2 * rowBytes + Align32(batch_) + 2 * slotBytes + Align32(numSlots_));
+      pipe_.InitBuffer(batchOutput_, rowBytes + 3 * 32 * batch_ + Align32(batch_));
+    } else {
+      pipe_.InitBuffer(in_, 1, 32);
+      pipe_.InitBuffer(out_, 1, 32);
+    }
   }
 
   __aicore__ inline void Process() {
+    if (UseBatchTransfers()) {
+      ProcessBatched();
+      return;
+    }
     const int32_t initialFlush = 2 * maxSpecLen_ > logicalLimit_ ? 1 : 0;
     for (uint32_t row = 0; row < batch_; ++row) {
       const int32_t slot = Read(slots_, row);
@@ -87,6 +98,110 @@ class ReplaySDCursor {
   }
 
  private:
+  __aicore__ inline bool UseBatchTransfers() const {
+    return batch_ >= 32 && batch_ <= 1024 && numSlots_ <= 1024;
+  }
+
+  __aicore__ inline uint32_t Align32(uint32_t bytes) const {
+    return (bytes + 31) / 32 * 32;
+  }
+
+  template <typename T>
+  __aicore__ inline void CopyIn(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
+    const DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
+    const DataCopyPadExtParams<T> pad{false, 0, 0, 0};
+    DataCopyPad(dst, src, cp, pad);
+  }
+
+  template <typename T>
+  __aicore__ inline void CopyOut(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+    const DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
+    DataCopyPad(dst, src, cp);
+  }
+
+  __aicore__ inline void ProcessBatched() {
+    const uint32_t rowBytes = Align32(batch_ * sizeof(int32_t));
+    const uint32_t slotBytes = Align32(numSlots_ * sizeof(int32_t));
+    auto input = batchInput_.Get<int8_t>();
+    auto slots = input.ReinterpretCast<int32_t>();
+    auto accepted = input[rowBytes].ReinterpretCast<int32_t>();
+    auto resets = input[2 * rowBytes];
+    const uint32_t cursorOffset = 2 * rowBytes + Align32(batch_);
+    auto positions = input[cursorOffset].ReinterpretCast<int32_t>();
+    auto bases = input[cursorOffset + slotBytes].ReinterpretCast<int32_t>();
+    auto flushes = input[cursorOffset + 2 * slotBytes];
+    CopyIn(slots, slots_, batch_);
+    CopyIn(accepted, accepted_, batch_);
+    CopyIn(resets, reset_, batch_);
+    CopyIn(positions, wp_, numSlots_);
+    CopyIn(bases, base_, numSlots_);
+    CopyIn(flushes, flush_, numSlots_);
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+
+    auto output = batchOutput_.Get<int8_t>();
+    auto statuses = output.ReinterpretCast<int32_t>();
+    auto newPositions = output[rowBytes].ReinterpretCast<int32_t>();
+    auto newBases = output[rowBytes + 32 * batch_].ReinterpretCast<int32_t>();
+    auto newFlushes = output[rowBytes + 2 * 32 * batch_];
+    auto writeRows = output[rowBytes + 3 * 32 * batch_];
+    for (uint32_t row = 0; row < batch_; ++row) {
+      const int32_t slot = slots.GetValue(row);
+      const int32_t n = accepted.GetValue(row);
+      int32_t status = 0;
+      int32_t newPos = 0;
+      int32_t newBase = 0;
+      bool write = false;
+      if (slot < 0 || slot >= static_cast<int32_t>(numSlots_)) {
+        status = 1;
+      } else if (slot != 0) {
+        if (resets.GetValue(row) != 0) {
+          write = true;
+        } else if (n < 0 || n > static_cast<int32_t>(maxSpecLen_)) {
+          status = 2;
+        } else {
+          const int32_t oldPos = positions.GetValue(slot);
+          const int32_t oldBase = bases.GetValue(slot);
+          const int32_t oldFlush = flushes.GetValue(slot);
+          if (oldPos < 0 || oldPos > static_cast<int32_t>(logicalLimit_) ||
+              oldBase < 0 || oldBase >= static_cast<int32_t>(ringLen_) ||
+              (oldFlush != 0 && oldFlush != 1)) {
+            status = 3;
+          } else if (n != 0) {
+            newPos = (oldFlush != 0 ? 0 : oldPos) + n;
+            newBase = oldFlush != 0 ? (oldBase + oldPos) & (ringLen_ - 1) : oldBase;
+            if (newPos > static_cast<int32_t>(logicalLimit_)) {
+              status = 4;
+            } else {
+              write = true;
+            }
+          }
+        }
+      }
+      statuses.SetValue(row, status);
+      writeRows.SetValue(row, static_cast<int8_t>(write));
+      if (write) {
+        newPositions.SetValue(row * 8, newPos);
+        newBases.SetValue(row * 8, newBase);
+        newFlushes.SetValue(row * 32, static_cast<int8_t>(newPos + 2 * maxSpecLen_ > logicalLimit_));
+      }
+    }
+
+    // A row owns one aligned UB block per mutable field. Individual GM
+    // stores retain the existing slot ownership and skip unlisted slots.
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    for (uint32_t row = 0; row < batch_; ++row) {
+      if (writeRows.GetValue(row) != 0) {
+        const int32_t slot = slots.GetValue(row);
+        CopyOut(wp_[slot], newPositions[row * 8], 1);
+        CopyOut(base_[slot], newBases[row * 8], 1);
+        CopyOut(flush_[slot], newFlushes[row * 32], 1);
+      }
+    }
+    CopyOut(status_, statuses, batch_);
+  }
+
   template <typename T>
   __aicore__ inline T Read(GlobalTensor<T>& source, uint32_t offset) {
     auto local = in_.AllocTensor<T>();
@@ -122,6 +237,7 @@ class ReplaySDCursor {
   TPipe pipe_;
   TQue<QuePosition::VECIN, 1> in_;
   TQue<QuePosition::VECOUT, 1> out_;
+  TBuf<QuePosition::VECCALC> batchInput_, batchOutput_;
   GlobalTensor<int32_t> wp_, base_, accepted_, slots_, status_;
   GlobalTensor<int8_t> flush_, reset_;
   uint32_t batch_, numSlots_, logicalLimit_, maxSpecLen_, ringLen_;

@@ -80,13 +80,14 @@ void replayssm_sd_compact(const at::Tensor& checkpoint, const at::Tensor& d_cach
                     flush.data_ptr<int32_t>() == packed + 3,
                 "variant 4 requires four views of one interleaved int32[B,4] allocation");
   }
-  TORCH_CHECK(tile_v == 16 || tile_v == 32, "tile_v must be 16/32");
+  TORCH_CHECK(tile_v == 16 || tile_v == 32 || (tile_v == 64 && variant >= 5),
+              "tile_v must be 16/32, or 64 for variant 5/6");
   const int64_t tasks = batch * value_heads * (128 / tile_v);
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt &&
                   status.is_contiguous(),
               "status must be contiguous int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 4, "variant must be 0..4");
+  TORCH_CHECK(variant >= 0 && variant <= 6, "variant must be 0..6");
   TORCH_CHECK(variant != 4 || !ring_slots.has_value(),
               "variant 4 packed metadata does not support independent ring slots");
   TORCH_CHECK(variant == 0 || (value_heads * (128 / tile_v)) % 8 == 0,

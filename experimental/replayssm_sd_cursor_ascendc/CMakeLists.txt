@@ -6,8 +6,8 @@ set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/cann-9.2.0" CACHE PATH "CANN roo
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-if(NOT SOC_VERSION MATCHES "^[Aa]scend910[Bb]")
-    message(FATAL_ERROR "Replay SD cursor targets Ascend910B; got ${SOC_VERSION}")
+if(NOT (SOC_VERSION MATCHES "^[Aa]scend910[Bb]" OR SOC_VERSION STREQUAL "ascend910_9362"))
+    message(FATAL_ERROR "Replay SD cursor targets Ascend910B or ascend910_9362; got ${SOC_VERSION}")
 endif()
 
 set(ASCENDC_CMAKE_DIR "")

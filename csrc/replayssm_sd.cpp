@@ -28,6 +28,7 @@
 #include "aclrtlaunch_replayssm_sd_verify_v20_chunk8k_gate_batch.h"
 #include "aclrtlaunch_replayssm_sd_verify_v21_packed_metadata.h"
 #include "aclrtlaunch_replayssm_sd_verify_v22_grouped_key_heads.h"
+#include "aclrtlaunch_replayssm_sd_verify_v23_wide_checkpoint.h"
 
 #include <algorithm>
 #include <cmath>
@@ -111,14 +112,14 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
   TORCH_CHECK(g.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat &&
                   g_cache.scalar_type() == at::kFloat,
               "g/beta/g_cache must be FP32");
-  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && (variant == 12 || variant == 13 || (variant >= 15 && variant <= 22))),
-              "tile_v must be 16/32/64, or 128 with variant 12/13/15-22");
+  TORCH_CHECK(tile_v == 16 || tile_v == 32 || tile_v == 64 || (tile_v == 128 && (variant == 12 || variant == 13 || (variant >= 15 && variant <= 23))),
+              "tile_v must be 16/32/64, or 128 with variant 12/13/15-23");
   const int64_t tasks = batch * value_heads * (K_DIM / tile_v);
   TORCH_CHECK(status.dim() == 1 && status.numel() == tasks && status.scalar_type() == at::kInt,
               "status must be int32[B*HV*(128/tile_v)]");
   TORCH_CHECK(cores >= 1 && cores <= 40, "cores must be in [1,40]");
-  TORCH_CHECK(variant >= 0 && variant <= 22 && variant != 14, "variant must be in 0-13 or 15-22 (14 is the separate fusion operator)");
-  TORCH_CHECK((variant != 12 && variant != 13 && (variant < 15 || variant > 22)) || tile_v == 128, "variant 12/13/15-22 requires tile_v=128");
+  TORCH_CHECK(variant >= 0 && variant <= 23 && variant != 14, "variant must be in 0-13 or 15-23 (14 is the separate fusion operator)");
+  TORCH_CHECK((variant != 12 && variant != 13 && (variant < 15 || variant > 23)) || tile_v == 128, "variant 12/13/15-23 requires tile_v=128");
   if (variant == 21) {
     TORCH_CHECK(packed_metadata.has_value(), "variant 21 requires packed_metadata [B,8]");
     const auto& meta = *packed_metadata;
@@ -210,6 +211,9 @@ void replayssm_sd_verify(const at::Tensor& q, const at::Tensor& k, const at::Ten
       break;
     case 22:
       result = aclrtlaunch_replayssm_sd_verify_v22_grouped_key_heads(REPLAY_SD_LAUNCH_ARGS);
+      break;
+    case 23:
+      result = aclrtlaunch_replayssm_sd_verify_v23_wide_checkpoint(REPLAY_SD_LAUNCH_ARGS);
       break;
     default:
       result = aclrtlaunch_replayssm_sd_verify_tile128_bulk_qkv(REPLAY_SD_LAUNCH_ARGS);

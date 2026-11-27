@@ -10,7 +10,7 @@
   "Tensor(b!) d_cache, Tensor(c!) k_cache, Tensor(d!) g_cache, Tensor slots, "                   \
   "Tensor positions, Tensor bases, Tensor lengths, Tensor flush, Tensor(e!) out, "               \
   "Tensor(f!) verify_status, Tensor(g!) compact_status, float scale, "                           \
-  "int tile_v=128, int cores=40, Tensor? ring_slots=None) -> ()"
+  "int tile_v=128, int cores=40, Tensor? ring_slots=None, int variant=14) -> ()"
 
 namespace vllm_ascend {
 void replayssm_sd_verify_compact_fused(
@@ -21,12 +21,12 @@ void replayssm_sd_verify_compact_fused(
     const at::Tensor& lengths, const at::Tensor& flush, const at::Tensor& out,
     const at::Tensor& verify_status, const at::Tensor& compact_status,
     double scale, int64_t tile_v, int64_t cores,
-    c10::optional<at::Tensor> ring_slots);
+    c10::optional<at::Tensor> ring_slots, int64_t variant);
 
 inline void replayssm_sd_verify_compact_fused_meta(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    const at::Tensor&, double, int64_t, int64_t, c10::optional<at::Tensor>) {}
+    const at::Tensor&, double, int64_t, int64_t, c10::optional<at::Tensor>, int64_t) {}
 }  // namespace vllm_ascend

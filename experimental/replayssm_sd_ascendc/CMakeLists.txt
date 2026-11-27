@@ -10,8 +10,8 @@ set(CMAKE_LINK_DEPENDS_USE_LINKER FALSE)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
-if(NOT SOC_VERSION MATCHES "^[Aa]scend910[Bb]")
-    message(FATAL_ERROR "Replay SD pilot targets Ascend910B; got ${SOC_VERSION}")
+if(NOT (SOC_VERSION MATCHES "^[Aa]scend910[Bb]" OR SOC_VERSION STREQUAL "ascend910_9362"))
+    message(FATAL_ERROR "Replay SD pilot targets Ascend910B or ascend910_9362; got ${SOC_VERSION}")
 endif()
 
 set(ASCENDC_CMAKE_DIR "")
@@ -40,7 +40,18 @@ ascendc_library(replayssm_sd_verify_kernel SHARED
     ../../csrc/kernels/replayssm_sd_verify_muladd.cpp
     ../../csrc/kernels/replayssm_sd_verify_bulk_qkv.cpp
     ../../csrc/kernels/replayssm_sd_verify_tile128.cpp
-    ../../csrc/kernels/replayssm_sd_verify_tile128_bulk_qkv.cpp)
+    ../../csrc/kernels/replayssm_sd_verify_tile128_bulk_qkv.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v15_history_fma.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v16_chunk8k.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v17_spec_rows_ub.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v18_paired_matvec.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v19_gate_batch.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v20_chunk8k_gate_batch.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v21_packed_metadata.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v22_grouped_key_heads.cpp
+    ../../csrc/kernels/replayssm_sd_verify_v23_wide_checkpoint.cpp
+    ../../csrc/kernels/replayssm_sd_verify_compact_fused.cpp
+    ../../csrc/kernels/replayssm_sd_verify_compact_fused_v24.cpp)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(
@@ -54,7 +65,7 @@ execute_process(
 find_library(TORCH_NPU_LIB torch_npu PATHS "${torch_npu_root}/lib" NO_DEFAULT_PATH REQUIRED)
 find_library(ASCENDCL_LIB ascendcl PATHS "${ASCEND_CANN_PACKAGE_PATH}/lib64" NO_DEFAULT_PATH REQUIRED)
 
-add_library(replayssm_sd_torch SHARED csrc/torch_binding.cpp ../../csrc/replayssm_sd.cpp)
+add_library(replayssm_sd_torch SHARED csrc/torch_binding.cpp ../../csrc/replayssm_sd.cpp ../../csrc/replayssm_sd_fused.cpp)
 add_dependencies(replayssm_sd_torch replayssm_sd_verify_kernel)
 target_include_directories(replayssm_sd_torch PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../csrc"

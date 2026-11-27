@@ -24,6 +24,13 @@ constexpr uint32_t MAX_VALUE_HEADS = 32;
 // of the paper, but is not yet the final performance tiling.
 template <int VARIANT>
 class ReplaySDVerify {
+  static constexpr bool BULK_QKV = VARIANT == 11 || VARIANT == 13 || VARIANT == 14 ||
+                                   (VARIANT >= 15 && VARIANT <= 24);
+  static constexpr bool BULK_HISTORY = VARIANT == 9 || VARIANT == 12 || BULK_QKV;
+  static constexpr bool WIDE_CHECKPOINT = VARIANT == 23 || VARIANT == 24;
+  static constexpr bool BATCH_GATE = VARIANT == 19 || VARIANT == 20 || WIDE_CHECKPOINT;
+  static constexpr bool FUSED = VARIANT == 14 || VARIANT == 24;
+
  public:
   __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta, GM_ADDR checkpoint,
                               GM_ADDR dCache, GM_ADDR kCache, GM_ADDR gCache, GM_ADDR slots, GM_ADDR ringSlots, GM_ADDR positions,
@@ -64,7 +71,7 @@ class ReplaySDVerify {
 
     // Tile128 variants stage the checkpoint in bounded input chunks.
     pipe_.InitBuffer(in_, 1,
-                     VARIANT == 12 || VARIANT == 16 || VARIANT == 20 ? 8192 : ((VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 22)) ? 4096 : tileV * K_DIM * sizeof(bfloat16_t)));
+                     VARIANT == 12 || VARIANT == 16 || VARIANT == 20 ? 8192 : ((VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 24)) ? 4096 : tileV * K_DIM * sizeof(bfloat16_t)));
     // A key-cache store casts all 128 elements to FP16 in this queue.
     pipe_.InitBuffer(outQueue_, 1, VARIANT == 14 ? 4096 : K_DIM * sizeof(float));
     pipe_.InitBuffer(checkpointBuffer_, tileV * K_DIM * sizeof(float));
@@ -92,7 +99,7 @@ class ReplaySDVerify {
       pipe_.InitBuffer(allQBuffer_, MAX_TOKENS * K_DIM * sizeof(float));
       allQ_ = allQBuffer_.Get<float>();
     }
-    if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 22)) {
+    if constexpr (BULK_QKV) {
       pipe_.InitBuffer(allVBuffer_, MAX_TOKENS * tileV_ * sizeof(float));
       allV_ = allVBuffer_.Get<float>();
     }
@@ -157,7 +164,7 @@ class ReplaySDVerify {
   }
 
   __aicore__ inline void SetFusionOutputs(GM_ADDR flush, GM_ADDR compactStatus) {
-    if constexpr (VARIANT == 14) {
+    if constexpr (FUSED) {
       flush_.SetGlobalBuffer((__gm__ int32_t*)flush);
       compactStatus_.SetGlobalBuffer((__gm__ int32_t*)compactStatus);
     }
@@ -356,7 +363,7 @@ class ReplaySDVerify {
         length = ReadInt(lengths_, row);
       }
       int32_t flush = 0;
-      if constexpr (VARIANT == 14) {
+      if constexpr (FUSED) {
         flush = ReadInt(flush_, row);
       }
       int32_t error = 0;
@@ -384,7 +391,7 @@ class ReplaySDVerify {
           }
           WriteStatus(task * tiles_ + tile, error);
         }
-        if constexpr (VARIANT == 14) {
+        if constexpr (FUSED) {
           if (head == 0) {
             WriteCompactStatus(row, CompactError(slot, ringSlot, pos, base, flush));
           }
@@ -422,11 +429,11 @@ class ReplaySDVerify {
         const uint32_t phys = Physical(base, i);
         historyAlpha[i] = historyGate_.GetValue(phys);
         historyProduct *= historyAlpha[i];
-        if constexpr (VARIANT != 9 && VARIANT != 11 && VARIANT != 12 && VARIANT != 13 && VARIANT != 14 && (VARIANT < 15 || VARIANT > 21)) {
+        if constexpr (!BULK_HISTORY) {
           Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, historyK_[i * K_DIM], K_DIM);
         }
       }
-      if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12 || VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 21)) {
+      if constexpr (BULK_HISTORY) {
         // Logical history crosses the physical ring at most once. Two large
         // copies replace up to 16 per-record K copies and casts.
         const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
@@ -456,7 +463,7 @@ class ReplaySDVerify {
         alpha[s] = candidateGate_.GetValue(gateIndex);
         beta[s] = candidateBeta_.GetValue(gateIndex);
         logGate[s] = candidateLogGate_.GetValue(gateIndex);
-        if constexpr (VARIANT != 11 && VARIANT != 13 && VARIANT != 14 && (VARIANT < 15 || VARIANT > 21)) {
+        if constexpr (!BULK_QKV) {
           const uint64_t qkOffset = (static_cast<uint64_t>(row) * MAX_TOKENS + s) * heads_ * K_DIM +
                                     static_cast<uint64_t>(keyHead) * K_DIM;
           Load(q_, qkOffset, allQ_[s * K_DIM], K_DIM);
@@ -465,7 +472,7 @@ class ReplaySDVerify {
           Load(k_, qkOffset, specK_[s * K_DIM], K_DIM);
         }
       }
-      if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 21)) {
+      if constexpr (BULK_QKV) {
         // Q/K are [B, 4, H, 128]. Copy the active tokens as packed UB rows.
         const uint64_t qkOffset = static_cast<uint64_t>(row) * MAX_TOKENS * heads_ * K_DIM +
                                   static_cast<uint64_t>(keyHead) * K_DIM;
@@ -569,6 +576,8 @@ class ReplaySDVerify {
           if (tile + 2 < tiles_) {
             PrefetchCheckpoint(stateOffset + (tile + 2) * tileV_ * K_DIM);
           }
+        } else if constexpr (WIDE_CHECKPOINT) {
+          LoadCheckpointInProduct(stateOffset + vStart * K_DIM);
         } else if constexpr (VARIANT == 12 || VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 21)) {
           // V12: four 8 KiB chunks; V13: eight 4 KiB chunks so history
           // correction keeps separate UB buffers instead of aliasing product_.
@@ -579,7 +588,7 @@ class ReplaySDVerify {
         } else {
           Load(checkpoint_, stateOffset + vStart * K_DIM, state_, tileV_ * K_DIM);
         }
-        if constexpr (VARIANT == 9 || VARIANT == 11 || VARIANT == 12 || VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 21)) {
+        if constexpr (BULK_HISTORY) {
           const uint32_t available = ringLen_ - static_cast<uint32_t>(base);
           const uint32_t first = static_cast<uint32_t>(pos) < available ? static_cast<uint32_t>(pos) : available;
           if (first > 0) {
@@ -612,7 +621,7 @@ class ReplaySDVerify {
           Duplicate(specD_, 0.0f, SPEC_ROWS * tileV_);
           PipeBarrier<PIPE_V>();
         }
-        if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 21)) {
+        if constexpr (BULK_QKV) {
           // V is [B, 4, HV, 128]; each V tile has its own row offset.
           LoadCandidateRows(v_, OutputOffset(row, 0, head, vStart), allV_,
                             static_cast<uint32_t>(length), tileV_, valueHeads_ * V_DIM);
@@ -620,7 +629,7 @@ class ReplaySDVerify {
         float specProduct = 1.0f;
         for (int32_t s = 0; s < length; ++s) {
           const uint64_t vOffset = OutputOffset(row, s, head, vStart);
-          if constexpr (VARIANT != 11 && VARIANT != 13 && VARIANT != 14 && (VARIANT < 15 || VARIANT > 21)) {
+          if constexpr (!BULK_QKV) {
             Load(v_, vOffset, value_, tileV_);
           }
           if constexpr (VARIANT == 18) {
@@ -671,7 +680,7 @@ class ReplaySDVerify {
           }
           Muls(prevK_, prevK_, alpha[s], tileV_);
           PipeBarrier<PIPE_V>();
-          if constexpr (VARIANT == 11 || VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 21)) {
+          if constexpr (BULK_QKV) {
             Sub(delta_, allV_[s * tileV_], prevK_, tileV_);
           } else {
             Sub(delta_, value_, prevK_, tileV_);
@@ -694,7 +703,7 @@ class ReplaySDVerify {
           const uint32_t phys = Physical(base, pos + s);
           Store(dCache_, dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart, delta_, tileV_);
           if (vStart == 0) {
-            if constexpr (VARIANT != 19 && VARIANT != 20) {
+            if constexpr (!BATCH_GATE) {
               WriteGate(gOffset + phys, logGate[s]);
             }
             if (head % (valueHeads_ / heads_) == 0) {
@@ -704,7 +713,7 @@ class ReplaySDVerify {
           }
           specProduct *= alpha[s];
         }
-        if constexpr (VARIANT == 19 || VARIANT == 20) {
+        if constexpr (BATCH_GATE) {
           if (vStart == 0) {
             WriteGateBatch(gOffset, base, pos, length, logGate);
           }
@@ -716,14 +725,18 @@ class ReplaySDVerify {
         }
         WriteStatus(task * tiles_ + tile, 0);
       }
-      if constexpr (VARIANT == 14) {
+      if constexpr (FUSED) {
         const int32_t compactError = CompactError(slot, ringSlot, pos, base, flush);
         if (compactError == 0 && flush == 1 && pos > 0) {
           // The tile128 checkpoint and committed history remain in UB after
           // verify. Fold only old records after all draft outputs are written.
           FoldHistoryInUB(historyAlpha, pos);
-          for (uint32_t k = 0; k < tileV_ * K_DIM; k += 2048) {
-            Store(checkpoint_, stateOffset + k, state_[k], 2048);
+          if constexpr (WIDE_CHECKPOINT) {
+            StoreCheckpointInProduct(stateOffset);
+          } else {
+            for (uint32_t k = 0; k < tileV_ * K_DIM; k += 2048) {
+              Store(checkpoint_, stateOffset + k, state_[k], 2048);
+            }
           }
         }
         if (head == 0) {
@@ -1171,9 +1184,23 @@ class ReplaySDVerify {
   __aicore__ inline void FoldHistoryInUB(const float* historyAlpha, int32_t pos) {
     uint32_t shape[2] = {tileV_, K_DIM};
     uint32_t deltaShape[2] = {tileV_, 1};
-    for (int32_t i = 0; i < pos; ++i) {
-      Muls(state_, state_, historyAlpha[i], tileV_ * K_DIM);
+    if constexpr (VARIANT == 24) {
+      // D is no longer needed by verify. Apply suffix scales there and
+      // multiply the checkpoint once, as in standalone Compact V6.
+      float suffix = 1.0f;
+      for (int32_t i = pos - 1; i >= 0; --i) {
+        auto delta = historyD_[i * tileV_];
+        Muls(delta, delta, suffix, tileV_);
+        suffix *= historyAlpha[i];
+      }
+      Muls(state_, state_, suffix, tileV_ * K_DIM);
       PipeBarrier<PIPE_V>();
+    }
+    for (int32_t i = 0; i < pos; ++i) {
+      if constexpr (VARIANT != 24) {
+        Muls(state_, state_, historyAlpha[i], tileV_ * K_DIM);
+        PipeBarrier<PIPE_V>();
+      }
       Broadcast<float, 2, 1>(product_, historyD_[i * tileV_], shape, deltaShape);
       PipeBarrier<PIPE_V>();
       auto key = historyK_[i * K_DIM];
@@ -1280,6 +1307,34 @@ class ReplaySDVerify {
 
   __aicore__ inline uint64_t OutputOffset(uint32_t row, uint32_t token, uint32_t head, uint32_t vStart) const {
     return ((static_cast<uint64_t>(row) * MAX_TOKENS + token) * valueHeads_ + head) * V_DIM + vStart;
+  }
+
+  __aicore__ inline void LoadCheckpointInProduct(uint64_t offset) {
+    // K-side dots have finished using product_. Use it as a BF16 staging
+    // area until Cast produces the independent FP32 checkpoint tile.
+    const uint32_t count = tileV_ * K_DIM;
+    auto input = productBuffer_.Get<bfloat16_t>();
+    SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    const DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(bfloat16_t)), 0, 0, 0};
+    const DataCopyPadExtParams<bfloat16_t> pad{false, 0, 0, 0};
+    DataCopyPad(input, checkpoint_[offset], cp, pad);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    Cast(state_, input, RoundMode::CAST_NONE, count);
+    PipeBarrier<PIPE_V>();
+  }
+
+  __aicore__ inline void StoreCheckpointInProduct(uint64_t offset) {
+    const uint32_t count = tileV_ * K_DIM;
+    auto staging = productBuffer_.Get<bfloat16_t>();
+    Cast(staging, state_, RoundMode::CAST_RINT, count);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    const DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(bfloat16_t)), 0, 0, 0};
+    DataCopyPad(checkpoint_[offset], staging, cp);
+    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
   }
 
   template <typename T>
@@ -1424,7 +1479,7 @@ class ReplaySDVerify {
     // each step updates disjoint destinations and halves the active rows.
     for (uint32_t step = 1; step < MAX_HISTORY; step *= 2) {
       const uint8_t repeats = MAX_HISTORY / (2 * step);
-      if constexpr (VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 22)) {
+      if constexpr (VARIANT == 13 || VARIANT == 14 || (VARIANT >= 15 && VARIANT <= 24)) {
         if (step == 8) {
           // One remaining pair: use the count API for all 128 FP32 values.
           Add(weightedHistory_, weightedHistory_, weightedHistory_[step * tileV_], tileV_);

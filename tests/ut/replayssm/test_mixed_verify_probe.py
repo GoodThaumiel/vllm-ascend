@@ -70,6 +70,12 @@ class TestMixedVerifyProbe(unittest.TestCase):
                 self.assertEqual(expected.shape, (blocks, dim, 16))
                 self.assertEqual(expected[:, :, 8:].count_nonzero().item(), 0)
 
+    def test_balanced_workspace_records_last_value_head_even_if_group_splits(self):
+        case = make_case(geometry="27b", tp=4, batch=16)
+        expected = reference_projections(case, torch.tensor([0, 1, 15]), torch.tensor([8, 6, 11]))
+        actual = last_projections(case, 20, balanced=True)
+        torch.testing.assert_close(actual[[0, 1, 19]], expected)
+
     def test_two_tiles_projected_recurrence_matches_dense(self):
         # Simulate the 128x16 FP32 handoff to two V64 consumers. Exercise both
         # head-sharing ratios, a wrapped committed ring and padded K/Q columns.

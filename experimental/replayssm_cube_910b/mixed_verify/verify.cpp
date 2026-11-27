@@ -10,7 +10,6 @@ constexpr uint32_t COLS = 16;
 constexpr uint32_t TOKENS = 4;
 constexpr uint32_t HISTORY = 16;
 constexpr uint32_t RING = 32;
-constexpr uint32_t PANEL = TILE * COLS;
 constexpr uint32_t FRACTAL = 16 * 16;
 constexpr uint32_t FLOAT_LANES_PER_BLOCK = 32 / sizeof(float);
 constexpr uint32_t CANDIDATE_SCALARS = TOKENS * FLOAT_LANES_PER_BLOCK;
@@ -40,7 +39,27 @@ struct Inputs {
   GlobalTensor<float> g, beta, gates, scratch;
   GlobalTensor<int32_t> slots, ringSlots, pos, base, length, status;
   uint32_t batch, hk, hv, numSlots, numRingSlots, blocks;
-  bool perHeadWorkspace;
+  bool perHeadWorkspace, balanceHeads;
+
+  __aicore__ inline uint32_t FirstTask(uint32_t block, uint32_t group) const {
+    return balanceHeads ? (batch * hv * block) / blocks : block * group;
+  }
+
+  __aicore__ inline uint32_t EndTask(uint32_t block) const {
+    return balanceHeads ? (batch * hv * (block + 1)) / blocks : batch * hv;
+  }
+
+  __aicore__ inline uint32_t GroupEnd(uint32_t task, uint32_t end, uint32_t group) const {
+    if (!balanceHeads) {
+      return task + group;
+    }
+    const uint32_t groupEnd = (task / group + 1) * group;
+    return groupEnd < end ? groupEnd : end;
+  }
+
+  __aicore__ inline uint32_t NextTask(uint32_t task, uint32_t groupEnd, uint32_t group) const {
+    return balanceHeads ? groupEnd : task + blocks * group;
+  }
 
   __aicore__ inline uint64_t KeyInput(uint32_t row, uint32_t key) const {
     return (static_cast<uint64_t>(row) * TOKENS * hk + key) * DIM;
@@ -66,25 +85,28 @@ class Projector {
     pipe_.InitBuffer(b2_, COLS * DIM * sizeof(bfloat16_t));
     pipe_.InitBuffer(c1_, DIM * COLS * sizeof(float));
 
-    for (uint32_t task = block; task < x.batch * x.hk; task += x.blocks) {
-      const uint32_t row = task / x.hk;
-      const uint32_t key = task % x.hk;
+    const uint32_t end = x.EndTask(block);
+    for (uint32_t task = x.FirstTask(block, group); task < end;) {
+      const uint32_t row = task / x.hv;
+      const uint32_t firstHead = task - row * x.hv;
+      const uint32_t key = firstHead / group;
+      const uint32_t groupEnd = x.GroupEnd(task, end, group);
       const int32_t slot = x.slots.GetValue(row);
       const bool valid = slot > 0 && static_cast<uint32_t>(slot) < x.numSlots;
       if (valid) {
         StageRhs(x, row, key);
       }
-      for (uint32_t member = 0; member < group; ++member) {
+      for (uint32_t head = firstHead; head < firstHead + groupEnd - task; ++head) {
         if (valid) {
-          const uint32_t head = key * group + member;
           const uint64_t stateOff = (static_cast<uint64_t>(slot) * x.hv + head) * DIM * DIM;
-          Project(x, stateOff, x.Projection(block, row, head), member == 0);
+          Project(x, stateOff, x.Projection(block, row, head), head == firstHead);
         }
         // Pad/error rows have the same handshakes. The AIVs skip the read.
         CrossCoreSetFlag<MIX_MODE, PIPE_FIX>(READY);
         // One ack at the AIC after both AIVs have loaded their tiles.
         CrossCoreWaitFlag(CONSUMED);
       }
+      task = x.NextTask(task, groupEnd, group);
     }
   }
 
@@ -167,7 +189,10 @@ class Projector {
 #endif
 
 #ifdef __DAV_C220_VEC__
+template <uint32_t PanelCols, bool SuffixHistory = false, bool BulkQkv = false>
 class Consumer {
+  static constexpr uint32_t PANEL = TILE * PanelCols;
+
  public:
   __aicore__ inline void Run(Inputs &x) {
     const uint32_t block = GetBlockIdx() / 2;
@@ -175,9 +200,12 @@ class Consumer {
     const uint32_t vStart = sub * TILE;
     const uint32_t group = x.hv / x.hk;
     Init();
-    for (uint32_t task = block; task < x.batch * x.hk; task += x.blocks) {
-      const uint32_t row = task / x.hk;
-      const uint32_t key = task % x.hk;
+    const uint32_t end = x.EndTask(block);
+    for (uint32_t task = x.FirstTask(block, group); task < end;) {
+      const uint32_t row = task / x.hv;
+      const uint32_t firstHead = task - row * x.hv;
+      const uint32_t key = firstHead / group;
+      const uint32_t groupEnd = x.GroupEnd(task, end, group);
       const int32_t slot = x.slots.GetValue(row);
       const int32_t ring = x.ringSlots.GetValue(row);
       const int32_t pos = x.pos.GetValue(row);
@@ -188,8 +216,7 @@ class Consumer {
       if (valid) {
         MakeDots(x, row, key, ring, pos, base, len);
       }
-      for (uint32_t member = 0; member < group; ++member) {
-        const uint32_t head = key * group + member;
+      for (uint32_t head = firstHead; head < firstHead + groupEnd - task; ++head) {
         if (valid && pos > 0) {
           const uint64_t dOffset = (static_cast<uint64_t>(ring) * x.hv + head) * RING * DIM;
           StageHistory(x.d[dOffset + vStart], base, pos, TILE);
@@ -199,7 +226,17 @@ class Consumer {
           // The previous head may still have Vector reads of proj_ or the
           // gate buffers in flight. Order the next DMA writes after them.
           Fence<HardEvent::V_MTE2>();
-          DataCopy(proj_.Get<float>(), x.scratch[x.Projection(block, row, head) + vStart * COLS], PANEL);
+          const auto from = x.scratch[x.Projection(block, row, head) + vStart * COLS];
+          if constexpr (PanelCols == COLS) {
+            DataCopy(proj_.Get<float>(), from, PANEL);
+          } else {
+            // The Cube fractal is 16 columns wide. Only K0..3 and Q0..3
+            // are used by AIV, so skip the zero half of each row during DMA.
+            constexpr uint32_t bytes = PanelCols * sizeof(float);
+            const DataCopyExtParams copy{TILE, bytes, (COLS - PanelCols) * sizeof(float), 0, 0};
+            const DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+            DataCopyPad(proj_.Get<float>(), from, copy, pad);
+          }
           Fence<HardEvent::MTE2_V>(projectionReady_);
         }
         // After the read, the projection lives in this AIV's private UB.
@@ -214,12 +251,15 @@ class Consumer {
           StoreStatus(x, row * x.hv + head, error);
         }
       }
-      if (valid && sub == 0) {
+      // With head balancing, one key group can span two Cube blocks. Only
+      // the segment containing its first V head owns candidate K writes.
+      if (valid && sub == 0 && firstHead == key * group) {
         const uint64_t kRing = (static_cast<uint64_t>(ring) * x.hk + key) * RING;
         for (uint32_t t = 0; t < static_cast<uint32_t>(len); ++t) {
           StoreCast(x.keys[(kRing + Physical(base, pos + t)) * DIM], rhs_.Get<float>()[t * DIM], DIM);
         }
       }
+      task = x.NextTask(task, groupEnd, group);
     }
     pipe_.ReleaseEventID<HardEvent::MTE2_V>(projectionReady_);
     pipe_.ReleaseEventID<HardEvent::MTE2_V>(historyReady_);
@@ -228,11 +268,11 @@ class Consumer {
 
  private:
   __aicore__ inline void Init() {
-    pipe_.InitBuffer(in_, 1, DIM * sizeof(bfloat16_t));
+    pipe_.InitBuffer(in_, 1, (BulkQkv ? TOKENS : 1) * DIM * sizeof(bfloat16_t));
     pipe_.InitBuffer(out_, 1, DIM * sizeof(float));
-    pipe_.InitBuffer(rhs_, COLS * DIM * sizeof(float));
-    pipe_.InitBuffer(products_, COLS * DIM * sizeof(float));
-    pipe_.InitBuffer(dot_, (HISTORY + TOKENS) * COLS * sizeof(float));
+    pipe_.InitBuffer(rhs_, PanelCols * DIM * sizeof(float));
+    pipe_.InitBuffer(products_, PanelCols * DIM * sizeof(float));
+    pipe_.InitBuffer(dot_, (HISTORY + TOKENS) * PanelCols * sizeof(float));
     pipe_.InitBuffer(proj_, PANEL * sizeof(float));
     pipe_.InitBuffer(outer_, PANEL * sizeof(float));
     pipe_.InitBuffer(gather_, 2 * TOKENS * TILE * sizeof(uint32_t));
@@ -242,6 +282,9 @@ class Consumer {
     pipe_.InitBuffer(selected_, TILE * sizeof(float));
     pipe_.InitBuffer(gates_, 2 * RING * sizeof(float));
     pipe_.InitBuffer(candidate_, 3 * CANDIDATE_SCALARS * sizeof(float));
+    if constexpr (BulkQkv) {
+      pipe_.InitBuffer(values_, TOKENS * TILE * sizeof(float));
+    }
     pipe_.InitBuffer(scalarOut_, 32);
     // MTE2 can enqueue gate copies while the V wait on the projection is
     // still outstanding. Reserve distinct token IDs for these dependencies.
@@ -251,7 +294,7 @@ class Consumer {
     auto offsets = gather_.Get<uint32_t>();
     for (uint32_t col = 0; col < 2 * TOKENS; ++col) {
       for (uint32_t v = 0; v < TILE; ++v) {
-        offsets.SetValue(col * TILE + v, (v * COLS + col) * sizeof(float));
+        offsets.SetValue(col * TILE + v, (v * PanelCols + col) * sizeof(float));
       }
     }
     Fence<HardEvent::S_V>();
@@ -273,6 +316,20 @@ class Consumer {
     in_.EnQue(in);
     in = in_.DeQue<T>();
     Cast(dst, in, RoundMode::CAST_NONE, count);
+    PipeBarrier<PIPE_V>();
+    in_.FreeTensor(in);
+  }
+
+  __aicore__ inline void LoadCandidateRows(LocalTensor<float> dst, GlobalTensor<bfloat16_t> src,
+                                          uint32_t rows, uint32_t width, uint32_t pitch) {
+    auto in = in_.AllocTensor<bfloat16_t>();
+    const DataCopyExtParams copy{static_cast<uint16_t>(rows), static_cast<uint32_t>(width * sizeof(bfloat16_t)),
+                                 static_cast<uint32_t>((pitch - width) * sizeof(bfloat16_t)), 0, 0};
+    const DataCopyPadExtParams<bfloat16_t> pad{false, 0, 0, 0};
+    DataCopyPad(in, src, copy, pad);
+    in_.EnQue(in);
+    in = in_.DeQue<bfloat16_t>();
+    Cast(dst, in, RoundMode::CAST_NONE, rows * width);
     PipeBarrier<PIPE_V>();
     in_.FreeTensor(in);
   }
@@ -331,12 +388,17 @@ class Consumer {
       StageHistory(x.keys[kOffset], base, pos, DIM);
     }
     auto rhs = rhs_.Get<float>();
-    Duplicate(rhs, 0.0f, COLS * DIM);
+    Duplicate(rhs, 0.0f, PanelCols * DIM);
     PipeBarrier<PIPE_V>();
     const uint64_t off = x.KeyInput(row, key);
-    for (uint32_t t = 0; t < len; ++t) {
-      LoadCast(rhs[t * DIM], x.k[off + t * x.hk * DIM], DIM);
-      LoadCast(rhs[(TOKENS + t) * DIM], x.q[off + t * x.hk * DIM], DIM);
+    if constexpr (BulkQkv) {
+      LoadCandidateRows(rhs, x.k[off], len, DIM, x.hk * DIM);
+      LoadCandidateRows(rhs[TOKENS * DIM], x.q[off], len, DIM, x.hk * DIM);
+    } else {
+      for (uint32_t t = 0; t < len; ++t) {
+        LoadCast(rhs[t * DIM], x.k[off + t * x.hk * DIM], DIM);
+        LoadCast(rhs[(TOKENS + t) * DIM], x.q[off + t * x.hk * DIM], DIM);
+      }
     }
     if (pos) {
       CastHistory(pos * DIM);
@@ -353,23 +415,24 @@ class Consumer {
   __aicore__ inline void Dot(uint32_t i, LocalTensor<float> k) {
     auto p = products_.Get<float>();
     auto rhs = rhs_.Get<float>();
-    Mul(p, rhs, k, 64, COLS, {1, 1, 1, 16, 16, 0});
-    Mul(p[64], rhs[64], k[64], 64, COLS, {1, 1, 1, 16, 16, 0});
+    Mul(p, rhs, k, 64, PanelCols, {1, 1, 1, 16, 16, 0});
+    Mul(p[64], rhs[64], k[64], 64, PanelCols, {1, 1, 1, 16, 16, 0});
     PipeBarrier<PIPE_V>();
-    Add(p, p, p[64], 64, COLS, {1, 1, 1, 16, 16, 16});
+    Add(p, p, p[64], 64, PanelCols, {1, 1, 1, 16, 16, 16});
     PipeBarrier<PIPE_V>();
-    WholeReduceSum(dot_.Get<float>()[i * COLS], p, 64, COLS, 1, 1, 16);
+    WholeReduceSum(dot_.Get<float>()[i * PanelCols], p, 64, PanelCols, 1, 1, 16);
     PipeBarrier<PIPE_V>();
   }
 
   __aicore__ inline void Outer(uint32_t i, LocalTensor<float> d) {
     auto outer = outer_.Get<float>();
     auto proj = proj_.Get<float>();
-    const uint32_t dstShape[2] = {TILE, COLS};
+    const uint32_t dstShape[2] = {TILE, PanelCols};
     const uint32_t srcShape[2] = {TILE, 1};
     Broadcast<float, 2, 1>(outer, d, dstShape, srcShape);
     PipeBarrier<PIPE_V>();
-    Mul(outer, outer, dot_.Get<float>()[i * COLS], COLS, TILE, {1, 1, 1, 2, 2, 0});
+    constexpr uint32_t rowStride = PanelCols / FLOAT_LANES_PER_BLOCK;
+    Mul(outer, outer, dot_.Get<float>()[i * PanelCols], PanelCols, TILE, {1, 1, 1, rowStride, rowStride, 0});
     PipeBarrier<PIPE_V>();
     Add(proj, proj, outer, PANEL);
     PipeBarrier<PIPE_V>();
@@ -396,14 +459,34 @@ class Consumer {
       LoadGates(gates[RING], x.gates[ringHead], pos - first);
     }
     LoadCandidates(x, x.Output(row, 0, head) / DIM, logGate, decay, beta);
+    if constexpr (BulkQkv) {
+      LoadCandidateRows(values_.Get<float>(), x.v[x.Output(row, 0, head) + vStart], len, TILE, x.hv * DIM);
+    }
     if (pos) {
       CastHistory(pos * TILE);
     }
     auto rows = historyRows_.Get<float>();
+    if constexpr (SuffixHistory) {
+      if (pos != 0) {
+        // Move the per-history gate scales to D and scale the whole panel
+        // once. This shortens the projected recurrence's dependency chain.
+        float suffix = 1.0f;
+        for (uint32_t n = pos; n > 0; --n) {
+          const uint32_t i = n - 1;
+          auto delta = rows[i * TILE];
+          Muls(delta, delta, suffix, TILE);
+          suffix *= gates.GetValue(i < first ? i : RING + i - first);
+        }
+        Muls(proj, proj, suffix, PANEL);
+        PipeBarrier<PIPE_V>();
+      }
+    }
     for (uint32_t i = 0; i < pos; ++i) {
-      const uint32_t gateIndex = i < first ? i : RING + i - first;
-      Muls(proj, proj, gates.GetValue(gateIndex), PANEL);
-      PipeBarrier<PIPE_V>();
+      if constexpr (!SuffixHistory) {
+        const uint32_t gateIndex = i < first ? i : RING + i - first;
+        Muls(proj, proj, gates.GetValue(gateIndex), PANEL);
+        PipeBarrier<PIPE_V>();
+      }
       Outer(i, rows[i * TILE]);
     }
     for (uint32_t t = 0; t < len; ++t) {
@@ -411,10 +494,16 @@ class Consumer {
       const auto record = Physical(base, pos + t);
       const uint32_t lane = t * FLOAT_LANES_PER_BLOCK;
       Muls(proj, proj, decay.GetValue(lane), PANEL);
-      LoadCast(d, x.v[out + vStart], TILE);
+      if constexpr (!BulkQkv) {
+        LoadCast(d, x.v[out + vStart], TILE);
+      }
       Gather(selected, proj, offsets[t * TILE], 0, TILE);
       PipeBarrier<PIPE_V>();
-      Sub(d, d, selected, TILE);
+      if constexpr (BulkQkv) {
+        Sub(d, values_.Get<float>()[t * TILE], selected, TILE);
+      } else {
+        Sub(d, d, selected, TILE);
+      }
       PipeBarrier<PIPE_V>();
       Muls(d, d, beta.GetValue(lane), TILE);
       PipeBarrier<PIPE_V>();
@@ -466,7 +555,7 @@ class Consumer {
   TQue<TPosition::VECIN, 1> in_, historyIn_;
   TQue<TPosition::VECOUT, 1> out_;
   TBuf<TPosition::VECCALC> rhs_, products_, dot_, proj_, outer_, gather_, historyRows_;
-  TBuf<TPosition::VECCALC> delta_, selected_, gates_, candidate_;
+  TBuf<TPosition::VECCALC> delta_, selected_, gates_, candidate_, values_;
   TBuf<TPosition::VECOUT> scalarOut_;
   event_t projectionReady_, historyReady_, candidatesReady_;
 };
@@ -478,7 +567,7 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
     GM_ADDR d, GM_ADDR keys, GM_ADDR gates, GM_ADDR slots, GM_ADDR ringSlots,
     GM_ADDR pos, GM_ADDR base, GM_ADDR length, GM_ADDR out, GM_ADDR status, GM_ADDR zeros,
     GM_ADDR scratch, uint32_t batch, uint32_t hk, uint32_t hv, uint32_t numSlots,
-    uint32_t numRingSlots, uint32_t blocks, uint32_t perHeadWorkspace) {
+    uint32_t numRingSlots, uint32_t blocks, uint32_t perHeadWorkspace, uint32_t panelMode, uint32_t balanceHeads) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
   Inputs x;
   x.q.SetGlobalBuffer((__gm__ bfloat16_t *)q);
@@ -506,11 +595,23 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   x.numRingSlots = numRingSlots;
   x.blocks = blocks;
   x.perHeadWorkspace = perHeadWorkspace != 0;
+  x.balanceHeads = balanceHeads != 0;
 #if defined(__DAV_C220_CUBE__)
   Projector op;
   op.Run(x);
 #elif defined(__DAV_C220_VEC__)
-  Consumer op;
-  op.Run(x);
+  if (panelMode == 3) {
+    Consumer<2 * TOKENS, false, true> op;
+    op.Run(x);
+  } else if (panelMode == 2) {
+    Consumer<2 * TOKENS, true> op;
+    op.Run(x);
+  } else if (panelMode == 1) {
+    Consumer<2 * TOKENS> op;
+    op.Run(x);
+  } else {
+    Consumer<COLS> op;
+    op.Run(x);
+  }
 #endif
 }

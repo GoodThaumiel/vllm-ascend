@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--tile-v", type=int, choices=(16, 32, 64, 128), default=32)
     parser.add_argument("--cores", type=int, choices=(8, 20, 40), default=40)
-    parser.add_argument("--variant", type=int, choices=(*range(14), *range(15, 23)), default=0)
+    parser.add_argument("--variant", type=int, choices=(*range(14), *range(15, 24)), default=0)
     parser.add_argument("--layout", choices=("compact", "page_strided"), default="page_strided")
     parser.add_argument("--stage", choices=("smoke", "graph", "perf", "all"), default="smoke")
     parser.add_argument("--iterations", type=int, default=50)
@@ -221,8 +221,10 @@ def main() -> None:
     args = parse_args()
     if (args.geometry, args.tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2)):
         raise SystemExit("27b requires TP4/TP8; 9b requires TP1/TP2")
-    if args.variant >= 15 and (args.backend != "framework" or args.tile_v != 128):
-        raise SystemExit("Variants 15-22 require --backend framework --tile-v 128")
+    if args.variant >= 15 and args.tile_v != 128:
+        raise SystemExit("Variants 15-23 require --tile-v 128")
+    if args.variant == 21 and args.backend != "framework":
+        raise SystemExit("Variant 21 requires --backend framework")
     if args.variant == 22 and (args.geometry, args.tp) != ("27b", 4):
         raise SystemExit("Variant 22 requires 27b TP4 geometry")
     value_heads = (48 if args.geometry == "27b" else 32) // args.tp

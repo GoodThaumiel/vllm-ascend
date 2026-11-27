@@ -47,7 +47,12 @@ class ReplaySDCompact {
     tiles_ = V_DIM / tileV;
     variant_ = variant;
 
-    if (variant >= 3) {
+    if (variant >= 5) {
+      const uint32_t alignedRows = (batch + 7) / 8 * 8;
+      pipe_.InitBuffer(metaBatch_, 5 * alignedRows * sizeof(int32_t));
+      pipe_.InitBuffer(history_, (MAX_HISTORY * (K_DIM + tileV_) + 2 * MAX_HISTORY) * sizeof(float));
+      InitHeavyBuffers();
+    } else if (variant >= 3) {
       // Metadata and status remain live on the no-flush path. The large
       // checkpoint queues and vector tiles are initialized on first Fold.
       pipe_.InitBuffer(metaIn_, 1, 32);
@@ -81,6 +86,8 @@ class ReplaySDCompact {
       ProcessGrouped();
     } else if (variant == 2) {
       ProcessHybrid();
+    } else if (variant >= 5) {
+      ProcessBatchedMetadata();
     } else if (variant >= 3) {
       ProcessGroupedLight();
     } else {
@@ -163,6 +170,43 @@ class ReplaySDCompact {
     int32_t flush;
   };
 
+  __aicore__ inline void ProcessBatchedMetadata() {
+    const uint32_t pitch = (batch_ + 7) / 8 * 8;
+    auto metadata = metaBatch_.Get<int32_t>();
+    const DataCopyExtParams cp{1, static_cast<uint32_t>(batch_ * sizeof(int32_t)), 0, 0, 0};
+    const DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
+    DataCopyPad(metadata, slots_, cp, pad);
+    DataCopyPad(metadata[pitch], ringSlots_, cp, pad);
+    DataCopyPad(metadata[2 * pitch], positions_, cp, pad);
+    DataCopyPad(metadata[3 * pitch], bases_, cp, pad);
+    DataCopyPad(metadata[4 * pitch], flush_, cp, pad);
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    const uint32_t rowTasks = valueHeads_ * tiles_;
+    for (uint32_t group = GetBlockIdx(); group < batch_ * valueHeads_; group += GetBlockNum()) {
+      const uint32_t row = group / valueHeads_;
+      const uint32_t head = group % valueHeads_;
+      const int32_t flush = metadata.GetValue(4 * pitch + row);
+      if (flush == 0 && head != 0) {
+        continue;
+      }
+      const int32_t slot = metadata.GetValue(row);
+      const int32_t ringSlot = metadata.GetValue(pitch + row);
+      const int32_t pos = metadata.GetValue(2 * pitch + row);
+      const int32_t base = metadata.GetValue(3 * pitch + row);
+      const int32_t error = Validate(slot, ringSlot, pos, base, flush);
+      if (error != 0 || slot == 0 || flush == 0 || pos == 0) {
+        if (head == 0) {
+          WriteStatusSpan(row * rowTasks, rowTasks, error);
+        }
+        continue;
+      }
+      for (uint32_t tile = 0; tile < tiles_; ++tile) {
+        Fold(group * tiles_ + tile, slot, ringSlot, pos, base);
+      }
+    }
+  }
+
   // v3 isolates lazy UB setup from v1; v4 additionally reads a pre-packed
   // [B,4] metadata allocation. Both keep the v1 grouped task mapping.
   __aicore__ inline void ProcessGroupedLight() {
@@ -238,20 +282,87 @@ class ReplaySDCompact {
     const uint64_t kOffset = static_cast<uint64_t>(ringSlot) * kStride_ + static_cast<uint64_t>(keyHead) * ringLen_ * K_DIM;
     const uint64_t gOffset = static_cast<uint64_t>(ringSlot) * gStride_ + static_cast<uint64_t>(head) * ringLen_;
     Load(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
-    for (int32_t i = 0; i < pos; ++i) {
+    if (variant_ >= 5) {
+      FoldBatchedHistory(dOffset + vStart, kOffset, gOffset, pos, base);
+    } else {
+      FoldSerialHistory(dOffset + vStart, kOffset, gOffset, pos, base);
+    }
+    Store(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
+    WriteStatus(task, 0);
+  }
+
+  __aicore__ inline void FoldSerialHistory(uint64_t dOffset, uint64_t kOffset, uint64_t gOffset,
+                                           uint32_t pos, uint32_t base) {
+    for (uint32_t i = 0; i < pos; ++i) {
       const uint32_t phys = (static_cast<uint32_t>(base) + static_cast<uint32_t>(i)) & (ringLen_ - 1);
       Load(kCache_, kOffset + static_cast<uint64_t>(phys) * K_DIM, key_, K_DIM);
-      LoadD(dOffset + static_cast<uint64_t>(phys) * V_DIM + vStart);
+      LoadD(dOffset + static_cast<uint64_t>(phys) * V_DIM);
       Load(gCache_, gOffset + phys, scalar_, 1);
       Exp(scalar_, scalar_, 1);
       PipeBarrier<PIPE_V>();
       const float alpha = ReadLocal(scalar_, 0);
       Muls(state_, state_, alpha, tileV_ * K_DIM);
       PipeBarrier<PIPE_V>();
-      OuterAdd();
+      OuterAdd(delta_, key_);
     }
-    Store(checkpoint_, stateOffset, state_, tileV_ * K_DIM);
-    WriteStatus(task, 0);
+  }
+
+  __aicore__ inline void LoadPackedHistory(GlobalTensor<half> src, LocalTensor<float> dst,
+                                            uint32_t width, uint32_t pitch, uint32_t rows) {
+    auto in = in_.AllocTensor<half>();
+    DataCopyExtParams cp{static_cast<uint16_t>(rows), static_cast<uint32_t>(width * sizeof(half)),
+                         static_cast<uint32_t>((pitch - width) * sizeof(half)), 0, 0};
+    DataCopyPadExtParams<half> pad{false, 0, 0, 0};
+    DataCopyPad(in, src, cp, pad);
+    in_.EnQue(in);
+    in = in_.DeQue<half>();
+    Cast(dst, in, RoundMode::CAST_NONE, rows * width);
+    PipeBarrier<PIPE_V>();
+    in_.FreeTensor(in);
+  }
+
+  __aicore__ inline void FoldBatchedHistory(uint64_t dOffset, uint64_t kOffset, uint64_t gOffset,
+                                            uint32_t pos, uint32_t base) {
+    auto keys = history_.Get<float>();
+    auto deltas = keys[MAX_HISTORY * K_DIM];
+    auto gates = deltas[MAX_HISTORY * tileV_];
+    const uint32_t available = ringLen_ - base;
+    const uint32_t first = pos < available ? pos : available;
+    LoadPackedHistory(kCache_[kOffset + base * K_DIM], keys, K_DIM, K_DIM, first);
+    LoadPackedHistory(dCache_[dOffset + base * V_DIM], deltas, tileV_, V_DIM, first);
+    Load(gCache_, gOffset + base, gates, first);
+    Exp(gates, gates, first);
+    if (pos > first) {
+      const uint32_t tail = pos - first;
+      LoadPackedHistory(kCache_[kOffset], keys[first * K_DIM], K_DIM, K_DIM, tail);
+      LoadPackedHistory(dCache_[dOffset], deltas[first * tileV_], tileV_, V_DIM, tail);
+      Load(gCache_, gOffset, gates[MAX_HISTORY], tail);
+      Exp(gates[MAX_HISTORY], gates[MAX_HISTORY], tail);
+    }
+    SetFlag<HardEvent::V_S>(EVENT_ID0);
+    WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    if (variant_ == 6) {
+      // Apply each gate to the short D rows instead of rescaling the full
+      // state matrix once per history token. The checkpoint is scaled once.
+      float suffix = 1.0f;
+      for (uint32_t n = pos; n > 0; --n) {
+        const uint32_t i = n - 1;
+        Muls(deltas[i * tileV_], deltas[i * tileV_], suffix, tileV_);
+        suffix *= gates.GetValue(i < first ? i : MAX_HISTORY + i - first);
+      }
+      Muls(state_, state_, suffix, tileV_ * K_DIM);
+      PipeBarrier<PIPE_V>();
+      for (uint32_t i = 0; i < pos; ++i) {
+        OuterAdd(deltas[i * tileV_], keys[i * K_DIM]);
+      }
+      return;
+    }
+    for (uint32_t i = 0; i < pos; ++i) {
+      const float alpha = gates.GetValue(i < first ? i : MAX_HISTORY + i - first);
+      Muls(state_, state_, alpha, tileV_ * K_DIM);
+      PipeBarrier<PIPE_V>();
+      OuterAdd(deltas[i * tileV_], keys[i * K_DIM]);
+    }
   }
 
   __aicore__ inline void WriteStatusSpan(uint32_t offset, uint32_t count, int32_t error) {
@@ -362,13 +473,13 @@ class ReplaySDCompact {
     return source.GetValue(offset);
   }
 
-  __aicore__ inline void OuterAdd() {
+  __aicore__ inline void OuterAdd(LocalTensor<float> delta, LocalTensor<float> key) {
     uint32_t shape[2] = {tileV_, K_DIM};
     uint32_t deltaShape[2] = {tileV_, 1};
-    Broadcast<float, 2, 1>(product_, delta_, shape, deltaShape);
+    Broadcast<float, 2, 1>(product_, delta, shape, deltaShape);
     PipeBarrier<PIPE_V>();
-    Mul(product_, product_, key_, 64, tileV_, {1, 1, 1, 16, 16, 0});
-    Mul(product_[64], product_[64], key_[64], 64, tileV_, {1, 1, 1, 16, 16, 0});
+    Mul(product_, product_, key, 64, tileV_, {1, 1, 1, 16, 16, 0});
+    Mul(product_[64], product_[64], key[64], 64, tileV_, {1, 1, 1, 16, 16, 0});
     PipeBarrier<PIPE_V>();
     Add(state_, state_, product_, tileV_ * K_DIM);
     PipeBarrier<PIPE_V>();
@@ -404,7 +515,7 @@ class ReplaySDCompact {
   TQue<QuePosition::VECOUT, 1> out_;
   TQue<QuePosition::VECIN, 1> metaIn_;
   TQue<QuePosition::VECOUT, 1> statusOut_;
-  TBuf<QuePosition::VECCALC> stateBuffer_, productBuffer_, vectorBuffer_;
+  TBuf<QuePosition::VECCALC> stateBuffer_, productBuffer_, vectorBuffer_, metaBatch_, history_;
   LocalTensor<float> state_, product_, key_, delta_, scalar_;
   GlobalTensor<bfloat16_t> checkpoint_;
   GlobalTensor<half> dCache_, kCache_;

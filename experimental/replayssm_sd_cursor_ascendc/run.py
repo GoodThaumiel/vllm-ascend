@@ -16,6 +16,8 @@ from pathlib import Path
 import torch
 from lab import MUTABLE, clone_case, invoke, make_case, reference_step
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 def cases(batch: int, mtp_size: int) -> list[tuple[str, dict[str, torch.Tensor]]]:
     max_tokens = mtp_size + 1
@@ -69,6 +71,16 @@ def cases(batch: int, mtp_size: int) -> list[tuple[str, dict[str, torch.Tensor]]
         invalid["write_pos"][4] = logical_limit - 1
         invalid["accepted"][3] = max_tokens
         result.append(("invalid_rows", invalid))
+        scattered = make_case(batch=batch, slots=2 * batch + 1, logical_limit=logical_limit, max_spec_len=max_tokens)
+        scattered["slots"].copy_(2 * torch.randperm(batch, generator=torch.Generator().manual_seed(42)) + 1)
+        scattered["write_pos"][1::2] = 16
+        scattered["write_pos"][2::2] = 3
+        scattered["cache_base"][1::2] = 29
+        scattered["cache_base"][2::2] = 7
+        scattered["is_flush"][1::2] = 1
+        scattered["accepted"][::3] = 0
+        scattered["do_reset"][1::3] = 1
+        result.append(("scattered_slots", scattered))
     return result
 
 
@@ -92,8 +104,8 @@ def main() -> None:
     args = parser.parse_args()
     max_tokens = args.mtp_size + 1
     logical_limit = 16 + max_tokens
-    if args.batch < 1 or args.batch > 128 or args.iterations < 1:
-        parser.error("batch must be 1..128 and iterations must be positive")
+    if args.batch < 1 or args.batch > 256 or args.iterations < 1:
+        parser.error("batch must be 1..256 and iterations must be positive")
 
     report = {
         "stage": args.stage,
@@ -103,9 +115,11 @@ def main() -> None:
         "mtp_size": args.mtp_size,
         "status": "FAILED",
         "cases": [],
-        "source_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True
-        ).strip(),
+        "source_commit": (
+            (ROOT / "SOURCE_COMMIT").read_text().strip()
+            if (ROOT / "SOURCE_COMMIT").exists()
+            else subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        ),
         "packages": {},
     }
     for name in ("torch", "torch-npu", "vllm", "vllm-ascend"):
@@ -130,20 +144,27 @@ def main() -> None:
         report["library_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
         device = torch.device(f"npu:{args.device}")
         scenarios = cases(args.batch, args.mtp_size)
-        allocated = clone_case(scenarios[0][1], device)
+        allocations = {}
         if args.stage in ("graph", "perf"):
-            invoke(allocated, logical_limit, max_tokens, backend=args.backend)
-            torch.npu.synchronize()
-            graph = torch.npu.NPUGraph()
-            with torch.npu.graph(graph):
-                invoke(allocated, logical_limit, max_tokens, backend=args.backend)
+            for _, source in scenarios:
+                capacity = source["write_pos"].numel()
+                if capacity not in allocations:
+                    allocated = clone_case(source, device)
+                    invoke(allocated, logical_limit, max_tokens, backend=args.backend)
+                    torch.npu.synchronize()
+                    graph = torch.npu.NPUGraph()
+                    with torch.npu.graph(graph):
+                        invoke(allocated, logical_limit, max_tokens, backend=args.backend)
+                    allocations[capacity] = allocated, graph
 
         for name, source in scenarios:
-            for key, tensor in source.items():
-                allocated[key].copy_(tensor.to(device))
             if args.stage == "smoke":
+                allocated = clone_case(source, device)
                 invoke(allocated, logical_limit, max_tokens, backend=args.backend)
             else:
+                allocated, graph = allocations[source["write_pos"].numel()]
+                for key, tensor in source.items():
+                    allocated[key].copy_(tensor.to(device))
                 graph.replay()
             torch.npu.synchronize()
             compare(allocated, reference_step(source, logical_limit=logical_limit, max_spec_len=max_tokens))
@@ -152,7 +173,10 @@ def main() -> None:
         if args.stage == "perf":
             timings = {}
             for name, source in scenarios[:4]:
+                allocated, graph = allocations[source["write_pos"].numel()]
                 source_device = clone_case(source, device)
+                for key, tensor in source_device.items():
+                    allocated[key].copy_(tensor)
                 samples = []
                 for _ in range(args.iterations):
                     for key in MUTABLE:

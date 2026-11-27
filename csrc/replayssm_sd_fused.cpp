@@ -7,6 +7,7 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <acl/acl.h>
 #include "aclrtlaunch_replayssm_sd_verify_compact_fused.h"
+#include "aclrtlaunch_replayssm_sd_verify_compact_fused_v24.h"
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +21,7 @@ void replayssm_sd_verify_compact_fused(
     const at::Tensor& lengths, const at::Tensor& flush, const at::Tensor& out,
     const at::Tensor& verify_status, const at::Tensor& compact_status,
     double scale, int64_t tile_v, int64_t cores,
-    c10::optional<at::Tensor> ring_slots) {
+    c10::optional<at::Tensor> ring_slots, int64_t variant) {
   const at::Tensor& ring_ids = ring_slots.has_value() ? *ring_slots : slots;
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& t : {k, v, g, beta, checkpoint, d_cache, k_cache, g_cache,
@@ -40,8 +41,10 @@ void replayssm_sd_verify_compact_fused(
   TORCH_CHECK(batch > 0 && batch <= 1024 && heads > 0 && value_heads > 0 &&
                   value_heads <= 32 && value_heads % heads == 0,
               "Invalid batch/head dimensions");
-  TORCH_CHECK((heads == 4 && value_heads == 12) || (heads == 2 && value_heads == 6),
-              "This fusion ablation currently supports 27B TP4/TP8 only");
+  TORCH_CHECK(variant == 14 || variant == 24, "Fused verify variant must be 14 or 24");
+  TORCH_CHECK((heads == 4 && value_heads == 12) || (heads == 2 && value_heads == 6) ||
+                  (variant == 24 && heads == 16 && value_heads == 32),
+              "Fusion supports 27B TP4/TP8 and 9B TP1 (V24)");
   TORCH_CHECK(g.sizes() == at::IntArrayRef({batch, 4, value_heads}) &&
                   beta.sizes() == g.sizes() && g.scalar_type() == at::kFloat &&
                   beta.scalar_type() == at::kFloat && g.is_contiguous() && beta.is_contiguous(),
@@ -91,7 +94,9 @@ void replayssm_sd_verify_compact_fused(
 
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
-  const auto result = aclrtlaunch_replayssm_sd_verify_compact_fused(
+  const auto launch = variant == 24 ? &aclrtlaunch_replayssm_sd_verify_compact_fused_v24
+                                    : &aclrtlaunch_replayssm_sd_verify_compact_fused;
+  const auto result = launch(
       static_cast<uint32_t>(std::min(cores, batch * value_heads)), stream,
       q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(),
       checkpoint.data_ptr(), d_cache.data_ptr(), k_cache.data_ptr(), g_cache.data_ptr(),

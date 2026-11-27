@@ -20,9 +20,34 @@ class TestVectorBatchProbe(unittest.TestCase):
             self.assertEqual(args.batches, tuple(range(1, 129)))
             self.assertEqual(args.path, ("native", "v20", "compact_v1", "vector_pair"))
             self.assertEqual(args.tp, tp)
-        for invalid in ("0,1", "129", "5,5", "abc"):
+        for invalid in ("0,1", "257", "5,5", "abc"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 run.batches(invalid)
+        self.assertEqual(run.batches("32,64,256"), (32, 64, 256))
+
+    def test_boundary_probe_keeps_flush_count_fixed(self):
+        args = run.parse_args(
+            [
+                "--suite",
+                "vector",
+                "--batches",
+                "15,16,17,18,31,32,33",
+                "--flush-count",
+                "2",
+                "--path",
+                "native",
+                "v23_compact_v5",
+                "--verify-library",
+                "verify.so",
+                "--compact-library",
+                "compact.so",
+                "--layers",
+                "48",
+                "--output",
+                "unused.json",
+            ]
+        )
+        self.assertEqual((args.batches, args.flush_count, args.layers), ((15, 16, 17, 18, 31, 32, 33), 2, 48))
 
     def test_native_9b_state_at_bs128(self):
         state, page_bytes = native_state_page(torch.device("meta"), 1, 128, 4, geometry="9b")
