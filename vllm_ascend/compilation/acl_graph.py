@@ -298,7 +298,11 @@ class ACLGraphWrapper:
             self._updatable_graph_replay(forward_context, entry.aclgraph)
         else:
             entry.aclgraph.replay()
-        logger.info_once("ACL graph replay is active (logged once).")
+        logger.info_once(
+            "ACL graph replay is active for the %s model (%s, logged once).",
+            "draft" if _EXTRA_CTX.is_draft_model else "target",
+            self.runtime_mode.name,
+        )
         return entry.output
 
     def _updatable_graph_replay(
