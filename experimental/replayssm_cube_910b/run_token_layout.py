@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 from experimental.replayssm_cube_910b.run import (  # noqa: E402
     MIXED_AIV_ABLATIONS,
     MIXED_FOLD_FMA_PATH,
+    MIXED_FOLD_PAIR_PATH,
     MIXED_FUSED_FOLD_PATH,
     batches,
     measure,
@@ -119,8 +120,13 @@ def trial(args, batch, device):
         blocks = min(20, batch * fixed_inputs[0].size(2))
         scratch = torch.empty((blocks, 128, 16), dtype=torch.float32, device=device)
 
-    def invoke_mixed(cache, inputs, out, token_offsets=None):
-        ablation = MIXED_FOLD_FMA_PATH if args.mixed_fold_fma else MIXED_FUSED_FOLD_PATH
+    fold_path = MIXED_FUSED_FOLD_PATH
+    if args.mixed_fold_pair:
+        fold_path = MIXED_FOLD_PAIR_PATH
+    elif args.mixed_fold_fma:
+        fold_path = MIXED_FOLD_FMA_PATH
+
+    def invoke_mixed(cache, inputs, out, token_offsets=None, *, ablation=fold_path):
         torch.ops.replayssm_mix_910b.verify_(
             *inputs,
             *(cache[name] for name in CACHE_NAMES),
@@ -159,8 +165,11 @@ def trial(args, batch, device):
     def capture_expected(valid_indices=pick, path="fixed"):
         reset_cache(case)
         reset_status()
-        oracle = invoke_mixed if path == MIXED_PATH else invoke
-        oracle(case, fixed_inputs, fixed_out)
+        if path == MIXED_PATH:
+            reference_fold = MIXED_FUSED_FOLD_PATH if args.mixed_fold_pair else fold_path
+            invoke_mixed(case, fixed_inputs, fixed_out, ablation=reference_fold)
+        else:
+            invoke(case, fixed_inputs, fixed_out)
         check_status(path)
         expected_out = fixed_out.flatten(0, 1).index_select(0, valid_indices).cpu()
         expected_cache = {name: case[name].cpu() for name in CACHE_NAMES}
@@ -360,7 +369,9 @@ def main():
     parser.add_argument("--verify-library", type=Path, required=True)
     parser.add_argument("--mixed-library", type=Path)
     parser.add_argument("--mixed-balanced", action="store_true", help="Split key-head groups across Cube blocks")
-    parser.add_argument("--mixed-fold-fma", action="store_true", help="Fuse multiply-add in checkpoint folding")
+    fold_options = parser.add_mutually_exclusive_group()
+    fold_options.add_argument("--mixed-fold-fma", action="store_true", help="Fuse multiply-add in checkpoint folding")
+    fold_options.add_argument("--mixed-fold-pair", action="store_true", help="Batch pairs of history row broadcasts")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.flush_fraction <= 1 or not 1 <= args.layers <= 48 or args.iterations < 1:

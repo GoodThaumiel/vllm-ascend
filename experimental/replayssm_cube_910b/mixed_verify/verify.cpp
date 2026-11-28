@@ -218,12 +218,14 @@ class Projector {
 #ifdef __DAV_C220_VEC__
 template <uint32_t PanelCols, bool SuffixHistory = false, bool BulkQkv = false,
           bool BatchHistory = false, bool TriangularSolve = false, bool FuseFold = false,
-          bool FoldFma = false>
+          bool FoldFma = false, bool FoldPair = false>
 class Consumer {
   static constexpr uint32_t PANEL = TILE * PanelCols;
+  static constexpr uint32_t FOLD_ELEMENTS = TILE * DIM;
   static_assert(!BatchHistory || (PanelCols == 2 * TOKENS && SuffixHistory));
   static_assert(!TriangularSolve || (PanelCols == 2 * TOKENS && BulkQkv));
   static_assert(!FuseFold || (BatchHistory && !TriangularSolve));
+  static_assert(!FoldPair || (FuseFold && !FoldFma));
 
  public:
   __aicore__ inline void Run(Inputs &x) {
@@ -342,7 +344,9 @@ class Consumer {
       pipe_.InitBuffer(values_, TOKENS * TILE * sizeof(float));
     }
     if constexpr (BatchHistory) {
-      pipe_.InitBuffer(historyPanels_, HISTORY * PANEL * sizeof(float));
+      static_assert(!FoldPair || 2 * FOLD_ELEMENTS >= HISTORY * PANEL);
+      constexpr uint32_t elements = FoldPair ? 2 * FOLD_ELEMENTS : HISTORY * PANEL;
+      pipe_.InitBuffer(historyPanels_, elements * sizeof(float));
     }
     if constexpr (TriangularSolve) {
       pipe_.InitBuffer(solvedDeltas_, TOKENS * TILE * sizeof(float));
@@ -721,6 +725,11 @@ class Consumer {
     return historyDecay;
   }
 
+  __aicore__ inline void MultiplyFoldKey(LocalTensor<float> product, LocalTensor<float> key) {
+    Mul(product, product, key, 64, TILE, {1, 1, 1, 16, 16, 0});
+    Mul(product[64], product[64], key[64], 64, TILE, {1, 1, 1, 16, 16, 0});
+  }
+
   __aicore__ inline void FoldCheckpoint(GlobalTensor<bfloat16_t> dst, uint32_t pos, float alpha) {
     auto state = foldState_.Get<float>();
     auto input = foldIn_.DeQue<bfloat16_t>();
@@ -733,8 +742,26 @@ class Consumer {
     auto weightedD = historyRows_.Get<float>();
     constexpr uint32_t dstShape[2] = {TILE, DIM};
     constexpr uint32_t srcShape[2] = {TILE, 1};
-    Muls(state, state, alpha, TILE * DIM);
-    for (uint32_t i = 0; i < pos; ++i) {
+    Muls(state, state, alpha, FOLD_ELEMENTS);
+    uint32_t i = 0;
+    if constexpr (FoldPair) {
+      constexpr uint32_t pairDstShape[2] = {2 * TILE, DIM};
+      constexpr uint32_t pairSrcShape[2] = {2 * TILE, 1};
+      const auto second = products[FOLD_ELEMENTS];
+      for (; i + 1 < pos; i += 2) {
+        Broadcast<float, 2, 1>(products, weightedD[i * TILE], pairDstShape, pairSrcShape);
+        PipeBarrier<PIPE_V>();
+        MultiplyFoldKey(products, keys[i * DIM]);
+        MultiplyFoldKey(second, keys[(i + 1) * DIM]);
+        PipeBarrier<PIPE_V>();
+        // Keep the original FP32 addition order for both records.
+        Add(state, state, products, FOLD_ELEMENTS);
+        PipeBarrier<PIPE_V>();
+        Add(state, state, second, FOLD_ELEMENTS);
+        PipeBarrier<PIPE_V>();
+      }
+    }
+    for (; i < pos; ++i) {
       Broadcast<float, 2, 1>(products, weightedD[i * TILE], dstShape, srcShape);
       PipeBarrier<PIPE_V>();
       auto key = keys[i * DIM];
@@ -744,10 +771,9 @@ class Consumer {
         MulAddDst(state, products, key, 64, TILE, {1, 1, 1, 16, 16, 0});
         MulAddDst(state[64], products[64], key[64], 64, TILE, {1, 1, 1, 16, 16, 0});
       } else {
-        Mul(products, products, key, 64, TILE, {1, 1, 1, 16, 16, 0});
-        Mul(products[64], products[64], key[64], 64, TILE, {1, 1, 1, 16, 16, 0});
+        MultiplyFoldKey(products, key);
         PipeBarrier<PIPE_V>();
-        Add(state, state, products, TILE * DIM);
+        Add(state, state, products, FOLD_ELEMENTS);
       }
       PipeBarrier<PIPE_V>();
     }
@@ -846,7 +872,10 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   Projector op;
   op.Run(x);
 #elif defined(__DAV_C220_VEC__)
-  if (panelMode == 8) {
+  if (panelMode == 9) {
+    Consumer<2 * TOKENS, true, true, true, false, true, false, true> op;
+    op.Run(x);
+  } else if (panelMode == 8) {
     Consumer<2 * TOKENS, true, true, true, false, true, true> op;
     op.Run(x);
   } else if (panelMode == 7) {

@@ -32,7 +32,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(cores >= 1 && cores <= 20, "cores must be 1..20 on 910B4");
   TORCH_CHECK(packed_panel || (!suffix_history && !bulk_qkv), "AIV ablations require the packed panel");
   TORCH_CHECK(!suffix_history || !bulk_qkv, "Run suffix history and bulk QKV as separate ablations");
-  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= 5, "Invalid AIV ablation");
+  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= 6, "Invalid AIV ablation");
   TORCH_CHECK(aiv_ablation == 0 || (packed_panel && bulk_qkv && !suffix_history),
               "AIV ablations require the bulk-QKV packed baseline");
   TORCH_CHECK(checkpoint.dim() == 4 && d.dim() == 4, "checkpoint/D must be rank-4");

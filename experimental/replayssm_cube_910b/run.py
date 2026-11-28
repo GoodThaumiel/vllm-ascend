@@ -34,13 +34,15 @@ VECTOR_PATHS = ("native", "v20", "compact_v1", "vector_pair")
 MIXED_PATHS = ("mixed_verify", "mixed_pair")
 MIXED_FUSED_FOLD_PATH = "mixed_fused_fold"
 MIXED_FOLD_FMA_PATH = "mixed_fold_fma"
-IN_KERNEL_FOLD_PATHS = (MIXED_FUSED_FOLD_PATH, MIXED_FOLD_FMA_PATH)
+MIXED_FOLD_PAIR_PATH = "mixed_fold_pair"
+IN_KERNEL_FOLD_PATHS = (MIXED_FUSED_FOLD_PATH, MIXED_FOLD_FMA_PATH, MIXED_FOLD_PAIR_PATH)
 MIXED_AIV_ABLATIONS = {
     "mixed_history_panel": 1,
     "mixed_triangular": 2,
     "mixed_suffix_reference": 3,
     MIXED_FUSED_FOLD_PATH: 4,
     MIXED_FOLD_FMA_PATH: 5,
+    MIXED_FOLD_PAIR_PATH: 6,
 }
 MIXED_CUBE_FOLD_PATH = "mixed_cube_fold"
 CUBE_FOLD_ONLY_PATHS = ("cube_fold_path", "cube_fold_gemm")
