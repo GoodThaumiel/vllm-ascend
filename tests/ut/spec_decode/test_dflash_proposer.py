@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 
@@ -28,9 +29,11 @@ from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 
 
 class TestDummySlotMappingCleanup:
-    def test_dummy_run_clears_single_group_buffers_before_forward(self, monkeypatch):
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_dummy_run_clears_buffers_before_kv_groups_are_initialized(self, monkeypatch, mixed):
         proposer = AscendDflashProposer.__new__(AscendDflashProposer)
-        proposer.mixed_dflash_attention = False
+        proposer.mixed_dflash_attention = mixed
+        proposer._per_group_query_slot_mapping_buffers = {}
         proposer._slot_mapping_buffer = torch.full((8,), 123, dtype=torch.int32)
         proposer._context_slot_mapping_buffers = torch.full((8,), 456, dtype=torch.int32)
 

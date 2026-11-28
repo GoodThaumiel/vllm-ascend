@@ -55,6 +55,10 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
         self.mixed_dflash_attention = self.method == "dflash" and vllm_config._dflash_needs_multi_kv_group()
+        # Memory profiling calls dummy_run before initialize_attn_backend.
+        self._dflash_block_sizes: dict[int, int] = {}
+        self._per_group_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
+        self._per_group_context_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         self.max_positions = self.max_num_tokens + self.max_query_tokens
 
@@ -298,7 +302,7 @@ class AscendDflashProposer(AscendEagleProposer):
 
     def _clear_dummy_slot_mappings(self) -> None:
         self._slot_mapping_buffer.fill_(-1)
-        if self.mixed_dflash_attention:
+        if self.mixed_dflash_attention and self._per_group_query_slot_mapping_buffers:
             for buffers in (
                 self._per_group_query_slot_mapping_buffers,
                 self._per_group_context_slot_mapping_buffers,
