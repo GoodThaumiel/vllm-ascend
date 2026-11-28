@@ -619,6 +619,23 @@ def test_non_spec_prefill_metadata_uses_prefill_tail_for_chunk_metadata(
     )
 
 
+def test_dflash_anchor_keeps_previous_accepted_state_when_grammar_drops_all_drafts():
+    device = torch.device("cpu")
+    builder = _make_builder(device=device, num_heads=32, num_speculative_tokens=3, num_speculative_blocks=3)
+    builder.vllm_config.speculative_config.method = "dflash"
+    common = create_common_attn_metadata(BatchSpec(seq_lens=[24], query_lens=[1]), block_size=16, device=device)
+    common.is_prefilling.zero_()
+    common.block_table_tensor = torch.tensor([[4, 5, 6, 7]], dtype=torch.int32)
+    accepted = torch.tensor([3], dtype=torch.int32)
+    metadata = builder.build(0, common, num_accepted_tokens=accepted)
+    assert metadata.num_spec_decodes == 1
+    conv = metadata.spec_decode_metadata.spec_causal_conv1d
+    torch.testing.assert_close(conv.cache_indices, common.block_table_tensor)
+    torch.testing.assert_close(conv.num_accepted_tokens, accepted)
+    expected_lengths = torch.tensor([0, 1], dtype=torch.int32)
+    torch.testing.assert_close(metadata.spec_decode_metadata.actual_seq_lengths, expected_lengths)
+
+
 def test_spec_conv1d_args_use_device_cache_and_accepted_tokens():
     batch_spec = BatchSpec(
         seq_lens=[4, 4],

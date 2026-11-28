@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm_ascend.ops.gdn import (
     AscendGatedDeltaNetAttention,
+    _native_spec_recurrent,
     _pack_conv_weights,
     initialize_packed_conv_weight,
 )
@@ -98,6 +99,8 @@ def _make_layer() -> SimpleNamespace:
         key_dim=2,
         value_dim=2,
         num_spec=3,
+        use_replayssm_sd=False,
+        cache_config=SimpleNamespace(use_replayssm=False),
         conv1d=nn.Conv1d(
             in_channels=1,
             out_channels=6,
@@ -293,12 +296,12 @@ def test_decode_forward_does_not_reconcat_qkv(speculative):
     metadata.num_spec_decodes = 2 if speculative else 0
     metadata.num_spec_decode_tokens = 4 if speculative else 0
     metadata.spec_sequence_masks = torch.tensor([True, True]) if speculative else None
-    metadata.spec_state_indices_tensor = torch.tensor([0, 1], dtype=torch.int32)
+    metadata.spec_state_indices_tensor = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
     metadata.non_spec_state_indices_tensor = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
     metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
         spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
             query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
-            cache_indices=torch.tensor([0, 1], dtype=torch.int32),
+            cache_indices=metadata.spec_state_indices_tensor,
             num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32),
         ),
         actual_seq_lengths=torch.tensor([0, 2, 2], dtype=torch.int32),
@@ -320,8 +323,8 @@ def test_decode_forward_does_not_reconcat_qkv(speculative):
 
     # Reject the inherited concat helper for all real decode inputs.
     original = layer.rearrange_mixed_qkv.side_effect
-    layer.rearrange_mixed_qkv.side_effect = (
-        lambda x: original(x) if x is None else pytest.fail("decode used inherited QKV concat")
+    layer.rearrange_mixed_qkv.side_effect = lambda x: (
+        original(x) if x is None else pytest.fail("decode used inherited QKV concat")
     )
     with (
         override_forward_context(context),
@@ -343,6 +346,27 @@ def test_decode_forward_does_not_reconcat_qkv(speculative):
             conv.call_args.kwargs["num_accepted_tokens"],
             torch.tensor([1, 2], dtype=torch.int32),
         )
+
+
+def test_native_spec_recurrent_preserves_predecessor_slot_for_short_query():
+    state_indices = torch.arange(1, 9, dtype=torch.int32).view(2, 4)
+    accepted = torch.tensor([3, 2], dtype=torch.int32)
+    metadata = GDNSpecDecodeMetadata(
+        spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
+            query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+            cache_indices=state_indices,
+            num_accepted_tokens=accepted,
+        ),
+        actual_seq_lengths=torch.tensor([0, 1, 2], dtype=torch.int32),
+    )
+    x = torch.arange(1, 4, dtype=torch.float32).view(3, 1, 1)
+    with patch("vllm_ascend.ops.gdn.recurrent_gated_delta_rule", side_effect=lambda q, k, v, *a, **kw: v) as op:
+        actual = _native_spec_recurrent(x, x, x, x[..., 0], x[..., 0], torch.zeros(9, 1, 1, 1), metadata, 2)
+    torch.testing.assert_close(actual, x)
+    torch.testing.assert_close(op.call_args.args[0].flatten(), torch.tensor([1.0, 0.0, 0.0, 0.0, 2.0, 3.0, 0.0, 0.0]))
+    torch.testing.assert_close(op.call_args.kwargs["ssm_state_indices"], state_indices.flatten())
+    torch.testing.assert_close(op.call_args.kwargs["num_accepted_tokens"], accepted)
+    torch.testing.assert_close(op.call_args.kwargs["actual_seq_lengths"], torch.tensor([0, 4, 4], dtype=torch.int32))
 
 
 @pytest.mark.parametrize("mixed,head_dim", [(False, 16), (True, 16), (False, 2)])

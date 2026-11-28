@@ -48,7 +48,7 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
-from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend, GDNSpecDecodeMetadata
 from vllm_ascend.ops.replayssm.ascendc import (
     REPLAYSSM_SD_MIXED_CORES,
     load_replayssm_sd_mixed_library,
@@ -78,6 +78,66 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+
+
+def _native_spec_recurrent(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    metadata: GDNSpecDecodeMetadata,
+    num_requests: int,
+) -> torch.Tensor:
+    conv = metadata.spec_causal_conv1d
+    state_indices = conv.cache_indices
+    lengths = metadata.actual_seq_lengths
+    assert lengths is not None
+    scale = key.size(-1) ** -0.5
+    if state_indices.numel() == query.size(0):
+        return recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            state,
+            g=gate,
+            beta=beta,
+            scale=scale,
+            actual_seq_lengths=lengths,
+            ssm_state_indices=state_indices.flatten(),
+            num_accepted_tokens=conv.num_accepted_tokens.to(torch.int32),
+        )
+
+    # The native op indexes both its initial state and per-token writes
+    # through a slot array of length T. Keep each live request's full
+    # slot row so the prior accepted count can select a state even when
+    # grammar filtering shortened the current query.
+    state_indices = state_indices[:num_requests]
+    width = state_indices.size(1)
+    offsets = conv.query_start_loc[: num_requests + 1].to(torch.int64)
+    row_offsets = torch.arange(num_requests, device=query.device) * width - offsets[:-1]
+    pack = torch.repeat_interleave(row_offsets, offsets.diff(), output_size=query.size(0))
+    pack = pack + torch.arange(query.size(0), device=query.device)
+
+    def pad(x: torch.Tensor) -> torch.Tensor:
+        return x.new_zeros((state_indices.numel(), *x.shape[1:])).index_copy_(0, pack, x)
+
+    padded_lengths = lengths.new_full((num_requests + 1,), width)
+    padded_lengths[0] = 0
+    out = recurrent_gated_delta_rule(
+        pad(query),
+        pad(key),
+        pad(value),
+        state,
+        g=pad(gate),
+        beta=pad(beta),
+        scale=scale,
+        actual_seq_lengths=padded_lengths,
+        ssm_state_indices=state_indices.flatten(),
+        num_accepted_tokens=conv.num_accepted_tokens[:num_requests].to(torch.int32),
+    )
+    return out.index_select(0, pack)
 
 
 @lru_cache(maxsize=1)
@@ -745,7 +805,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
@@ -989,7 +1048,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
             if use_replayssm_sd:
@@ -1003,17 +1061,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     output=core_attn_out[:num_actual_tokens] if direct_sd_output else None,
                 )
             else:
-                core_attn_out_spec = recurrent_gated_delta_rule(
+                core_attn_out_spec = _native_spec_recurrent(
                     query_spec.squeeze(0),
                     key_spec.squeeze(0),
                     value_spec.squeeze(0),
+                    g_spec.squeeze(0),
+                    beta_spec.squeeze(0),
                     ssm_state,
-                    g=g_spec.squeeze(0),
-                    beta=beta_spec.squeeze(0),
-                    scale=key_spec.shape[-1] ** -0.5,
-                    actual_seq_lengths=actual_seq_lengths,
-                    ssm_state_indices=spec_state_indices_tensor.flatten(),
-                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                    attn_metadata.spec_decode_metadata,
+                    attn_metadata.num_spec_decodes,
                 ).unsqueeze(0)
         else:
             core_attn_out_spec, last_recurrent_state = None, None

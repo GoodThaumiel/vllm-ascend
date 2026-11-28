@@ -3849,11 +3849,15 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args["num_actual_reqs"] = num_reqs
-                if use_spec_decode or replayssm_sd_enabled(self.vllm_config):
-                    extra_attn_metadata_args.update(
-                        num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
-                        num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
+                use_replay_sd = replayssm_sd_enabled(self.vllm_config)
+                if use_spec_decode or use_replay_sd:
+                    extra_attn_metadata_args["num_decode_draft_tokens_cpu"] = (
+                        self.num_decode_draft_tokens.cpu[:num_reqs_padded]
                     )
+                if use_spec_decode or use_replay_sd or (
+                    self.speculative_config is not None and self.speculative_config.use_dflash()
+                ):
+                    extra_attn_metadata_args["num_accepted_tokens"] = self.num_accepted_tokens.gpu[:num_reqs_padded]
 
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
                 if for_cudagraph_capture:
