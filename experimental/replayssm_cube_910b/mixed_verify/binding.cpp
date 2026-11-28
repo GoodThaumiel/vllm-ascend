@@ -29,14 +29,14 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   const auto tokenCount = packedTokens ? q.size(0) : 0;
   TORCH_CHECK(!packedTokens || (tokenCount > 0 && tokenCount <= b * kMaxTokens),
               "packed token count must be in 1..B*", kMaxTokens);
-  TORCH_CHECK(kMaxTokens == 4 || (packedTokens && aiv_ablation == 4),
+  TORCH_CHECK(kMaxTokens == 4 || (packedTokens && (aiv_ablation == 4 || aiv_ablation == 7)),
               "The eight-token build requires packed tokens and fused verify/compact");
   TORCH_CHECK(b >= 1 && b <= 256 && ((hk == 4 && hv == 12) || (hk == 16 && hv == 32)),
               "expected B1..256 and 27B TP4 or 9B TP1");
   TORCH_CHECK(cores >= 1 && cores <= 20, "cores must be 1..20 on 910B4");
   TORCH_CHECK(packed_panel || (!suffix_history && !bulk_qkv), "AIV ablations require the packed panel");
   TORCH_CHECK(!suffix_history || !bulk_qkv, "Run suffix history and bulk QKV as separate ablations");
-  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= 6, "Invalid AIV ablation");
+  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= (kMaxTokens == 8 ? 7 : 6), "Invalid AIV ablation");
   TORCH_CHECK(aiv_ablation == 0 || (packed_panel && bulk_qkv && !suffix_history),
               "AIV ablations require the bulk-QKV packed baseline");
   TORCH_CHECK(checkpoint.dim() == 4 && d.dim() == 4, "checkpoint/D must be rank-4");

@@ -224,7 +224,7 @@ class Projector {
 #ifdef __DAV_C220_VEC__
 template <uint32_t PanelCols, bool SuffixHistory = false, bool BulkQkv = false,
           bool BatchHistory = false, bool TriangularSolve = false, bool FuseFold = false,
-          bool FoldFma = false, bool FoldPair = false>
+          bool FoldFma = false, bool FoldPair = false, bool ColumnRecurrence = false>
 class Consumer {
   static constexpr uint32_t PANEL = TILE * PanelCols;
   static constexpr uint32_t FOLD_ELEMENTS = TILE * DIM;
@@ -232,6 +232,7 @@ class Consumer {
   static_assert(!TriangularSolve || (PanelCols == 2 * TOKENS && BulkQkv));
   static_assert(!FuseFold || (BatchHistory && !TriangularSolve));
   static_assert(!FoldPair || (FuseFold && !FoldFma));
+  static_assert(!ColumnRecurrence || (PanelCols == COLS && BulkQkv && FuseFold && TOKENS == 8));
 
  public:
   __aicore__ inline void Run(Inputs &x) {
@@ -640,6 +641,57 @@ class Consumer {
     }
   }
 
+  __aicore__ inline void CorrectCandidateColumns(Inputs &x, uint32_t tokenStart, uint32_t head,
+                                                  uint64_t ringHead, uint32_t base, uint32_t pos,
+                                                  uint32_t len, uint32_t vStart, LocalTensor<float> decay,
+                                                  LocalTensor<float> beta, LocalTensor<float> logGate) {
+    auto columns = outer_.Get<float>();
+    auto update = proj_.Get<float>();
+    auto d = delta_.Get<float>();
+    auto selected = selected_.Get<float>();
+    auto dots = dot_.Get<float>();
+    Gather(columns, update, gather_.Get<uint32_t>(), 0, PANEL);
+    PipeBarrier<PIPE_V>();
+    constexpr uint32_t dstShape[2] = {PanelCols, TILE};
+    constexpr uint32_t srcShape[2] = {PanelCols, 1};
+    constexpr uint32_t stride = TILE / FLOAT_LANES_PER_BLOCK;
+    for (uint32_t t = 0; t < len; ++t) {
+      auto key = columns[t * TILE];
+      auto query = columns[(TOKENS + t) * TILE];
+      const uint32_t lane = t * FLOAT_LANES_PER_BLOCK;
+      const uint32_t remaining = (len - t) * TILE;
+      const float gate = decay.GetValue(lane);
+      Muls(key, key, gate, remaining);
+      Muls(query, query, gate, remaining);
+      PipeBarrier<PIPE_V>();
+      Sub(d, values_.Get<float>()[t * TILE], key, TILE);
+      PipeBarrier<PIPE_V>();
+      Muls(d, d, beta.GetValue(lane), TILE);
+      PipeBarrier<PIPE_V>();
+      const uint32_t record = Physical(base, pos + t);
+      StoreCast(x.d[(ringHead + record) * DIM + vStart], d, TILE);
+
+      // One repeat updates one dense V64 column. Every repeat reads the
+      // same delta vector (src1 repeat stride is zero).
+      Broadcast<float, 2, 1>(update, dots[(pos + t) * PanelCols], dstShape, srcShape);
+      PipeBarrier<PIPE_V>();
+      Mul(update, update, d, TILE, PanelCols, {1, 1, 1, stride, stride, 0});
+      PipeBarrier<PIPE_V>();
+      // This key projection has already been consumed for the delta.
+      if (remaining > TILE) {
+        Add(key[TILE], key[TILE], update[(t + 1) * TILE], remaining - TILE);
+      }
+      Add(query, query, update[(TOKENS + t) * TILE], remaining);
+      PipeBarrier<PIPE_V>();
+      Muls(selected, query, SCALE, TILE);
+      PipeBarrier<PIPE_V>();
+      StoreCast(x.out[x.Output(tokenStart, t, head) + vStart], selected, TILE);
+      if (vStart == 0) {
+        StoreScalar(x.gates[ringHead + record], logGate.GetValue(lane));
+      }
+    }
+  }
+
   __aicore__ inline float Correct(Inputs &x, uint32_t tokenStart, uint32_t head, uint32_t ring, uint32_t pos,
                                  uint32_t base, uint32_t len, uint32_t vStart) {
     auto proj = proj_.Get<float>();
@@ -699,6 +751,10 @@ class Consumer {
     }
     if constexpr (TriangularSolve) {
       SolveCandidates(x, x.Output(tokenStart, 0, head), ringHead, base, pos, len, vStart, decay, beta, logGate);
+      return historyDecay;
+    }
+    if constexpr (ColumnRecurrence) {
+      CorrectCandidateColumns(x, tokenStart, head, ringHead, base, pos, len, vStart, decay, beta, logGate);
       return historyDecay;
     }
     for (uint32_t t = 0; t < len; ++t) {
@@ -881,10 +937,13 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   op.Run(x);
 #elif defined(__DAV_C220_VEC__)
 #if REPLAYSSM_VERIFY_MAX_TOKENS == 8
-  // The binding checks this build's sole mode before launching. In
-  // particular the four-step triangular solver is not used here.
-  Consumer<COLS, true, true, true, false, true> op;
-  op.Run(x);
+  if (panelMode == 10) {
+    Consumer<COLS, true, true, true, false, true, false, false, true> op;
+    op.Run(x);
+  } else {
+    Consumer<COLS, true, true, true, false, true> op;
+    op.Run(x);
+  }
 #else
   if (panelMode == 9) {
     Consumer<2 * TOKENS, true, true, true, false, true, false, true> op;

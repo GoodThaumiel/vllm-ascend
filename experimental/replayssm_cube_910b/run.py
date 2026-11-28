@@ -35,7 +35,8 @@ MIXED_PATHS = ("mixed_verify", "mixed_pair")
 MIXED_FUSED_FOLD_PATH = "mixed_fused_fold"
 MIXED_FOLD_FMA_PATH = "mixed_fold_fma"
 MIXED_FOLD_PAIR_PATH = "mixed_fold_pair"
-IN_KERNEL_FOLD_PATHS = (MIXED_FUSED_FOLD_PATH, MIXED_FOLD_FMA_PATH, MIXED_FOLD_PAIR_PATH)
+MIXED_COLUMN_RECURRENCE_PATH = "mixed_column_recurrence"
+IN_KERNEL_FOLD_PATHS = (MIXED_FUSED_FOLD_PATH, MIXED_FOLD_FMA_PATH, MIXED_FOLD_PAIR_PATH, MIXED_COLUMN_RECURRENCE_PATH)
 MIXED_AIV_ABLATIONS = {
     "mixed_history_panel": 1,
     "mixed_triangular": 2,
@@ -43,6 +44,7 @@ MIXED_AIV_ABLATIONS = {
     MIXED_FUSED_FOLD_PATH: 4,
     MIXED_FOLD_FMA_PATH: 5,
     MIXED_FOLD_PAIR_PATH: 6,
+    MIXED_COLUMN_RECURRENCE_PATH: 7,
 }
 MIXED_CUBE_FOLD_PATH = "mixed_cube_fold"
 CUBE_FOLD_ONLY_PATHS = ("cube_fold_path", "cube_fold_gemm")
@@ -899,8 +901,10 @@ def parse_args(argv=None):
         defaults = VECTOR_PATHS if vector_only else PATHS
     args.batches = args.batches or (DEFAULT_BATCHES if defaults == PATHS else batches("all"))
     args.path = args.path or defaults
-    if args.length > 4 and set(args.path) - {"native", MIXED_FUSED_FOLD_PATH}:
-        ap.error("six/eight-token windows require --path native and/or mixed_fused_fold")
+    if args.length > 4 and set(args.path) - {"native", MIXED_FUSED_FOLD_PATH, MIXED_COLUMN_RECURRENCE_PATH}:
+        ap.error("six/eight-token windows require --path native, mixed_fused_fold or mixed_column_recurrence")
+    if args.length <= 4 and MIXED_COLUMN_RECURRENCE_PATH in args.path:
+        ap.error("mixed_column_recurrence requires a six/eight-token window")
     if args.flush_count is not None and not 0 <= args.flush_count <= min(args.batches):
         ap.error("flush-count must fit the smallest requested batch")
     if (args.suite != "all" or args.geometry == "9b") and any(path in CUBE_PATHS for path in args.path):

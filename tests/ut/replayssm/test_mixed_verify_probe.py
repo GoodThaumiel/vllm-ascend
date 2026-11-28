@@ -39,6 +39,13 @@ class TestMixedVerifyProbe(unittest.TestCase):
                 self.assertEqual(projected[:, window:8].count_nonzero().item(), 0)
                 self.assertEqual(projected[:, 8 + window :].count_nonzero().item(), 0)
 
+    def test_wide_column_recurrence_reduces_modeled_work(self):
+        row = dict(batch=32, length=8, pos=8, active_flush=16, nonflush_pos=4, aiv_panel_cols=16)
+        original = contract({**row, "path": "mixed_fused_fold"})
+        columns = contract({**row, "path": "mixed_column_recurrence"})
+        self.assertLess(columns[0], original[0])
+        self.assertEqual(columns[1], original[1])
+
     def test_failure_names_tensor_and_preserves_values(self):
         actual, expected = torch.tensor([0.0, 0.0227]), torch.zeros(2)
         with TemporaryDirectory() as directory:

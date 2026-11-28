@@ -247,6 +247,7 @@ def run(args: argparse.Namespace) -> dict:
     }
     if mixed_library is not None:
         report["mixed_library_sha256"] = hashlib.sha256(mixed_library.read_bytes()).hexdigest()
+        report["mixed_ablation"] = args.mixed_ablation
     report["backend"] = "mixed_fused_fold" if mixed_library is not None else "framework_v13_compact_v1"
     for step in range(args.steps):
         replayssm_sd_cursor(
@@ -343,7 +344,7 @@ def run(args: argparse.Namespace) -> dict:
                 False,
                 True,
                 False,
-                MIXED_FUSED_FOLD,
+                args.mixed_ablation,
                 replay["flush"],
                 offsets,
             )
@@ -406,6 +407,7 @@ def main() -> int:
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--cpu-reference", action="store_true")
     backend.add_argument("--mixed-library", type=Path, help="Use the packed grouped-fused verify library")
+    parser.add_argument("--mixed-ablation", type=int, choices=(MIXED_FUSED_FOLD, 7), default=MIXED_FUSED_FOLD)
     parser.add_argument("--window", type=int, choices=(4, 6, 8), default=4)
     parser.add_argument("--logical-limit", type=int)
     parser.add_argument("--gate-max", type=float, default=0.04)
@@ -428,6 +430,8 @@ def main() -> int:
         parser.error(f"logical-limit must be in [{2 * args.window}, {max_limit}]")
     if args.window > 4 and not (args.cpu_reference or args.mixed_library):
         parser.error("windows above four require the wide mixed library or --cpu-reference")
+    if args.mixed_ablation == 7 and (args.window <= 4 or args.mixed_library is None):
+        parser.error("column recurrence requires a wide window and the mixed library")
     if args.tp not in GEOMETRIES[args.geometry] or (args.mixed_library and args.tp != GEOMETRIES[args.geometry][0]):
         parser.error("unsupported geometry/TP combination for this backend")
     if args.atol < 0 or args.rtol < 0 or not 0 <= args.gate_max <= 1:

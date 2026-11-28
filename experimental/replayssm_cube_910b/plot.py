@@ -41,6 +41,27 @@ def contract(row):
         2 * b * h * d * d * n + 4 * b * k * (p + t) * d * n + 3 * b * h * (p + t) * d * n,
         verify_io + 2 * b * h * d * n * 4,
     )
+    if path in ("mixed_fused_fold", "mixed_column_recurrence"):
+        cols = row.get("aiv_panel_cols", 8)
+        pos_counts = ((p, f), (row.get("nonflush_pos", p), b - f))
+        histories = sum(pos * count for pos, count in pos_counts)
+        with_history = sum(count for pos, count in pos_counts if pos)
+        tree_adds = sum(count * ((4 if pos <= 4 else 8 if pos <= 8 else 16) - 1) for pos, count in pos_counts if pos)
+        projected_history = (histories + tree_adds + 2 * with_history) * h * d * cols + histories * h * d
+        candidate_panel = 3 * t * cols
+        if path == "mixed_column_recurrence":
+            candidate_panel = t * (t + 1) + t * cols + t * t
+        candidate_work = b * h * d * (candidate_panel + 3 * t)
+        dot_work = 2 * k * (histories + b * t) * cols * (2 * d - 1)
+        folded = f if p else 0
+        fold_work = folded * h * d * d * (1 + 2 * p)
+        ring_payload = (histories + b * t) * (2 * d * (h + k) + 4 * h)
+        checkpoint_io = (2 * b + 4 * folded) * h * d * d
+        handoff_io = 4 * b * h * d * (n + cols)
+        return (
+            2 * b * h * d * d * n + projected_history + candidate_work + dot_work + fold_work,
+            checkpoint_io + handoff_io + qkv + ring_payload,
+        )
     if path in ("vector_pair", "cube_pair", "mixed_pair"):
         a, c = {"vector_pair": (v20, compact), "cube_pair": (cube, short), "mixed_pair": (mixed, compact)}[path]
         return a[0] + c[0], a[1] + c[1]
@@ -139,7 +160,7 @@ def main():
         ax.legend(fontsize=8)
     config = report["config"]
     fig.suptitle(
-        f"910B4 Qwen3.5-{config.get('geometry', '27b').upper()} TP{config.get('tp', 4)} | "
+        f"{report.get('soc', 'Ascend')} Qwen3.5-{config.get('geometry', '27b').upper()} TP{config.get('tp', 4)} | "
         f"T={config['length']} pos={config['pos']} flush={config['flush']} | ceilings: {args.roof_source}"
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
