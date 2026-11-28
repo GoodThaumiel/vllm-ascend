@@ -111,8 +111,10 @@ FULL runtime graph hits. All fixed-length requests completed.
 | 32 / 32 | 546.73 | 607.86 | 49.67 | 43.99 |
 
 C1 used 128 output tokens per request. C8 and C32 used 160. Each cell is
-one run. The large C8 throughput delta needs a same-commit repeat before
-attribution. No per-row flush trace was collected in these service runs.
+one run. C8 TTFT p50 also changed from 2.48 s to 0.41 s, so the large
+throughput delta needs a same-commit repeat before attribution. Native and
+Replay reported 116,307 and 249,977 tokens of KV capacity. No per-row flush
+trace was collected in these service runs.
 
 | Acceptance workload (C8) | Native accepted / proposed | Replay accepted / proposed | Passed Native / Replay |
 |---|---:|---:|---:|
@@ -140,3 +142,7 @@ and draft replay markers. These runs are
 `dflash-9b-replay-k7.bMb2We` and `dflash-9b-native-k7.NNt9Ns` on Blue2.
 The subsequent MRv1 work keeps the model's original layer attention
 modes and routes each draft KV group to its own page table and slot maps.
+At `eb799cb`, weights loaded and the draft FULL wrapper initialized.
+Memory profiling failed because it clears dummy slot mappings before
+the per-group buffers are assigned. `c0f10e4` fixes that initialization
+order. The failed profile report is `dflash-9b-replay-k7.41b8vD`.
