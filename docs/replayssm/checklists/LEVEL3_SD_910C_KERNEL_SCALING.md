@@ -933,3 +933,27 @@ fold 与 ring 绕回，再测多请求和 ragged 候选。
 的 target forward p50/p90。对 Mixed L20 与 L8，检查同一批请求的
 MTP 接受率、折叠比例分布、输出及排队情况。若 Native 达不到同一
 活跃 batch，汇报可重叠的 batch 区间及各自的 HTTP 吞吐与容量。
+
+#### 设备连续窗口正确性
+
+`b53e1776`，Blue2 逻辑 die 13，Ascend910_9362、CANN 9.2.1、
+PyTorch 2.10.0+cpu、torch-npu 2.10.0.post7、vLLM 0.30.0+empty。
+使用主扩展 cursor 和整组轮转 mixed verify/compact，mixed binding SHA-256
+`d1b9b1e315bd6eb77d811d0be6c5c59764c59a914ba0a2fcc0ab2c309f2a5b77`。
+两种几何各用 B1、MTP3、T4，固定 accepted 模式 3/1/4/2，
+seed 42、gate 最大绝对值 0.002、BF16 beta 往返。每组跑 120 步，
+按实际 BF16 checkpoint 和 FP16 D/K、FP32 G ring 对比本步参考，
+容差 `atol=0.001, rtol=0.03`。
+
+| 几何 / 阈值 | 折叠步数 | 最大历史 | 输出对本步参考 max abs | checkpoint 对本步参考 max abs | 输出对 FP64 dense max abs |
+|---|---:|---:|---:|---:|---:|
+| 9B TP1 / L20 | 20 | 15 | 6.10e-5 | 4.88e-4 | 1.22e-4 |
+| 9B TP1 / L8 | 119 | 4 | 3.05e-5 | 4.88e-4 | 2.44e-4 |
+| 27B TP4 单 rank / L20 | 20 | 15 | 3.05e-5 | 4.88e-4 | 1.22e-4 |
+| 27B TP4 单 rank / L8 | 119 | 4 | 6.10e-5 | 9.77e-4 | 1.98e-4 |
+
+四组均通过 120 步，无 cursor/verify 状态错误或本步精度超差。
+D ring 最大绝对差各为 1.22e-4，K/G 一致。设备结果复现了 CPU
+探针观察到的 L8 舍入累积增加。该测量针对合成输入连续窗口，
+服务端的候选接受率、模型输出与 forward 时延用独立 A/B 验证。
+原始报告位于 Blue2 的 `horizon-die13.Qozz2D/sequence.mt9ixy`。
