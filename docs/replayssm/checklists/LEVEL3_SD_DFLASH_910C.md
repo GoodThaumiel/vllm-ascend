@@ -265,7 +265,10 @@ fixed-length C1/C8/C32/C64 requests completed. One run per cell.
 All acceptance requests completed. All 16 JSON responses parsed in each
 cell. At C64 the K7 throughput gap was 1.3%. Absolute throughput peaked
 at K4 among these two measured windows, in both modes. No flush trace was
-collected. Artifacts are `dflash-9b-native-k4.FTbves`,
+collected. The engine reported Native / Replay KV capacities of
+213,305 / 300,402 tokens for K4 and 173,824 / 300,388 for K7. These
+are cache capacity estimates, with the active request cap held at 64.
+Artifacts are `dflash-9b-native-k4.FTbves`,
 `dflash-9b-replay-k4.0S5PHa`, `dflash-9b-native-k7.oSaKte`,
 and `dflash-9b-replay-k7.El0FDU`.
 
@@ -312,14 +315,22 @@ The original expanded mask sizing regressed a CPU graph-padding test.
 `0a6771a` keeps the existing mask sizing for other speculative modes.
 The two GDN metadata and mixed-batch modules then passed 80/80 CPU
 tests in the Blue2 environment, including the shortened DFlash query
-and anchor-only decode cases.
+and anchor-only decode cases. The broader final-code CPU suite, including
+both proposers, the DFlash configuration patch, ACLGraph and the SD
+serve validator, passed 152/152.
 
-9B TP1 Native at `57c388c` on die 10 passed strict JSON Schema over
-`vllm serve`. Settings matched the K7 matrix, with the separate device
-and mode-specific compile cache. A JSON Schema validator independently
-checked every response. C1 passed 4/4, accepting 184/420 proposed
-tokens (43.81%). C8 passed 16/16, accepting 731/1642 (44.52%).
-The ordinary C1 warmup logged actual FULL replay for both target and
-draft. This runtime check establishes the shape fix for the 9B Native
-K7 case. It does not measure graph coverage specifically during
-structured generation. Artifact `dflash-9b-native-k7.TDuNWs`.
+9B TP1 Native and Replay at `57c388c` on die 10 passed strict JSON
+Schema over `vllm serve`. Settings matched the K7 matrix, with the
+separate device and mode-specific compile cache. A JSON Schema validator
+independently checked every response.
+
+| JSON Schema requests | Native schema-valid | Replay schema-valid | Native accepted / proposed | Replay accepted / proposed |
+|---|---:|---:|---:|---:|
+| C1, 4 requests | 4/4 | 4/4 | 184/420 (43.81%) | 185/424 (43.63%) |
+| C8, 16 requests | 16/16 | 16/16 | 731/1642 (44.52%) | 734/1690 (43.43%) |
+
+Both ordinary C1 warmups logged actual FULL replay for target and draft.
+The schema runs had fewer than K proposed tokens in some iterations, so
+per-position percentages are omitted. These runs do not separately
+measure graph coverage during structured generation. Artifacts are
+`dflash-9b-native-k7.TDuNWs` and `dflash-9b-replay-k7.TYwczo`.
