@@ -82,10 +82,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("report", type=Path)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--bandwidth-gbs", type=float, required=True)
-    ap.add_argument("--cube-tflops", type=float, required=True)
-    ap.add_argument("--vector-tflops", type=float, required=True)
-    ap.add_argument("--roof-source", required=True, help="board calibration run ID or source of ceiling values")
+    ap.add_argument("--calibration", type=Path, help="Use same-device measurements from calibrate.py")
+    ap.add_argument("--bandwidth-gbs", type=float)
+    ap.add_argument("--cube-tflops", type=float)
+    ap.add_argument("--vector-tflops", type=float)
+    ap.add_argument("--roof-source", help="board calibration run ID or source of explicit ceiling values")
     ap.add_argument("--counters", type=Path, help="CSV: batch,path,flops,hbm_read_bytes,hbm_write_bytes (per replay)")
     args = ap.parse_args()
     import matplotlib
@@ -93,11 +94,26 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if not all(math.isfinite(x) and x > 0 for x in (args.bandwidth_gbs, args.cube_tflops, args.vector_tflops)):
-        ap.error("all ceilings must be positive and finite")
     report = json.loads(args.report.read_text())
     if report.get("status", "PASSED") != "PASSED" or "error" in report or not report["rows"]:
         ap.error("incomplete report")
+    if args.calibration:
+        if any(
+            value is not None for value in (args.bandwidth_gbs, args.cube_tflops, args.vector_tflops, args.roof_source)
+        ):
+            ap.error("use either --calibration or the four explicit ceiling/source arguments")
+        calibration = json.loads(args.calibration.read_text())
+        if calibration.get("status") != "PASSED" or calibration.get("soc") != report.get("soc"):
+            ap.error("calibration must pass and match the benchmark device")
+        args.bandwidth_gbs = calibration["bandwidth_gbs"]
+        args.cube_tflops = calibration["cube_tflops"]
+        args.vector_tflops = calibration["vector_tflops"]
+        args.roof_source = args.calibration.stem
+    if not args.roof_source or not all(
+        value is not None and math.isfinite(value) and value > 0
+        for value in (args.bandwidth_gbs, args.cube_tflops, args.vector_tflops)
+    ):
+        ap.error("all ceilings must be positive and finite and have a source")
     counters = {}
     if args.counters:
         with args.counters.open() as stream:

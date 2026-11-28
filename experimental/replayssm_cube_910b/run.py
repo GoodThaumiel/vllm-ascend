@@ -100,6 +100,12 @@ def measure(call, reset, iterations, label, check_graph=None):
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         call()
+    # The first launches of a newly captured Ascend graph can have a
+    # large setup cost even after eager warmup. Measure steady replay.
+    graph_warmups = 2
+    for _ in range(graph_warmups):
+        reset()
+        graph.replay()
     torch.npu.synchronize()
     us = []
     print(f"MEASURE_BEGIN {label} replays={iterations}", flush=True)
@@ -115,7 +121,12 @@ def measure(call, reset, iterations, label, check_graph=None):
     print(f"MEASURE_END {label}", flush=True)
     if check_graph is not None:
         check_graph(graph)
-    return {"graph_us": us, "p50_us": statistics.median(us), "p90_us": sorted(us)[(9 * len(us) - 1) // 10]}
+    return {
+        "graph_us": us,
+        "graph_warmup_replays": graph_warmups,
+        "p50_us": statistics.median(us),
+        "p90_us": sorted(us)[(9 * len(us) - 1) // 10],
+    }
 
 
 def measure_eager(call, reset, iterations):

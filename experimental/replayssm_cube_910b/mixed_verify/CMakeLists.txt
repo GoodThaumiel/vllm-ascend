@@ -4,6 +4,7 @@ project(replayssm_sd_mix_910b LANGUAGES C CXX)
 set(SOC_VERSION "Ascend910B4" CACHE STRING "AscendC compiler SoC")
 set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/cann-9.2.0" CACHE PATH "CANN root")
 set(REPLAYSSM_VERIFY_MAX_TOKENS "4" CACHE STRING "Candidate window compiled into the mixed verify library")
+option(REPLAYSSM_ROOFLINE_CALIBRATION "Build the standalone AIV throughput calibration op" OFF)
 if(NOT REPLAYSSM_VERIFY_MAX_TOKENS MATCHES "^(4|8)$")
     message(FATAL_ERROR "REPLAYSSM_VERIFY_MAX_TOKENS must be 4 or 8")
 endif()
@@ -30,7 +31,11 @@ if(NOT ASCENDC_CMAKE_DIR)
 endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
 
-ascendc_library(replayssm_sd_mix_kernel SHARED verify.cpp)
+set(mixed_kernels verify.cpp)
+if(REPLAYSSM_ROOFLINE_CALIBRATION)
+    list(APPEND mixed_kernels vector_calibration.cpp)
+endif()
+ascendc_library(replayssm_sd_mix_kernel SHARED ${mixed_kernels})
 ascendc_compile_definitions(replayssm_sd_mix_kernel PRIVATE REPLAYSSM_VERIFY_MAX_TOKENS=${REPLAYSSM_VERIFY_MAX_TOKENS})
 # CANN's legacy helper sends definitions only to the device compilations.
 ascendc_compile_options(replayssm_sd_mix_kernel PRIVATE
@@ -49,6 +54,9 @@ find_library(TORCH_NPU_LIB torch_npu PATHS "${torch_npu_root}/lib" NO_DEFAULT_PA
 find_library(ASCENDCL_LIB ascendcl PATHS "${ASCEND_CANN_PACKAGE_PATH}/lib64" NO_DEFAULT_PATH REQUIRED)
 
 add_library(replayssm_sd_mix_torch SHARED binding.cpp)
+if(REPLAYSSM_ROOFLINE_CALIBRATION)
+    target_compile_definitions(replayssm_sd_mix_torch PRIVATE REPLAYSSM_ROOFLINE_CALIBRATION)
+endif()
 target_compile_definitions(replayssm_sd_mix_torch PRIVATE REPLAYSSM_VERIFY_MAX_TOKENS=${REPLAYSSM_VERIFY_MAX_TOKENS})
 add_dependencies(replayssm_sd_mix_torch replayssm_sd_mix_kernel)
 target_include_directories(replayssm_sd_mix_torch PRIVATE

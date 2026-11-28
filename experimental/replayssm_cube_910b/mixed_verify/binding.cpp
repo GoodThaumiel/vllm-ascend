@@ -8,9 +8,25 @@
 #include <cstdint>
 #include <optional>
 #include "aclrtlaunch_replayssm_sd_verify_mix_910b.h"
+#ifdef REPLAYSSM_ROOFLINE_CALIBRATION
+#include "aclrtlaunch_replayssm_roofline_vector.h"
+#endif
 
 namespace {
 constexpr int64_t kMaxTokens = REPLAYSSM_VERIFY_MAX_TOKENS;
+
+#ifdef REPLAYSSM_ROOFLINE_CALIBRATION
+void MeasureVector(const at::Tensor& out, int64_t repeats) {
+  TORCH_CHECK(out.device().is_privateuseone() && out.is_contiguous() &&
+                  out.scalar_type() == at::kFloat && out.sizes() == at::IntArrayRef({40, 4, 4096}),
+              "Vector calibration requires contiguous FP32 output [40, 4, 4096]");
+  TORCH_CHECK(repeats >= 1 && repeats <= 512, "Vector calibration repeats must be 1..512");
+  const c10_npu::OptionalNPUGuard guard(out.device());
+  auto stream = c10_npu::getCurrentNPUStream().stream();
+  const auto rc = aclrtlaunch_replayssm_roofline_vector(40, stream, out.data_ptr(), static_cast<uint32_t>(repeats));
+  TORCH_CHECK(rc == ACL_SUCCESS, "Vector calibration launch failed: ", rc);
+}
+#endif
 
 void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& g, const at::Tensor& beta, const at::Tensor& checkpoint,
@@ -110,7 +126,13 @@ TORCH_LIBRARY(replayssm_mix_910b, m) {
         "Tensor positions, Tensor bases, Tensor lengths, Tensor(d!) out, Tensor(e!) status, "
         "Tensor zeros, Tensor(f!) scratch, int cores, bool packed_panel=False, "
         "bool suffix_history=False, bool bulk_qkv=False, bool balance_heads=False, int aiv_ablation=0, Tensor? flush=None, Tensor? token_offsets=None) -> ()");
+#ifdef REPLAYSSM_ROOFLINE_CALIBRATION
+  m.def("roofline_vector_(Tensor(a!) out, int repeats) -> ()");
+#endif
 }
 TORCH_LIBRARY_IMPL(replayssm_mix_910b, PrivateUse1, m) {
   m.impl("verify_", &Verify);
+#ifdef REPLAYSSM_ROOFLINE_CALIBRATION
+  m.impl("roofline_vector_", &MeasureVector);
+#endif
 }
