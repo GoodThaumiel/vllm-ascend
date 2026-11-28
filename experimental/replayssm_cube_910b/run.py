@@ -860,8 +860,9 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--suite", choices=("all", "vector", "mixed"), default="all")
     ap.add_argument("--geometry", choices=("27b", "9b"), default="27b")
+    ap.add_argument("--tp", type=int, choices=(1, 2, 4), help="Tensor-parallel geometry represented by this rank")
     ap.add_argument("--batches", type=batches)
-    ap.add_argument("--length", type=int, choices=(1, 2, 3, 4, 6, 8), default=4)
+    ap.add_argument("--length", type=int, choices=range(1, 9), default=4)
     ap.add_argument("--pos", type=int, choices=range(17), default=15)
     ap.add_argument("--base", type=int, choices=range(32), default=31)
     ap.add_argument("--flush", choices=("none", "mixed", "full"), default="full")
@@ -907,6 +908,9 @@ def parse_args(argv=None):
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args(argv)
+    args.tp = args.tp or (4 if args.geometry == "27b" else 1)
+    if args.geometry == "27b" and args.tp not in (2, 4) or args.geometry == "9b" and args.tp != 1:
+        ap.error("expected 27B TP2/TP4 or 9B TP1")
     if args.iterations < 1 or args.mixed_check_repeats < 1:
         ap.error("iterations and mixed check repeats must be positive")
     vector_only = args.suite == "vector" or (args.geometry == "9b" and args.suite == "all")
@@ -917,10 +921,10 @@ def parse_args(argv=None):
     args.batches = args.batches or (DEFAULT_BATCHES if defaults == PATHS else batches("all"))
     args.path = args.path or defaults
     if args.length > 4 and set(args.path) - {"native", MIXED_FUSED_FOLD_PATH, MIXED_COLUMN_RECURRENCE_PATH}:
-        ap.error("six/eight-token windows require --path native, mixed_fused_fold or mixed_column_recurrence")
+        ap.error("windows above four tokens require --path native, mixed_fused_fold or mixed_column_recurrence")
     if args.flush_count is not None and not 0 <= args.flush_count <= min(args.batches):
         ap.error("flush-count must fit the smallest requested batch")
-    if (args.suite != "all" or args.geometry == "9b") and any(path in CUBE_PATHS for path in args.path):
+    if (args.suite != "all" or args.tp != 4) and any(path in CUBE_PATHS for path in args.path):
         ap.error("the PyTorch Cube demo uses the 27B TP4 all suite")
     if any(path in ALL_MIXED_PATHS for path in args.path) and not args.mixed_library:
         ap.error("mixed paths require --mixed-library")
@@ -951,7 +955,6 @@ def parse_args(argv=None):
         ap.error("GDN stack supports 1..48 layers; choose native and/or paired Ascend C paths")
     if len(set(args.path)) != len(args.path):
         ap.error("paths must be unique")
-    args.tp = 4 if args.geometry == "27b" else 1
     return args
 
 
@@ -985,7 +988,7 @@ def main():
         mixed_ops = torch.ops.replayssm_mix_910b
         max_tokens = mixed_ops.max_tokens() if hasattr(mixed_ops, "max_tokens") else 4
         if max_tokens != (8 if args.length > 4 else 4):
-            raise ValueError("Build the mixed library with REPLAYSSM_VERIFY_MAX_TOKENS=8 for six/eight-token windows")
+            raise ValueError("Build the mixed library with REPLAYSSM_VERIFY_MAX_TOKENS=8 for windows above four tokens")
         report.update(
             mixed_library=str(mixed_library),
             mixed_library_sha256=hashlib.sha256(mixed_library.read_bytes()).hexdigest(),

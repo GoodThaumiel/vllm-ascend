@@ -29,12 +29,12 @@ def make_case(
     window: int = MAX_TOKENS,
 ) -> dict[str, torch.Tensor]:
     if (
-        (geometry, tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2))
+        (geometry, tp) not in (("27b", 2), ("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2))
         or batch < 1
         or ring_len not in (16, 32, 64)
     ):
         raise ValueError("Invalid TP, batch, or ring length")
-    if window not in (4, 6, 8) or not 0 <= position <= MAX_HISTORY or not 1 <= length <= window:
+    if not 4 <= window <= 8 or not 0 <= position <= MAX_HISTORY or not 1 <= length <= window:
         raise ValueError("Invalid history position or verify length")
     if position + length > ring_len or not 0 <= base < ring_len:
         raise ValueError("This pilot requires the verify window to fit the physical ring")
