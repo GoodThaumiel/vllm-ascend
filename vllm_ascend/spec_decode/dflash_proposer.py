@@ -162,6 +162,11 @@ class AscendDflashProposer(AscendEagleProposer):
         self._per_group_context_slot_mapping_buffers = {
             gid: torch.full_like(self._context_slot_mapping_buffers, -1) for gid in self._dflash_block_sizes
         }
+        # _run_merged_draft captures the context cache writes as well as the
+        # draft forward. Bind the layer mapping before its first capture.
+        self._context_slot_mapping_buffers = [
+            self._per_group_context_slot_mapping_buffers[gid] for gid in self._dflash_layer_gids
+        ]
 
     def set_per_group_attn_metadata(self, gid, block_table, slot_mapping) -> None:
         if gid in self._dflash_block_sizes:
@@ -231,9 +236,6 @@ class AscendDflashProposer(AscendEagleProposer):
                 )
                 for gid, block_size in self._dflash_block_sizes.items()
             ]
-            self._context_slot_mapping_buffers = [
-                self._per_group_context_slot_mapping_buffers[gid] for gid in self._dflash_layer_gids
-            ]
             query_slots = self._per_group_query_slot_mapping_buffers[self.kv_cache_gid]
         else:
             query_slots = self._slot_mapping_buffer
@@ -299,6 +301,14 @@ class AscendDflashProposer(AscendEagleProposer):
         cad.attn_state = AscendAttentionState.ChunkedPrefill
 
         return num_query_total, token_indices_to_sample, cad, None
+
+    def _pad_draft_buffers(self, num_actual_tokens: int, num_input_tokens: int) -> None:
+        super()._pad_draft_buffers(num_actual_tokens, num_input_tokens)
+        if self.mixed_dflash_attention and num_input_tokens > self._dflash_num_context:
+            # The captured context scatter traverses num_input_tokens slots.
+            # Shorter actual target windows must leave the graph tail masked.
+            for slots in self._per_group_context_slot_mapping_buffers.values():
+                slots[self._dflash_num_context : num_input_tokens].fill_(-1)
 
     def _clear_dummy_slot_mappings(self) -> None:
         self._slot_mapping_buffer.fill_(-1)
