@@ -149,6 +149,24 @@ At C8, Native / Replay acceptance was 85.23% / 84.74% on GSM8K,
 JSON. Both modes returned parseable JSON for all 16 samples. Artifacts
 are `dflash-27b-native-k4.nq1DX5` and `dflash-27b-replay-k4.Z0Z9ZN`.
 
+### 27B TP2, DFlash2 K6
+
+Both modes at `6b02f37` passed the same six cases and independently
+logged FULL target and draft replay. Graph shapes were 7/28/56/112/224
+and the Replay logical threshold was 23. No per-row flush trace was
+collected. One run per mode.
+
+| Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---|---:|---:|---:|---:|
+| 1 | 49.40 | 44.91 | 18.77 | 20.70 |
+| 8 | 236.02 | 233.67 | 29.18 | 29.84 |
+| 32 | 564.40 | 575.12 | 48.85 | 44.66 |
+
+At C8, Native / Replay acceptance was 77.66% / 77.76% on GSM8K,
+27.15% / 27.09% on text and 44.18% / 43.41% on prompt-only JSON.
+Both modes returned 16/16 parseable JSON responses. Artifacts are
+`dflash-27b-native-k6.OWGdG1` and `dflash-27b-replay-k6.jlJGBl`.
+
 ### 9B TP1 mixed attention preflight
 
 The 9B draft has five sliding layers with a 4096-token window and one full
@@ -192,3 +210,26 @@ context slots at replay. The first retry, `dflash-9b-replay-k7.cJlvH4`,
 stopped before ACLGraph capture in a reused npugraph_ex AOT cache with
 an argument arity mismatch. The clean-cache retry uses a cache root
 specific to source version, mode and K.
+
+### 9B TP1, DFlash K7 after binding context slots before capture
+
+Replay at `84d8ae3` used die 13, max-seqs 64, FULL graph sizes
+8/32/64/128/512, the same mixed library and a 24-entry logical threshold.
+The run independently logged target and draft FULL replay. The C8
+scatter failure did not recur in the suite. C1 acceptance on the
+same two requests recovered to 152/749 (20.29%). No per-row flush
+trace was collected. The MRv1 Native rerun uses the same code and
+serve settings on the same die.
+
+| Concurrency | Passed | Replay tok/s | Replay TPOT p50 (ms) |
+|---|---:|---:|---:|
+| 1 | 2/2 | 32.95 | 29.35 |
+| 8 | 16/16 | 220.52 | 33.66 |
+| 32 | 32/32 | 499.97 | 57.75 |
+| 64 | 64/64 | 859.04 | 66.04 |
+
+At C8, Replay accepted 8172/11795 (69.28%) for 32 GSM8K requests,
+3585/17920 (20.01%) for 32 general-text requests and 743/1974 (37.64%)
+for 16 prompt-only JSON requests. All requests completed and all
+16 JSON outputs parsed. Schema-constrained output remains a separate
+test. The verified Replay artifact is `dflash-9b-replay-k7.El0FDU`.
