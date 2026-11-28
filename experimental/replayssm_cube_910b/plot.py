@@ -179,8 +179,10 @@ def main():
         ax.grid(True, which="both", alpha=0.2)
         ax.legend(fontsize=8)
     config = report["config"]
+    tp = config.get("tp", 4)
+    geometry = f"TP{tp} rank geometry" if tp > 1 else "TP1"
     fig.suptitle(
-        f"{report.get('soc', 'Ascend')} Qwen3.5-{config.get('geometry', '27b').upper()} TP{config.get('tp', 4)} | "
+        f"{report.get('soc', 'Ascend')} Qwen3.5-{config.get('geometry', '27b').upper()} {geometry} | "
         f"T={config['length']} pos={config['pos']} flush={config['flush']} | reference: {args.roof_source}"
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)

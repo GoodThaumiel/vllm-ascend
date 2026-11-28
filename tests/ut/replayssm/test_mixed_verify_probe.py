@@ -94,6 +94,13 @@ class TestMixedVerifyProbe(unittest.TestCase):
         actual = last_projections(case, 20, balanced=True)
         torch.testing.assert_close(actual[[0, 1, 19]], expected)
 
+    def test_expanded_grid_uses_one_workspace_entry_per_head_at_batch_one(self):
+        case = make_case(geometry="27b", tp=4, batch=1, length=8, window=8)
+        heads = torch.arange(12)
+        expected = reference_projections(case, torch.zeros_like(heads), heads, panel_tokens=8)
+        actual = last_projections(case, 12, balanced=True, panel_tokens=8)
+        torch.testing.assert_close(actual, expected)
+
     def test_two_tiles_projected_recurrence_matches_dense(self):
         # Simulate the 128x16 FP32 handoff to two V64 consumers. Exercise both
         # head-sharing ratios, a wrapped committed ring and padded K/Q columns.
