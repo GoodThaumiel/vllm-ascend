@@ -23,7 +23,7 @@ from experimental.replayssm_cube_910b.projections import (  # noqa: E402
     panel,
     verify,
 )
-from experimental.replayssm_sd_ascendc.lab import make_case  # noqa: E402
+from experimental.replayssm_sd_ascendc.lab import make_case, recurrent_golden  # noqa: E402
 from scripts.replayssm.profile_sd_operator_compare import (  # noqa: E402
     native_state_page,
     package_versions,
@@ -140,37 +140,44 @@ def measure_eager(call, reset, iterations):
     }
 
 
-def last_projections(case, blocks, balanced=False):
+def last_projections(case, blocks, balanced=False, panel_tokens=4):
     """Reference the last head produced in each AIC's reusable workspace slot."""
     batch, _, hk, _ = case["k"].shape
     hv = case["v"].shape[2]
     if balanced:
         last = (torch.arange(1, blocks + 1) * (batch * hv)) // blocks - 1
-        return reference_projections(case, last // hv, last % hv)
+        return reference_projections(case, last // hv, last % hv, panel_tokens)
     group = hv // hk
     first = torch.arange(blocks)
     tasks = first + ((batch * hk - 1 - first) // blocks) * blocks
     rows, keys = tasks // hk, tasks % hk
-    return reference_projections(case, rows, keys * group + group - 1)
+    return reference_projections(case, rows, keys * group + group - 1, panel_tokens)
 
 
-def reference_projections(case, rows, heads):
+def reference_projections(case, rows, heads, panel_tokens=4):
     """Build FP32 C tiles for the requested (row, V head) pairs."""
     group = case["v"].shape[2] // case["k"].shape[2]
     keys = heads // group
     checkpoint = case["checkpoint"][rows + 1, heads].float()
     rhs = torch.zeros((rows.numel(), 128, 16), dtype=torch.float32)
-    rhs[:, :, :4] = case["k"][rows, :, keys].transpose(1, 2)
-    rhs[:, :, 4:8] = case["q"][rows, :, keys].transpose(1, 2)
+    width = case["k"].size(1)
+    rhs[:, :, :width] = case["k"][rows, :, keys].transpose(1, 2)
+    rhs[:, :, panel_tokens : panel_tokens + width] = case["q"][rows, :, keys].transpose(1, 2)
     return torch.bmm(checkpoint, rhs)
 
 
-def projection_error_summary(actual, expected):
+def projection_error_summary(actual, expected, panel_tokens=4):
     """Locate bad lanes in each workspace tile and count zeros and nonfinite values."""
     bad = ~torch.isclose(actual, expected, atol=PROJECTION_ATOL, rtol=PROJECTION_RTOL)
     summary = {}
-    for part, cols in (("k", slice(0, 4)), ("q", slice(4, 8)), ("padding", slice(8, 16))):
+    for part, cols in (
+        ("k", slice(0, panel_tokens)),
+        ("q", slice(panel_tokens, 2 * panel_tokens)),
+        ("padding", slice(2 * panel_tokens, 16)),
+    ):
         errors = bad[..., cols]
+        if errors.size(-1) == 0:
+            continue
         values = actual[..., cols]
         tiles = errors.reshape(-1, 2, 64, errors.size(-1)).sum(dim=(2, 3))
         indices = tiles.nonzero().tolist()
@@ -227,6 +234,7 @@ def trial(args, b, dev):
     from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_compact, replayssm_sd_verify
 
     p, t, base = args.pos, args.length, args.base
+    wide = t > 4
     active = {"none": 0, "mixed": max(1, b // 8), "full": b}[args.flush]
     if args.flush_count is not None:
         active = args.flush_count
@@ -241,6 +249,7 @@ def trial(args, b, dev):
         base=base,
         tile_v=128,
         seed=42,
+        window=t if wide else 4,
     )
     cpu["positions"].fill_(nonflush_pos)
     cpu["positions"][flush_rows] = p
@@ -328,18 +337,25 @@ def trial(args, b, dev):
 
     # Native materializes the committed ring in its initial state. Replay reads
     # the same history directly and writes its candidates into disjoint slots.
-    vector()
-    if c["status"].cpu().any():
-        raise RuntimeError("V20 returned nonzero status")
-    expected_out = c["out"][:, :t].float().cpu()
+    wide_golden = recurrent_golden(cpu) if wide else None
+    if wide_golden is None:
+        vector()
+        if c["status"].cpu().any():
+            raise RuntimeError("V20 returned nonzero status")
+        expected_out = c["out"][:, :t].float().cpu()
+        fold()
+        if status.cpu().any():
+            raise RuntimeError("Compact V1 returned nonzero status")
+        checkpoint = c["checkpoint"].cpu()
+    else:
+        expected_out = wide_golden["out"].float()
+        checkpoint = initial.cpu()
+        if p and active:
+            checkpoint[flush_rows + 5] = start_cpu[flush_rows]
     first.copy_(start_state)
     y_native = native().view_as(expected_out).float().cpu()
     torch.testing.assert_close(y_native, expected_out, atol=0.01, rtol=0.03)
-    errors = {"native_vs_v20_out": (y_native - expected_out).abs().max().item()}
-    fold()
-    if status.cpu().any():
-        raise RuntimeError("Compact V1 returned nonzero status")
-    checkpoint = c["checkpoint"].cpu()
+    errors = {"native_vs_dense_out" if wide else "native_vs_v20_out": (y_native - expected_out).abs().max().item()}
     unchanged = torch.ones(b + 1, dtype=torch.bool)
     if p and active:
         changed = flush_rows + 1
@@ -471,7 +487,10 @@ def trial(args, b, dev):
     compare_mixed = any(path in ALL_MIXED_PATHS for path in args.path)
     if compare_demo or compare_mixed or any(path in FUSED_PATHS for path in args.path):
         # Poison destinations so a missing Cube candidate write cannot inherit V20 results.
-        golden = {n: c[n].cpu() for n in ("out", "d_cache", "k_cache", "g_cache")}
+        golden = {
+            n: (wide_golden[n] if wide_golden is not None else c[n].cpu())
+            for n in ("out", "d_cache", "k_cache", "g_cache")
+        }
         cache_rows = torch.arange(1, b + 1, device=dev, dtype=torch.int64)
         candidate_records = [(c["positions"].long() + base + s) & 31 for s in range(t)]
 
@@ -519,12 +538,14 @@ def trial(args, b, dev):
     if compare_mixed:
         blocks = min(b * key_heads, args.mixed_cores)
         zeros = torch.zeros((16, 128), dtype=torch.bfloat16, device=dev)
+        panel_tokens = 8 if wide else 4
+        wide_offsets = torch.arange(b + 1, device=dev, dtype=torch.int32) * t if wide else None
         if args.mixed_workspace == "per-head":
             heads = torch.arange(value_heads).repeat(b)
             row_ids = torch.arange(b).repeat_interleave(value_heads)
-            expected_projection = reference_projections(cpu, row_ids, heads)
+            expected_projection = reference_projections(cpu, row_ids, heads, panel_tokens)
         else:
-            expected_projection = last_projections(cpu, blocks, balanced=args.mixed_balanced)
+            expected_projection = last_projections(cpu, blocks, balanced=args.mixed_balanced, panel_tokens=panel_tokens)
         scratch = torch.full(expected_projection.shape, float("nan"), dtype=torch.float32, device=dev)
         dump = args.output.with_suffix(".mismatch.pt") if args.mixed_dump else None
 
@@ -540,7 +561,7 @@ def trial(args, b, dev):
                     dump=dump,
                 )
             except AssertionError as exc:
-                summary = projection_error_summary(actual, expected_projection)
+                summary = projection_error_summary(actual, expected_projection, panel_tokens)
                 raise AssertionError(f"{exc}\nProjection mismatch by column group: {json.dumps(summary)}") from None
 
         def verify_mixed(packed=False, cache=c, ablation=0):
@@ -555,19 +576,26 @@ def trial(args, b, dev):
                 panel_options = (True, False, True, args.mixed_balanced, ablation)
                 if ablation >= MIXED_AIV_ABLATIONS[MIXED_FUSED_FOLD_PATH]:
                     panel_options += (flush,)
+            qkv = [cache[n] for n in ("q", "k", "v", "g", "beta")]
+            output = cache["out"]
+            if wide:
+                qkv = [tensor.flatten(0, 1) for tensor in qkv]
+                output = output.flatten(0, 1)
             torch.ops.replayssm_mix_910b.verify_(
-                *(cache[n] for n in ("q", "k", "v", "g", "beta", "checkpoint", "d_cache", "k_cache", "g_cache")),
+                *qkv,
+                *(cache[n] for n in ("checkpoint", "d_cache", "k_cache", "g_cache")),
                 slots,
                 ring,
                 c["positions"],
                 c["bases"],
                 c["lengths"],
-                c["out"],
+                output,
                 c["status"],
                 zeros,
                 scratch,
                 args.mixed_cores,
                 *panel_options,
+                *((wide_offsets,) if wide else ()),
             )
 
         mixed_checks = [
@@ -733,7 +761,7 @@ def trial(args, b, dev):
                 aiv_blocks=2 * blocks,
                 workspace_bytes=scratch.nbytes,
                 workspace_layout=args.mixed_workspace,
-                aiv_panel_cols=8 if path in PACKED_PANEL_PATHS else 16,
+                aiv_panel_cols=8 if path in PACKED_PANEL_PATHS and not wide else 16,
                 aiv_history_suffix=(
                     path in ("mixed_history_panel", "mixed_suffix_reference", *IN_KERNEL_FOLD_PATHS)
                     or (path not in MIXED_AIV_ABLATIONS and path in PACKED_PANEL_PATHS and args.mixed_suffix)
@@ -817,7 +845,7 @@ def parse_args(argv=None):
     ap.add_argument("--suite", choices=("all", "vector", "mixed"), default="all")
     ap.add_argument("--geometry", choices=("27b", "9b"), default="27b")
     ap.add_argument("--batches", type=batches)
-    ap.add_argument("--length", type=int, choices=range(1, 5), default=4)
+    ap.add_argument("--length", type=int, choices=(1, 2, 3, 4, 6, 8), default=4)
     ap.add_argument("--pos", type=int, choices=range(17), default=15)
     ap.add_argument("--base", type=int, choices=range(32), default=31)
     ap.add_argument("--flush", choices=("none", "mixed", "full"), default="full")
@@ -871,6 +899,8 @@ def parse_args(argv=None):
         defaults = VECTOR_PATHS if vector_only else PATHS
     args.batches = args.batches or (DEFAULT_BATCHES if defaults == PATHS else batches("all"))
     args.path = args.path or defaults
+    if args.length > 4 and set(args.path) - {"native", MIXED_FUSED_FOLD_PATH}:
+        ap.error("six/eight-token windows require --path native and/or mixed_fused_fold")
     if args.flush_count is not None and not 0 <= args.flush_count <= min(args.batches):
         ap.error("flush-count must fit the smallest requested batch")
     if (args.suite != "all" or args.geometry == "9b") and any(path in CUBE_PATHS for path in args.path):
@@ -881,7 +911,10 @@ def parse_args(argv=None):
         ap.error("mixed-suffix and mixed-qkv require a packed AIV path")
     if args.mixed_balanced and not any(path in ALL_MIXED_PATHS for path in args.path):
         ap.error("mixed-balanced requires a mixed kernel path")
-    if any(path in COMPACT_PATHS for path in args.path) and not args.compact_library:
+    if (
+        any(path in COMPACT_PATHS and path not in IN_KERNEL_FOLD_PATHS for path in args.path)
+        and not args.compact_library
+    ):
         ap.error("Compact candidate paths require --compact-library")
     if any(path in (*WIDE_PATHS, *FUSED_PATHS) for path in args.path) and not args.verify_library:
         ap.error("V23 and V24 paths require --verify-library")
@@ -930,6 +963,10 @@ def main():
     if any(path in ALL_MIXED_PATHS for path in args.path):
         mixed_library = args.mixed_library.resolve(strict=True)
         torch.ops.load_library(str(mixed_library))
+        mixed_ops = torch.ops.replayssm_mix_910b
+        max_tokens = mixed_ops.max_tokens() if hasattr(mixed_ops, "max_tokens") else 4
+        if max_tokens != (8 if args.length > 4 else 4):
+            raise ValueError("Build the mixed library with REPLAYSSM_VERIFY_MAX_TOKENS=8 for six/eight-token windows")
         report.update(
             mixed_library=str(mixed_library),
             mixed_library_sha256=hashlib.sha256(mixed_library.read_bytes()).hexdigest(),

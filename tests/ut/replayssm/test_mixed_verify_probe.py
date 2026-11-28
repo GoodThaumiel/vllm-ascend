@@ -28,6 +28,17 @@ class TestMixedVerifyProbe(unittest.TestCase):
             rhs = torch.cat((case["k"][row, :, head // 2], case["q"][row, :, head // 2])).float()
             torch.testing.assert_close(all_projections[index, :, :8], case["checkpoint"][row + 1, head].float() @ rhs.T)
 
+    def test_wide_probe_places_q_after_eight_k_columns(self):
+        for window in (6, 8):
+            with self.subTest(window=window):
+                case = make_case(batch=1, length=window, window=window)
+                state = case["checkpoint"][1, 0].float()
+                projected = reference_projections(case, torch.tensor([0]), torch.tensor([0]), panel_tokens=8)[0]
+                torch.testing.assert_close(projected[:, :window], state @ case["k"][0, :, 0].float().T)
+                torch.testing.assert_close(projected[:, 8 : 8 + window], state @ case["q"][0, :, 0].float().T)
+                self.assertEqual(projected[:, window:8].count_nonzero().item(), 0)
+                self.assertEqual(projected[:, 8 + window :].count_nonzero().item(), 0)
+
     def test_failure_names_tensor_and_preserves_values(self):
         actual, expected = torch.tensor([0.0, 0.0227]), torch.zeros(2)
         with TemporaryDirectory() as directory:
