@@ -1483,7 +1483,40 @@ Replay 均用 mixed verify + fused compact L8，
 原始目录为 Blue2 `horizon-die13.Qozz2D/textvqa-graph-baseline.zNPSSg`
 和 `horizon-die13.Qozz2D/textvqa-graph-b144.rRfKi3`。
 
-从每组压测前后的 Prometheus `_sum` 和 `_count` 差分计算，
+###### 同脚本三路复跑与在线 HBM
+
+在同一 Blue2 die 13 顺序复跑 Native、Replay 原图档、Replay 加
+144 行。三路使用 `e2a0931f0a9a2b830c6e035c699827ff25683756`、同一
+扩展、权重和 256 条 TextVQA 请求。都开启 `--cudagraph-metrics`，
+关闭 target Event 同步和内存探针。模型、窗口、图档、调度预算和
+精度同上。三路均完成 256/256，逐条输入和输出 token 数一致。
+每条请求的输出长度为 400。峰值 running 包含 prefill。
+
+| 路径 | 输出 token/s | 峰值 running | TPOT p50/p90/p99 (ms) | 抢占 | C256 进程 HBM 峰值 (MiB) | 图显存 (GiB) | KV 容量 (token) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Native | 637.97 | 94 | 127.72/145.98/171.95 | 13 | 52,588 | 0.47 | 418,176 |
+| Replay 原图档 | 658.44 | 142 | 183.28/202.87/239.06 | 9 | 52,799 | 0.47 | 615,628 |
+| Replay 加 144 行 | 671.57 | 142 | 177.27/197.86/224.12 | 6 | 52,776 | 0.48 | 615,628 |
+
+HBM 峰值为 `npu-smi info -t proc-mem` 在 C256 时间窗内各服务
+进程显存之和的采样最大值，每组采到 25–27 次，整 die 的 HBM
+峰值用量均读到 84%。两组 Replay 的 torch 已分配/保留量仍为
+48.92/49.38 GiB，KV 内存预算为 26.42 GiB。额外图档的捕获显存
+在日志显示精度下增加 0.01 GiB。进程峰值差异为 23 MiB，
+采样间隔约 6 秒，无法据此判定额外图档降低实际峰值 HBM。
+
+原图档有 40 步在 513–576 个有效 token 时使用 768-token 图，
+新增图档有 45 步落入 576-token 图。每个被重映射的 step 少处理
+192 个填充 token。复跑中 TPOT p50 降 6.02 ms，约为同轮
+原图档相对 Native 差距 55.57 ms 的 10.8%，吞吐升 2.0%。上轮
+同一 A/B 的 TPOT p50 增 0.83 ms，吞吐升 0.45%。两轮均显示
+明显分流，TPOT 回收幅度未稳定复现。复跑中抢占和草稿接受率
+（81.18% / 82.04%）也有变化。这里衡量的是加一档图的端到端
+净效应，尚未量出固定实际 batch 下的单步图时差或全部图填充
+的贡献。三路结束后逻辑 die 13 无残留。原始日志、请求 JSON
+和 HBM 样本位于 Blue2 `horizon-die13.Qozz2D/textvqa-b144-repeat.uKmPGz`。
+
+从首轮 A/B 的 Prometheus `_sum` 和 `_count` 差分计算，
 两组 Replay 的服务端平均 decode 阶段时长为 61.17 / 61.12 s
 （各 256 条），平均 prefill 为 1.375 / 1.376 s。无采集矩阵的
 上限 80 对照中，Native / Replay 的平均 decode 阶段为
@@ -1601,3 +1634,36 @@ p90 仅 B2 更高（+12.1%）。V25 在全 flush 仍慢，证据
 候选递推开销。真实 96 上限服务的结果见上节，两种测量
 口径不能互换。原始目录为 Blue2
 `horizon-die13.Qozz2D/mtp3-low-batch.ifTJq0`。
+
+##### MTP3 候选列递推消融
+
+`b0efb19`，Blue2 逻辑 die 13、Ascend910_9362、CANN 9.2.1、
+torch-npu 2.10.0.post7、vLLM 0.30.0+empty。9B TP1、BF16
+checkpoint、FP16 D/K、FP32 G。沿用整组轮转和 V64。ablation 7
+在 T4 构建复用 8 列 AIV panel，转为连续候选列，只缩放或更新
+仍有用的投影列。ablation 4 和 7 用同一库。绑定与 kernel 的
+SHA-256 为
+`6e7204e98e439d8a547b6639b5ea9893af87021f83d4bee71aa915d0001f9700`
+及 `8aaa16ace992fb6765ba6eeaa1fdd49b33dafb55c64d12dfad2220952e9be7bf`。
+
+B1 的 L8 连续 120 步通过（接受数 3/1/4/2，gate 上限 .002，
+BF16 beta）；B4/B8 的 ragged 和 padded、半数 flush 通过，
+包括改 offset 的图重放、无效跨度保护和缓存一致性。六组单层
+性能报告均通过。T1–3 的 P4 全 flush 每档测 6 个 batch、
+75 次回放。T4 对照上一节三类 flush 和 20 个 batch，每组
+100 次回放。两类计时均先热身两次。
+
+| T4 场景 | Native p50 (µs) | Mixed 基线 p50 (µs) | 候选列 p50 (µs) |
+|---|---:|---:|---:|
+| B2 P4，全 flush | 54.28 | 67.96 | 66.06 |
+| B96 P0，无 flush | 1404.49 | 689.92 | 652.62 |
+| B96 P4，全 flush | 1404.86 | 1315.36 | 1273.60 |
+| B96 P4/P2，12 行 flush | 1403.10 | 919.45 | 877.76 |
+
+相对原 Mixed，T4 的三类单层 p50 中位改善 3.53% / 2.71% /
+4.02%。全 flush 的 B1/3/4 等小批仍有回退，B2 虽略快于
+原 Mixed，仍慢于 Native 21.7%。T1/2 全 flush 较原 Mixed
+的 p50 中位变化小于 0.2%，T3 改善 1.72%。结果表明
+只改候选递推仍无法消除小批全 flush 回退。服务端 T4
+配置未参与本次实验。原始报告位于 Blue2
+`horizon-die13.Qozz2D/t4cols-results.MXs3QI`。die 13 已空闲。
