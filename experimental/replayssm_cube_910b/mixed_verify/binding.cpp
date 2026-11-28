@@ -10,6 +10,8 @@
 #include "aclrtlaunch_replayssm_sd_verify_mix_910b.h"
 
 namespace {
+constexpr int64_t kMaxTokens = REPLAYSSM_VERIFY_MAX_TOKENS;
+
 void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& g, const at::Tensor& beta, const at::Tensor& checkpoint,
             const at::Tensor& d, const at::Tensor& keys, const at::Tensor& gates,
@@ -25,8 +27,10 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(slots.dim() == 1, "slots must be rank-1");
   const auto b = slots.size(0), hk = q.size(rank - 2), hv = v.size(rank - 2);
   const auto tokenCount = packedTokens ? q.size(0) : 0;
-  TORCH_CHECK(!packedTokens || (tokenCount > 0 && tokenCount <= b * 4),
-              "packed token count must be in 1..B*4");
+  TORCH_CHECK(!packedTokens || (tokenCount > 0 && tokenCount <= b * kMaxTokens),
+              "packed token count must be in 1..B*", kMaxTokens);
+  TORCH_CHECK(kMaxTokens == 4 || (packedTokens && aiv_ablation == 4),
+              "The eight-token build requires packed tokens and fused verify/compact");
   TORCH_CHECK(b >= 1 && b <= 256 && ((hk == 4 && hv == 12) || (hk == 16 && hv == 32)),
               "expected B1..256 and 27B TP4 or 9B TP1");
   TORCH_CHECK(cores >= 1 && cores <= 20, "cores must be 1..20 on 910B4");
@@ -51,9 +55,9 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     expect(g, {tokenCount, hv}, at::kFloat, "g");
     expect(*tokenOffsets, {b + 1}, at::kInt, "token offsets");
   } else {
-    expect(q, {b, 4, hk, 128}, at::kBFloat16, "q");
-    expect(v, {b, 4, hv, 128}, at::kBFloat16, "v");
-    expect(g, {b, 4, hv}, at::kFloat, "g");
+    expect(q, {b, kMaxTokens, hk, 128}, at::kBFloat16, "q");
+    expect(v, {b, kMaxTokens, hv, 128}, at::kBFloat16, "v");
+    expect(g, {b, kMaxTokens, hv}, at::kFloat, "g");
   }
   expect(k, q.sizes(), at::kBFloat16, "k");
   expect(out, v.sizes(), at::kBFloat16, "out");
@@ -100,6 +104,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
 }  // namespace
 
 TORCH_LIBRARY(replayssm_mix_910b, m) {
+  m.def("max_tokens() -> int", []() -> int64_t { return kMaxTokens; });
   m.def("verify_(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor(g!) checkpoint, "
         "Tensor(a!) d, Tensor(b!) keys, Tensor(c!) gates, Tensor slots, Tensor ring_slots, "
         "Tensor positions, Tensor bases, Tensor lengths, Tensor(d!) out, Tensor(e!) status, "

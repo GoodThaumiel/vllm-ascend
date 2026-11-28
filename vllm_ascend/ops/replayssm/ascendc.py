@@ -11,12 +11,15 @@ REPLAYSSM_SD_MIXED_CORES = 20
 
 
 @cache
-def load_replayssm_sd_mixed_library(path: str) -> None:
+def load_replayssm_sd_mixed_library(path: str) -> int:
     """Register the standalone 910B/910C mixed operator before graph capture."""
     library = Path(path).resolve(strict=True)
     torch.ops.load_library(str(library))
-    if not hasattr(torch.ops.replayssm_mix_910b, "verify_"):
+    mixed_ops = torch.ops.replayssm_mix_910b
+    if not hasattr(mixed_ops, "verify_"):
         raise RuntimeError(f"ReplaySSM mixed verify operator was not registered by {library}")
+    # Existing mixed libraries were built for MTP3 and lack this query.
+    return mixed_ops.max_tokens() if hasattr(mixed_ops, "max_tokens") else 4
 
 
 def replayssm_ar_step(

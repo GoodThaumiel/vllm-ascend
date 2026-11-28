@@ -36,31 +36,34 @@ class SDSequenceDiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(states), 4)
 
     def test_short_horizon_folds_only_previous_accepted_prefix(self) -> None:
-        pattern = [4, 1, 3, 2]
-        args = SimpleNamespace(
-            geometry="27b",
-            tp=4,
-            seed=7,
-            gate_max=0.04,
-            beta_native_precision=True,
-            accepted=pattern,
-            steps=16,
-            logical_limit=8,
-            atol=0.001,
-            rtol=0.03,
-        )
-        report = DIAG.run_cpu_reference(args)
+        for window in (4, 6, 8):
+            with self.subTest(window=window):
+                pattern = [window, 1, window - 1, 2]
+                args = SimpleNamespace(
+                    geometry="27b",
+                    tp=4,
+                    seed=7,
+                    gate_max=0.04,
+                    beta_native_precision=True,
+                    accepted=pattern,
+                    steps=16,
+                    window=window,
+                    logical_limit=2 * window,
+                    atol=0.001,
+                    rtol=0.03,
+                )
+                report = DIAG.run_cpu_reference(args)
 
-        self.assertEqual(report["status"], "REFERENCE_COMPLETED")
-        self.assertEqual(report["flush_count"], args.steps - 1)
-        self.assertEqual(report["max_pending_history"], 4)
-        accepted_before = 0
-        for step, row in enumerate(report["steps"]):
-            previous = pattern[(step - 1) % len(pattern)] if step else 0
-            self.assertEqual(row["position"], previous)
-            self.assertEqual(row["base"], (accepted_before - previous) % 32)
-            accepted_before += row["accepted"]
-        self.assertEqual(report["summary"]["output_vs_dense_fp64"]["steps_outside_tolerance"], 0)
+                self.assertEqual(report["status"], "REFERENCE_COMPLETED")
+                self.assertEqual(report["flush_count"], args.steps - 1)
+                self.assertEqual(report["max_pending_history"], window)
+                accepted_before = 0
+                for step, row in enumerate(report["steps"]):
+                    previous = pattern[(step - 1) % len(pattern)] if step else 0
+                    self.assertEqual(row["position"], previous)
+                    self.assertEqual(row["base"], (accepted_before - previous) % 32)
+                    accepted_before += row["accepted"]
+                self.assertEqual(report["summary"]["output_vs_dense_fp64"]["steps_outside_tolerance"], 0)
 
     def test_compare_reports_first_mismatch(self) -> None:
         result = DIAG.compare(torch.tensor([1.0, 2.1]), torch.tensor([1.0, 2.0]), atol=0.01, rtol=0)

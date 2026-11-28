@@ -52,8 +52,8 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
     def test_sd_rejects_unsupported_window_before_cache_allocation(self) -> None:
         with self.assertRaisesRegex(ValueError, "buffer_len=16"):
             CACHE.replayssm_sd_ring_len(32, 3)
-        for num_spec in (0, 4):
-            with self.assertRaisesRegex(ValueError, "MTP1/2/3"):
+        for num_spec in (0, 8):
+            with self.assertRaisesRegex(ValueError, "1-7 speculative tokens"):
                 CACHE.replayssm_sd_ring_len(16, num_spec)
         with self.assertRaisesRegex(ValueError, "query length"):
             CACHE.replayssm_sd_pack_indices(torch.tensor([1, 5]))
@@ -124,7 +124,7 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
 
     def test_sd_logical_limit_changes_cursor_without_resizing_ring(self) -> None:
         config = SimpleNamespace(cache_config=SimpleNamespace(replayssm_buffer_len=16), additional_config={})
-        for num_spec in (1, 2, 3):
+        for num_spec in (1, 2, 3, 5, 7):
             field = "replayssm_sd_logical_limit"
             config.additional_config[field] = None
             self.assertEqual(CACHE.replayssm_sd_logical_limit(config, num_spec), 17 + num_spec)

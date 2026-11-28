@@ -14,6 +14,7 @@ REPLAYSSM_AR_HEAD_DIM = 128
 REPLAYSSM_AR_TILE_V = 32
 REPLAYSSM_AR_CORES = 8
 REPLAYSSM_SD_MAX_TOKENS = 4
+REPLAYSSM_SD_MIXED_MAX_TOKENS = 8
 REPLAYSSM_SD_MAX_HISTORY = 16
 REPLAYSSM_SD_MAX_VALUE_HEADS = 32
 REPLAYSSM_SD_VERIFY_TILE_V = 128
@@ -118,8 +119,8 @@ def replayssm_gdn_enabled(vllm_config) -> bool:
 
 def replayssm_sd_ring_len(buffer_len: int, num_spec: int) -> int:
     max_tokens = num_spec + 1
-    if buffer_len != REPLAYSSM_SD_MAX_HISTORY or not 1 <= num_spec < REPLAYSSM_SD_MAX_TOKENS:
-        raise ValueError("Ascend ReplaySSM SD currently requires buffer_len=16 and MTP1/2/3")
+    if buffer_len != REPLAYSSM_SD_MAX_HISTORY or not 1 <= num_spec < REPLAYSSM_SD_MIXED_MAX_TOKENS:
+        raise ValueError("Ascend ReplaySSM SD ring requires buffer_len=16 and 1-7 speculative tokens")
     return 1 << (buffer_len + max_tokens - 1).bit_length()
 
 

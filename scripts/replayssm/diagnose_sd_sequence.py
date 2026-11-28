@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from experimental.replayssm_sd_ascendc.lab import (  # noqa: E402
+    MAX_HISTORY,
     clone_page_strided_case,
     make_case,
     recurrent_golden,
@@ -32,9 +33,7 @@ from experimental.replayssm_sd_compact_ascendc.lab import compact_golden  # noqa
 from experimental.replayssm_sd_cursor_ascendc import lab as cursor_lab  # noqa: E402
 
 HEAD_DIM = 128
-MAX_TOKENS = 4
 RING_LEN = 32
-LOGICAL_LIMIT = 20
 MIXED_CORES = 20
 MIXED_PANEL_WIDTH = 16
 MIXED_FUSED_FOLD = 4
@@ -58,11 +57,11 @@ def compare(actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: 
 def dense_window(
     state: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """FP64 accepted-state recurrence; returns four candidate outputs/states."""
+    """FP64 accepted-state recurrence returning all candidate outputs/states."""
     group = v.shape[1] // q.shape[1]
     states: list[torch.Tensor] = []
     outputs: list[torch.Tensor] = []
-    for token in range(MAX_TOKENS):
+    for token in range(q.size(0)):
         key = k[token].double().repeat_interleave(group, dim=0)
         query = q[token].double().repeat_interleave(group, dim=0) * (HEAD_DIM**-0.5)
         decayed = torch.exp(g[token].double())[:, None, None] * state
@@ -97,7 +96,8 @@ def initial_case(args):
         tp=args.tp,
         batch=1,
         position=0,
-        length=MAX_TOKENS,
+        length=args.window,
+        window=args.window,
         ring_len=RING_LEN,
         tile_v=HEAD_DIM,
         seed=args.seed,
@@ -109,7 +109,7 @@ def run_cpu_reference(args: argparse.Namespace) -> dict:
     # folding equations. Neither this path nor the dense references import torch_npu.
     torch.set_num_threads(1)
     case = initial_case(args)
-    cursor = cursor_lab.make_case(batch=1, slots=2, logical_limit=args.logical_limit)
+    cursor = cursor_lab.make_case(batch=1, slots=2, logical_limit=args.logical_limit, max_spec_len=args.window)
     cursor["do_reset"].fill_(1)
     cursor["accepted"].zero_()
     generator = torch.Generator().manual_seed(args.seed + 1)
@@ -118,12 +118,12 @@ def run_cpu_reference(args: argparse.Namespace) -> dict:
     rows = []
 
     for step in range(args.steps):
-        cursor = cursor_lab.reference_step(cursor, logical_limit=args.logical_limit)
+        cursor = cursor_lab.reference_step(cursor, logical_limit=args.logical_limit, max_spec_len=args.window)
         cursor["do_reset"].zero_()
         position = int(cursor["write_pos"][1])
         base = int(cursor["cache_base"][1])
         flush = int(cursor["is_flush"][1]) & cursor_lab.FLUSH_BIT
-        if int(cursor["status"][0]) or position + MAX_TOKENS > args.logical_limit:
+        if int(cursor["status"][0]) or position + args.window > args.logical_limit:
             raise RuntimeError(f"Invalid cursor at step {step}: position={position}")
         case["positions"].fill_(position)
         case["bases"].fill_(base)
@@ -169,6 +169,7 @@ def run_cpu_reference(args: argparse.Namespace) -> dict:
         "torch": torch.__version__,
         "geometry": args.geometry,
         "tp": args.tp,
+        "window": args.window,
         "seed": args.seed,
         "gate_max": args.gate_max,
         "accepted_pattern": args.accepted,
@@ -186,7 +187,12 @@ def run_cpu_reference(args: argparse.Namespace) -> dict:
 def run(args: argparse.Namespace) -> dict:
     import torch_npu  # noqa: F401
 
-    from vllm_ascend.ops.replayssm.ascendc import replayssm_sd_compact, replayssm_sd_cursor, replayssm_sd_verify
+    from vllm_ascend.ops.replayssm.ascendc import (
+        load_replayssm_sd_mixed_library,
+        replayssm_sd_compact,
+        replayssm_sd_cursor,
+        replayssm_sd_verify,
+    )
     from vllm_ascend.utils import enable_custom_op
 
     torch.set_num_threads(1)
@@ -203,13 +209,14 @@ def run(args: argparse.Namespace) -> dict:
         replay["compact_status"] = torch.empty(value_heads * 4, dtype=torch.int32, device=device)
     else:
         mixed_library = mixed_library.resolve(strict=True)
-        torch.ops.load_library(str(mixed_library))
+        if load_replayssm_sd_mixed_library(str(mixed_library)) < args.window:
+            raise ValueError(f"Mixed library does not support a {args.window}-token window")
         for name in ("d_cache", "k_cache", "g_cache"):
             replay[name] = initial[name].to(device)
         zeros = torch.zeros((MIXED_PANEL_WIDTH, HEAD_DIM), dtype=torch.bfloat16, device=device)
         blocks = min(MIXED_CORES, initial["q"].shape[2])
         workspace = torch.empty((blocks, HEAD_DIM, MIXED_PANEL_WIDTH), dtype=torch.float32, device=device)
-        offsets = torch.tensor([0, MAX_TOKENS], dtype=torch.int32, device=device)
+        offsets = torch.tensor([0, args.window], dtype=torch.int32, device=device)
     cursor = {
         "write_pos": torch.zeros(2, dtype=torch.int32, device=device),
         "cache_base": torch.zeros(2, dtype=torch.int32, device=device),
@@ -228,6 +235,7 @@ def run(args: argparse.Namespace) -> dict:
         "packages": {name: importlib.metadata.version(name) for name in ("torch", "torch-npu", "vllm", "vllm-ascend")},
         "geometry": args.geometry,
         "tp": args.tp,
+        "window": args.window,
         "seed": args.seed,
         "logical_limit": args.logical_limit,
         "gate_max": args.gate_max,
@@ -250,7 +258,7 @@ def run(args: argparse.Namespace) -> dict:
             cursor["do_reset"],
             cursor["status"],
             args.logical_limit,
-            MAX_TOKENS,
+            args.window,
             RING_LEN,
         )
         cursor["do_reset"].zero_()
@@ -262,7 +270,7 @@ def run(args: argparse.Namespace) -> dict:
         base = int(replay["bases"].cpu()[0])
         flush = int(replay["flush"].cpu()[0])
         cursor_status = int(cursor["status"].cpu()[0])
-        if position > 16 or position + MAX_TOKENS > args.logical_limit or cursor_status:
+        if position > MAX_HISTORY or position + args.window > args.logical_limit or cursor_status:
             raise RuntimeError(f"cursor invalid at step {step}: pos={position}, status={cursor_status}")
 
         candidates = candidate_inputs(args, initial, generator)
@@ -342,7 +350,7 @@ def run(args: argparse.Namespace) -> dict:
         torch.npu.synchronize()
         actual = replay["out"][0].cpu()
         accepted = args.accepted[step % len(args.accepted)]
-        candidate_physical = [(base + position + token) & (RING_LEN - 1) for token in range(MAX_TOKENS)]
+        candidate_physical = [(base + position + token) & (RING_LEN - 1) for token in range(args.window)]
         local_cache = {
             name: compare(
                 replay[name][1, :, candidate_physical].cpu(),
@@ -398,9 +406,8 @@ def main() -> int:
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--cpu-reference", action="store_true")
     backend.add_argument("--mixed-library", type=Path, help="Use the packed grouped-fused verify library")
-    parser.add_argument(
-        "--logical-limit", type=int, choices=range(2 * MAX_TOKENS, LOGICAL_LIMIT + 1), default=LOGICAL_LIMIT
-    )
+    parser.add_argument("--window", type=int, choices=(4, 6, 8), default=4)
+    parser.add_argument("--logical-limit", type=int)
     parser.add_argument("--gate-max", type=float, default=0.04)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--steps", type=int, default=24)
@@ -412,8 +419,15 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.accepted = [int(item) for item in args.accepted.split(",")]
-    if args.steps < 1 or not args.accepted or any(not 1 <= item <= 4 for item in args.accepted):
-        parser.error("steps must be positive and accepted counts must be 1..4")
+    if args.steps < 1 or not args.accepted or any(not 1 <= item <= args.window for item in args.accepted):
+        parser.error(f"steps must be positive and accepted counts must be 1..{args.window}")
+    max_limit = MAX_HISTORY + args.window
+    if args.logical_limit is None:
+        args.logical_limit = max_limit
+    if not 2 * args.window <= args.logical_limit <= max_limit:
+        parser.error(f"logical-limit must be in [{2 * args.window}, {max_limit}]")
+    if args.window > 4 and not (args.cpu_reference or args.mixed_library):
+        parser.error("windows above four require the wide mixed library or --cpu-reference")
     if args.tp not in GEOMETRIES[args.geometry] or (args.mixed_library and args.tp != GEOMETRIES[args.geometry][0]):
         parser.error("unsupported geometry/TP combination for this backend")
     if args.atol < 0 or args.rtol < 0 or not 0 <= args.gate_max <= 1:

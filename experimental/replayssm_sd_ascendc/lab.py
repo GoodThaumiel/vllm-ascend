@@ -10,7 +10,6 @@ import torch
 
 MAX_TOKENS = 4
 MAX_HISTORY = 16
-MAX_WINDOW = MAX_HISTORY + MAX_TOKENS
 HEAD_DIM = 128
 CACHE_NAMES = ("checkpoint", "d_cache", "k_cache", "g_cache")
 
@@ -27,6 +26,7 @@ def make_case(
     tile_v: int = 32,
     seed: int = 0,
     padding: bool = False,
+    window: int = MAX_TOKENS,
 ) -> dict[str, torch.Tensor]:
     if (
         (geometry, tp) not in (("27b", 4), ("27b", 8), ("9b", 1), ("9b", 2))
@@ -34,9 +34,9 @@ def make_case(
         or ring_len not in (16, 32, 64)
     ):
         raise ValueError("Invalid TP, batch, or ring length")
-    if not 0 <= position <= MAX_HISTORY or not 1 <= length <= MAX_TOKENS:
+    if window not in (4, 6, 8) or not 0 <= position <= MAX_HISTORY or not 1 <= length <= window:
         raise ValueError("Invalid history position or verify length")
-    if position + length > min(MAX_WINDOW, ring_len) or not 0 <= base < ring_len:
+    if position + length > ring_len or not 0 <= base < ring_len:
         raise ValueError("This pilot requires the verify window to fit the physical ring")
     if tile_v not in (16, 32, 64, 128):
         raise ValueError("Invalid tile_v")
@@ -48,11 +48,11 @@ def make_case(
         return (torch.randn(*shape, generator=generator) * multiplier).to(dtype)
 
     case = {
-        "q": rand(batch, MAX_TOKENS, heads, HEAD_DIM, dtype=torch.bfloat16, multiplier=0.09),
-        "k": rand(batch, MAX_TOKENS, heads, HEAD_DIM, dtype=torch.bfloat16, multiplier=0.09),
-        "v": rand(batch, MAX_TOKENS, value_heads, HEAD_DIM, dtype=torch.bfloat16, multiplier=0.09),
-        "g": -(torch.rand(batch, MAX_TOKENS, value_heads, generator=generator) * 0.04),
-        "beta": torch.rand(batch, MAX_TOKENS, value_heads, generator=generator) * 0.8,
+        "q": rand(batch, window, heads, HEAD_DIM, dtype=torch.bfloat16, multiplier=0.09),
+        "k": rand(batch, window, heads, HEAD_DIM, dtype=torch.bfloat16, multiplier=0.09),
+        "v": rand(batch, window, value_heads, HEAD_DIM, dtype=torch.bfloat16, multiplier=0.09),
+        "g": -(torch.rand(batch, window, value_heads, generator=generator) * 0.04),
+        "beta": torch.rand(batch, window, value_heads, generator=generator) * 0.8,
         "checkpoint": rand(slots, value_heads, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, multiplier=0.02),
         "d_cache": torch.full((slots, value_heads, ring_len, HEAD_DIM), float("nan"), dtype=torch.float16),
         "k_cache": torch.full((slots, heads, ring_len, HEAD_DIM), float("nan"), dtype=torch.float16),
@@ -61,7 +61,7 @@ def make_case(
         "positions": torch.full((batch,), position, dtype=torch.int32),
         "bases": torch.full((batch,), base, dtype=torch.int32),
         "lengths": torch.full((batch,), length, dtype=torch.int32),
-        "out": torch.full((batch, MAX_TOKENS, value_heads, HEAD_DIM), float("nan"), dtype=torch.bfloat16),
+        "out": torch.full((batch, window, value_heads, HEAD_DIM), float("nan"), dtype=torch.bfloat16),
         "status": torch.full((batch * value_heads * (HEAD_DIM // tile_v),), -1, dtype=torch.int32),
     }
     for row in range(batch):
@@ -118,7 +118,7 @@ def _validate_row(case: dict[str, torch.Tensor], row: int) -> tuple[int, int, in
     ring_len = case["d_cache"].shape[2]
     if slot <= 0 or slot >= case["checkpoint"].shape[0]:
         raise ValueError("Golden requires a valid non-padding slot")
-    if pos < 0 or pos > MAX_HISTORY or length < 1 or length > MAX_TOKENS or pos + length > min(MAX_WINDOW, ring_len):
+    if not 0 <= pos <= MAX_HISTORY or not 1 <= length <= case["q"].size(1) or pos + length > ring_len:
         raise ValueError("Golden requires a verify window that fits the physical ring")
     if base < 0 or base >= ring_len:
         raise ValueError("Invalid circular base")

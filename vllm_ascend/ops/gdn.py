@@ -428,7 +428,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.head_v_dim,
                 ) != (128, 128):
                     raise ValueError("ReplaySSM SD mixed verify requires 27B TP4 or 9B TP1 GDN geometry")
-                load_replayssm_sd_mixed_library(mixed_library)
+                mixed_tokens = load_replayssm_sd_mixed_library(mixed_library)
+                if mixed_tokens < self.num_spec + 1:
+                    raise ValueError(
+                        f"MTP{self.num_spec} needs a {self.num_spec + 1}-token mixed window, "
+                        f"but {mixed_library} supports {mixed_tokens}. Rebuild with REPLAYSSM_VERIFY_MAX_TOKENS=8."
+                    )
                 self.register_buffer(
                     "_replayssm_sd_mixed_scratch",
                     torch.empty((REPLAYSSM_SD_MIXED_CORES, 128, 16), dtype=torch.float32, device=self.A_log.device),
@@ -439,7 +444,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     torch.zeros((16, 128), dtype=torch.bfloat16, device=self.A_log.device),
                     persistent=False,
                 )
-                logger.info_once("ReplaySSM SD enabled with grouped mixed verify and fused compact: %s", mixed_library)
+                logger.info_once(
+                    "ReplaySSM SD grouped mixed verify and fused compact (MTP%d, max window %d): %s",
+                    self.num_spec,
+                    mixed_tokens,
+                    mixed_library,
+                )
                 return
             self.register_buffer(
                 "_replayssm_sd_compact_status",

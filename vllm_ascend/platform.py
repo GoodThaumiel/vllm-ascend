@@ -508,19 +508,19 @@ class NPUPlatform(Platform):
 
         if replayssm_sd_enabled(vllm_config):
             spec = vllm_config.speculative_config
-            if spec is None:
-                raise ValueError("additional_config.replayssm_sd requires MTP1/2/3 speculative decoding")
+            if spec is None or getattr(spec, "method", None) != "mtp":
+                raise ValueError("additional_config.replayssm_sd requires MTP speculative decoding")
             ring_len = replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
             ring_capacity = replayssm_sd_ring_capacity(vllm_config)
             logical_limit = replayssm_sd_logical_limit(vllm_config, spec.num_speculative_tokens)
             replayssm_sd_verify_variant(vllm_config)
-            if getattr(spec, "method", None) != "mtp":
-                raise ValueError("Ascend ReplaySSM SD currently supports MTP1/2/3 only")
             if replayssm_sd_mixed_library(vllm_config) is not None:
-                if spec.num_speculative_tokens != 3:
-                    raise ValueError("ReplaySSM SD mixed verify requires MTP3")
+                if spec.num_speculative_tokens not in (3, 5, 7):
+                    raise ValueError("ReplaySSM SD mixed verify supports MTP3/5/7")
                 if vllm_config.scheduler_config.max_num_seqs > 256 or ring_capacity > 1023:
                     raise ValueError("ReplaySSM SD mixed verify requires max_num_seqs <= 256 and ring capacity <= 1023")
+            elif spec.num_speculative_tokens not in (1, 2, 3):
+                raise ValueError("ReplaySSM SD vector verify supports MTP1/2/3. MTP5/7 requires the mixed library.")
             if vllm_config.model_config.architecture not in (
                 "Qwen3NextForCausalLM",
                 "Qwen3_5ForCausalLM",

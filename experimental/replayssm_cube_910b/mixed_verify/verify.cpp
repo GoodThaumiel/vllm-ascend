@@ -7,7 +7,7 @@ namespace {
 constexpr uint32_t DIM = 128;
 constexpr uint32_t TILE = DIM / 2;
 constexpr uint32_t COLS = 16;
-constexpr uint32_t TOKENS = 4;
+constexpr uint32_t TOKENS = REPLAYSSM_VERIFY_MAX_TOKENS;
 constexpr uint32_t HISTORY = 16;
 constexpr uint32_t RING = 32;
 constexpr uint32_t FRACTAL = 16 * 16;
@@ -148,7 +148,7 @@ class Projector {
   }
 
   __aicore__ inline void StageRhs(Inputs &x, uint32_t tokenStart, uint32_t key, uint32_t len) {
-    // NZ for [N,K]. Each tile has 16 rows; K goes in 0..3 and Q in 4..7.
+    // NZ for [N,K]. K occupies the first TOKENS slots and Q the next TOKENS.
     // Clear only the unused lanes. A full L1 clear would overlap the K/Q
     // destinations, and successive MTE2 writes can be in flight together.
     auto b1 = b1_.Get<bfloat16_t>();
@@ -158,7 +158,13 @@ class Projector {
     if (len < TOKENS) {
       ToL1(b1[len * 16], x.zeros, TOKENS - len, DIM, COLS);
     }
-    ToL1(b1[(TOKENS + len) * 16], x.zeros, COLS - TOKENS - len, DIM, COLS);
+    if constexpr (2 * TOKENS == COLS) {
+      if (len < TOKENS) {
+        ToL1(b1[(TOKENS + len) * 16], x.zeros, TOKENS - len, DIM, COLS);
+      }
+    } else {
+      ToL1(b1[(TOKENS + len) * 16], x.zeros, COLS - TOKENS - len, DIM, COLS);
+    }
   }
 
   __aicore__ inline void LoadRhsFromL1() {
@@ -335,7 +341,9 @@ class Consumer {
     pipe_.InitBuffer(outer_, PANEL * sizeof(float));
     pipe_.InitBuffer(gather_, 2 * TOKENS * TILE * sizeof(uint32_t));
     pipe_.InitBuffer(historyIn_, 1, HISTORY * DIM * sizeof(half));
-    pipe_.InitBuffer(historyRows_, HISTORY * DIM * sizeof(float));
+    // The wide fused specialization keeps K in historyKeys_ and only the
+    // local V tile of D in historyRows_. Leave the four-token build intact.
+    pipe_.InitBuffer(historyRows_, HISTORY * (TOKENS == 8 && FuseFold ? TILE : DIM) * sizeof(float));
     pipe_.InitBuffer(delta_, TILE * sizeof(float));
     pipe_.InitBuffer(selected_, TILE * sizeof(float));
     pipe_.InitBuffer(gates_, 2 * RING * sizeof(float));
@@ -872,6 +880,12 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
   Projector op;
   op.Run(x);
 #elif defined(__DAV_C220_VEC__)
+#if REPLAYSSM_VERIFY_MAX_TOKENS == 8
+  // The binding checks this build's sole mode before launching. In
+  // particular the four-step triangular solver is not used here.
+  Consumer<COLS, true, true, true, false, true> op;
+  op.Run(x);
+#else
   if (panelMode == 9) {
     Consumer<2 * TOKENS, true, true, true, false, true, false, true> op;
     op.Run(x);
@@ -903,5 +917,6 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
     Consumer<COLS> op;
     op.Run(x);
   }
+#endif
 #endif
 }
