@@ -362,6 +362,21 @@ same scheduling cap. K3 had the highest C32 throughput so far among
 the matched K1/2/3/4/6 trials in both paths. Artifacts are
 `dflash-27b-native-k3.XuyTDy` and `dflash-27b-replay-k3.XkkVwV`.
 
+### 27B TP2, DFlash2 K5 structured graph replay
+
+The K5 Replay run at `0a6771a` used dies 11 and 15, max-seqs 32
+and FULL sizes 6/24/48/96/192. It served the C8 strict Schema phase
+before any regular warmup or performance traffic. The phase ran
+11:45:10–11:45:18 UTC on November 28, 2026. Both target and draft
+logged their first actual FULL replay at 11:45:12. This establishes
+that structured traffic itself exercised both graph paths at K5.
+
+All 16 requests passed independent Schema validation and Replay
+accepted 727/1353 (53.73%) of the proposed draft tokens. Artifact
+`dflash-27b-replay-k5.O4ojIP` includes `phases.tsv` and
+`serve.log`. The matched performance comparison and Native Schema
+result are reported separately once both services finish.
+
 ### Native ragged state-slot diagnostic
 
 The native GDR ABI expects a flat state index array of length T, the
