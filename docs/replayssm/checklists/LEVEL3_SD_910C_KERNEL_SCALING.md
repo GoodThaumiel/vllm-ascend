@@ -1098,3 +1098,40 @@ T6 接受计数模式为 6/1/5/2/4/3，T8 为 8/1/7/2/6/3/4，
 9B 的这两组输入仍增加相对 FP64 的累计舍入。该阶段在设备上
 逐窗口验证精度，服务 graph 和时延用独立负载实测。原始 JSON
 位于 Blue2 的 `horizon-die13.Qozz2D/wide-sequence.B6D22r`。
+
+#### 9B TP1 MTP5 服务对照
+
+同一逻辑 die 13，`180e0d454` 加 Event 采集 patch、上述宽库和主
+扩展，TP1 BF16，每个请求 4000 输入/400 输出。
+复用前面的 16 个 prompt、`max-model-len=4608`、`max-num-seqs=256`、
+`max-num-batched-tokens=8192`、显存利用率 0.85。两组使用
+`--speculative-config '{"method":"mtp","num_speculative_tokens":5,"enforce_eager":true}'`，
+FULL_DECODE_ONLY 的 capture token 档位为 6/48/192/384/768/1152/1536。
+Replay 的 `additional-config` 设 `replayssm_sd=true`、
+`replayssm_sd_mixed_library` 为上述宽库绝对路径，
+`replayssm_sd_logical_limit=12`。Native 仅设 `replayssm_sd=false`。
+每组各跑一轮，吞吐按整秒 wall time 近似，HTTP 包含采集开销。
+
+| 客户端并发 | 路径 | 成功 | token/s | HTTP p50 / p90 (s) | 峰值纯 decode 行 | 平均已接受草稿/轮 |
+|---:|---|---:|---:|---:|---:|---:|
+| 48 | Native MTP5 | 48/48 | 600 | 29.35 / 30.25 | 48 | 3.634 |
+| 48 | Mixed MTP5 L12 | 48/48 | 619 | 29.10 / 30.03 | 48 | 3.678 |
+| 128 | Native MTP5 | 128/128 | 632 | 70.46 / 78.98 | 74 | 3.698 |
+| 128 | Mixed MTP5 L12 | 128/128 | 692 | 69.63 / 72.26 | 128 | 3.730 |
+
+C48 固定实际 48 行、288 候选与 64 行/384 token 捕获形状时，
+target graph p50/p90 从 74.80/74.98 ms（58 样本）降到
+69.60/70.16 ms（50 样本），分别低 7.0%/6.4%。Replay 的
+行级 flush 比例为 99.97%，单步可全部 48 行折叠。C128
+两路活跃批分布不同，报告吞吐和请求时延。C128 的第五个
+草稿接受比例是 Native 57.2%、Replay 58.2%。
+
+同 MTP5 的 KV 池容量为 Native 334,540、Replay 615,321 token
+（+83.9%）。相比前面的 MTP3 测量，Native 容量下降约 20.0%，
+Replay 容量接近原值。C128 相对同档 Native 的吞吐增加约
+9.5%。当绝对吞吐是选择依据，本轮 Replay MTP5 的约 692 tok/s
+低于此前同机同负载 MTP3 L8 的约 731 tok/s，差约 5.4%。
+两个测试使用不同窗口及图形状，且 MTP5 版本已合入输出缓冲复用。
+平均每轮接受的草稿数增加，当前数据未把 draft 成本、verify 成本
+和长请求的排队变化定量拆开。原始服务报告位于 Blue2 的
+`horizon-die13.Qozz2D/wide-serve.cG59K0`。
