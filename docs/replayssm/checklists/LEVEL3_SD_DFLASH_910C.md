@@ -1,0 +1,142 @@
+# ReplaySSM SD + DFlash / DFlash2 on 910C
+
+This checklist covers MRv1 with a Qwen GDN target and a separate DFlash draft.
+Use `method=dflash` for both draft architectures. vLLM Ascend selects the
+DFlash2 proposer from `DFlash2DraftModel` in the draft config.
+`num_speculative_tokens=K` selects 1–7 draft tokens. The target verify
+window has up to `K+1` tokens, including the anchor. The checkpoint is BF16,
+ring D/K are FP16, and ring G is FP32. The mixed library is compiled with
+physical width 8 and uses packed token offsets for the logical window.
+
+| Target | Draft | Rank geometry | Blue2 logical dies |
+|---|---|---|---|
+| Qwen3.5-9B | Qwen3.5-9B-DFlash | TP1, 16 key / 32 value heads | 13 |
+| Qwen3.8-27B | Qwen3.8-27B-DFlash2 | TP2, 8 key / 24 value heads | 11, 15 |
+
+## Build and serve
+
+Run in the CANN 9.2.1 environment after importing the vLLM Ascend checkout
+and its compiled extension. On Blue2 use `SOC_VERSION=ascend910_9362`.
+
+```bash
+cmake -S experimental/replayssm_cube_910b/mixed_verify -B /tmp/replayssm-dflash-mix \
+  -DSOC_VERSION=ascend910_9362 \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DREPLAYSSM_VERIFY_MAX_TOKENS=8
+cmake --build /tmp/replayssm-dflash-mix -j 8
+MIXED=/tmp/replayssm-dflash-mix/libreplayssm_sd_mix_torch.so
+```
+
+Set `TARGET` and `DRAFT` to the complete local model paths. Set `TP` and
+`ASCEND_RT_VISIBLE_DEVICES` together with `MAX_SEQS=64` for 9B and
+`MAX_SEQS=32` for 27B. Use the same serve flags and same die(s) for both paths.
+Set `EXTRA='{}'` for Native. For Replay use the additional config shown below.
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=0
+K=7
+WINDOW=$((K+1))
+SIZES="$WINDOW,$((WINDOW*4)),$((WINDOW*8)),$((WINDOW*16)),$((WINDOW*MAX_SEQS))"
+SPEC=$(printf '{"method":"dflash","model":"%s","num_speculative_tokens":%d}' "$DRAFT" "$K")
+GRAPH=$(printf '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[%s]}' "$SIZES")
+EXTRA=$(printf '{"replayssm_sd":true,"replayssm_sd_mixed_library":"%s"}' "$MIXED")
+
+vllm serve "$TARGET" --served-model-name dflash-test --host 127.0.0.1 --port 18145 \
+  --language-model-only --tensor-parallel-size "$TP" --dtype bfloat16 \
+  --max-model-len 3072 --max-num-seqs "$MAX_SEQS" --max-num-batched-tokens 3072 \
+  --gpu-memory-utilization 0.85 --no-enable-prefix-caching \
+  --enable-chunked-prefill --no-async-scheduling \
+  --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype bfloat16 --mamba-cache-mode none \
+  --speculative-config "$SPEC" --compilation-config "$GRAPH" --cudagraph-metrics \
+  --additional-config "$EXTRA"
+```
+
+Verify capture and FULL replay for both target and draft using the engine's
+graph log. Confirm the Replay dispatch log and check proposed and accepted
+draft-token counts after traffic. Record source commit, library hashes, exact
+target and draft IDs, TP, logical dies, concurrency, and the dataset hash.
+
+## Benchmark matrix
+
+For each K 1–7 and mode, run greedy requests against an idle server. Use the
+same ordered prompt file in both modes. Use C1, C8 and C32 for both targets
+and C64 for 9B. Measure steady output rate with fixed output length. Measure
+acceptance separately on GSM8K math, general text, prompt-only JSON and
+schema-constrained JSON. Speculative acceptance is accepted draft tokens
+divided by proposed draft tokens. An absent denominator is recorded as null.
+Per-position rates are emitted when every counted draft proposed all K tokens.
+
+```bash
+python3 scripts/replayssm/benchmark_dflash_serve.py --url http://127.0.0.1:18145 \
+  --model dflash-test --dataset perf.jsonl --draft-tokens "$K" \
+  --concurrency 32 --requests 32 --max-tokens 160 --ignore-eos --output perf-c32.json
+python3 scripts/replayssm/benchmark_dflash_serve.py --url http://127.0.0.1:18145 \
+  --model dflash-test --dataset math.jsonl --draft-tokens "$K" \
+  --concurrency 8 --requests 32 --max-tokens 320 --output math-c8.json
+```
+
+Each JSONL row has a `prompt`. Set `expect_json` to count parseable output.
+Supply a `json_schema` object to request server-side structured generation.
+Save the reports, Prometheus snapshots, and the service log together.
+
+## Blue2 results
+
+Blue2 uses Ascend910_9362, CANN 9.2.1, torch_npu 2.10.0.post7 and vLLM
+`0.30.0+empty`. Earlier 27B TP1 DFlash2 Native K7 PIECEWISE emitted
+96 tokens and accepted 63 of 238 drafts. That smoke used one request
+and the artifact is `dflash2-die11.gpn0Dl/graph.CdOg6Z`.
+
+The first TP2 FULL Native attempt at source `e2a0931f` failed in FIA workspace
+tiling. The captured DFlash2 metadata had no mask and the attention layer
+declared sliding-window configuration. This chose sparse mode 4 even though
+the query was noncausal. On this branch, capture and eager use dense mode 0
+for noncausal metadata. The failure log is `dflash2-native-full-tp2.P0cOXn`.
+
+### 27B TP2, DFlash2 K7
+
+Native at `ee7b1ce` and Replay at `6b02f37` used dies 11 and 15,
+both with BF16, 3072 model and per-step token limits, a 32-request limit,
+and FULL capture sizes 8/32/64/128/256. Replay used the default 24-entry
+logical threshold and capacity 32, with physical ring width 32 and mixed
+verify window width 8. The mixed Torch library SHA-256 was
+`a173fd018d47ce8a10f7d202eee0aff89ab3c234c4bb3514070155d51dc80031`.
+The Replay log contains independent FULL replay messages for target and
+draft. Native logs contain the draft FULL wrapper, capture completion and
+FULL runtime graph hits. All fixed-length requests completed.
+
+| Client concurrency / requests | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---|---:|---:|---:|---:|
+| 1 / 2 | 51.41 | 43.63 | 18.01 | 21.35 |
+| 8 / 16 | 129.21 | 237.23 | 36.13 | 28.11 |
+| 32 / 32 | 546.73 | 607.86 | 49.67 | 43.99 |
+
+C1 used 128 output tokens per request. C8 and C32 used 160. Each cell is
+one run. The large C8 throughput delta needs a same-commit repeat before
+attribution. No per-row flush trace was collected in these service runs.
+
+| Acceptance workload (C8) | Native accepted / proposed | Replay accepted / proposed | Passed Native / Replay |
+|---|---:|---:|---:|
+| GSM8K, 32 requests | 8190/11116 (73.68%) | 8183/11053 (74.03%) | 32/32, 32/32 |
+| General text, 32 requests | 3864/16065 (24.05%) | 3861/15995 (24.14%) | 32/32, 32/32 |
+| Prompt-only JSON, 16 requests | 762/1743 (43.72%) | 765/1778 (43.03%) | 16/16, 16/16 |
+
+Both paths returned parseable JSON for 16/16 prompt-only JSON requests.
+The Native schema-constrained test hit
+`aclnnRecurrentGatedDeltaRuleGetWorkspaceSize: 561103` after requests entered
+the engine. All 16 requests failed, so its partial counters are excluded.
+The Replay schema-constrained test is pending. Artifact directories are
+`dflash-27b-native-k7.BKCgn8` and `dflash-27b-replay-k7.8KokLw` on Blue2.
+
+### 9B TP1 mixed attention preflight
+
+The 9B draft has five sliding layers with a 4096-token window and one full
+attention layer. Its verified weight SHA-256 is
+`0a42274b32554f48de1faa0d42824e9c2ceda649c30ae0a731cddf410dd698c7`.
+The first Replay MRv1 K7 attempt at `ee7b1ce` stopped at the upstream
+mixed sliding/full capability check before loading weights. The MRv2
+Native K7 health and two C1 requests later passed with 156/714 accepted
+draft tokens. It captured graphs, but the log lacks independent target
+and draft replay markers. These runs are
+`dflash-9b-replay-k7.bMb2We` and `dflash-9b-native-k7.NNt9Ns` on Blue2.
+The subsequent MRv1 work keeps the model's original layer attention
+modes and routes each draft KV group to its own page table and slot maps.
