@@ -425,15 +425,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             if mixed_library is not None:
                 self._replayssm_sd_mixed_ablation = replayssm_sd_mixed_ablation(vllm_config)
                 local_k_heads = self.num_k_heads // self.tp_size
-                if (self.tp_size, local_k_heads, local_v_heads) not in ((4, 4, 12), (1, 16, 32)) or (
+                if (self.tp_size, local_k_heads, local_v_heads) not in ((4, 4, 12), (2, 8, 24), (1, 16, 32)) or (
                     self.head_k_dim,
                     self.head_v_dim,
                 ) != (128, 128):
-                    raise ValueError("ReplaySSM SD mixed verify requires 27B TP4 or 9B TP1 GDN geometry")
+                    raise ValueError("ReplaySSM SD mixed verify requires 27B TP2/TP4 or 9B TP1 GDN geometry")
                 mixed_tokens = load_replayssm_sd_mixed_library(mixed_library)
                 if mixed_tokens < self.num_spec + 1:
                     raise ValueError(
-                        f"MTP{self.num_spec} needs a {self.num_spec + 1}-token mixed window, "
+                        f"{self.num_spec} draft tokens need a {self.num_spec + 1}-token mixed window, "
                         f"but {mixed_library} supports {mixed_tokens}. Rebuild with REPLAYSSM_VERIFY_MAX_TOKENS=8."
                     )
                 self.register_buffer(
@@ -447,7 +447,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     persistent=False,
                 )
                 logger.info_once(
-                    "ReplaySSM SD grouped mixed verify and fused compact (MTP%d, max window %d, AIV ablation %d): %s",
+                    "ReplaySSM SD grouped mixed verify and fused compact "
+                    "(%d draft tokens, max window %d, AIV ablation %d): %s",
                     self.num_spec,
                     mixed_tokens,
                     self._replayssm_sd_mixed_ablation,

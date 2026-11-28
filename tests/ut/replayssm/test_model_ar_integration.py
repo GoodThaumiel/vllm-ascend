@@ -124,7 +124,7 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
 
     def test_sd_logical_limit_changes_cursor_without_resizing_ring(self) -> None:
         config = SimpleNamespace(cache_config=SimpleNamespace(replayssm_buffer_len=16), additional_config={})
-        for num_spec in (1, 2, 3, 5, 7):
+        for num_spec in range(1, 8):
             field = "replayssm_sd_logical_limit"
             config.additional_config[field] = None
             self.assertEqual(CACHE.replayssm_sd_logical_limit(config, num_spec), 17 + num_spec)

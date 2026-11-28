@@ -47,8 +47,8 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
               "packed token count must be in 1..B*", kMaxTokens);
   TORCH_CHECK(kMaxTokens == 4 || (packedTokens && (aiv_ablation == 4 || aiv_ablation == 7)),
               "The eight-token build requires packed tokens and fused verify/compact");
-  TORCH_CHECK(b >= 1 && b <= 256 && ((hk == 4 && hv == 12) || (hk == 16 && hv == 32)),
-              "expected B1..256 and 27B TP4 or 9B TP1");
+  TORCH_CHECK(b >= 1 && b <= 256 && ((hk == 4 && hv == 12) || (hk == 8 && hv == 24) || (hk == 16 && hv == 32)),
+              "expected B1..256 and 27B TP2/TP4 or 9B TP1");
   TORCH_CHECK(cores >= 1 && cores <= 20, "cores must be 1..20 on 910B4");
   TORCH_CHECK(!expand_head_grid || balance_heads, "An expanded grid requires value-head balancing");
   TORCH_CHECK(packed_panel || (!suffix_history && !bulk_qkv), "AIV ablations require the packed panel");
