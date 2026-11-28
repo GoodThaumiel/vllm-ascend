@@ -500,6 +500,7 @@ class NPUPlatform(Platform):
         from vllm_ascend.ops.replayssm.cache import (
             replayssm_sd_enabled,
             replayssm_sd_logical_limit,
+            replayssm_sd_mixed_ablation,
             replayssm_sd_mixed_library,
             replayssm_sd_ring_capacity,
             replayssm_sd_ring_len,
@@ -514,7 +515,11 @@ class NPUPlatform(Platform):
             ring_capacity = replayssm_sd_ring_capacity(vllm_config)
             logical_limit = replayssm_sd_logical_limit(vllm_config, spec.num_speculative_tokens)
             replayssm_sd_verify_variant(vllm_config)
-            if replayssm_sd_mixed_library(vllm_config) is not None:
+            mixed_library = replayssm_sd_mixed_library(vllm_config)
+            mixed_ablation = replayssm_sd_mixed_ablation(vllm_config)
+            if mixed_ablation == 7 and (mixed_library is None or spec.num_speculative_tokens not in (5, 7)):
+                raise ValueError("ReplaySSM SD column recurrence requires the wide mixed library and MTP5/7")
+            if mixed_library is not None:
                 if spec.num_speculative_tokens not in (3, 5, 7):
                     raise ValueError("ReplaySSM SD mixed verify supports MTP3/5/7")
                 if vllm_config.scheduler_config.max_num_seqs > 256 or ring_capacity > 1023:

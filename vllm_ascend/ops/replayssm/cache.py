@@ -63,6 +63,14 @@ def replayssm_sd_mixed_library(vllm_config) -> str | None:
     return value
 
 
+def replayssm_sd_mixed_ablation(vllm_config) -> int:
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    variant = additional_config.get("replayssm_sd_mixed_ablation", 4)
+    if type(variant) is not int or variant not in (4, 7):
+        raise ValueError("additional_config.replayssm_sd_mixed_ablation must be 4 or 7")
+    return variant
+
+
 def replayssm_sd_ring_capacity(vllm_config) -> int:
     """Number of request-owned ring slots, excluding reserved slot zero."""
     max_seqs = vllm_config.scheduler_config.max_num_seqs

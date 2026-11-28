@@ -1135,3 +1135,90 @@ Replay 容量接近原值。C128 相对同档 Native 的吞吐增加约
 平均每轮接受的草稿数增加，当前数据未把 draft 成本、verify 成本
 和长请求的排队变化定量拆开。原始服务报告位于 Blue2 的
 `horizon-die13.Qozz2D/wide-serve.cG59K0`。
+
+#### 9B TP1 MTP7 服务对照
+
+沿用 MTP5 的 `180e0d454`、同一宽库、Event 采集 patch、逻辑
+die 13 和 4000 输入/400 输出负载。MTP7 使用 8 个候选，
+FULL_DECODE_ONLY 的 capture token 档位为 8/64/256/512/1024/1536/2048。
+Replay 折叠阈值 L16，ring 仍为 32。各配置各跑一轮。
+
+| 客户端并发 | 路径 | 成功 | token/s | HTTP p50 / p90 (s) | 峰值纯 decode 行 | 平均已接受草稿/轮 |
+|---:|---|---:|---:|---:|---:|---:|
+| 48 | Native MTP7 | 48/48 | 582 | 30.90 / 32.23 | 48 | 4.361 |
+| 48 | Mixed MTP7 L16 | 48/48 | 582 | 30.35 / 31.49 | 48 | 4.473 |
+| 128 | Native MTP7 | 128/128 | 602 | 74.81 / 83.05 | 62 | 4.398 |
+| 128 | Mixed MTP7 L16 | 128/128 | 656 | 73.51 / 76.63 | 125 | 4.377 |
+
+同实际 B48、384 候选和 64 行/512 token 捕获形状下，Native 的
+target graph p50/p90 为 91.50/91.68 ms（45 样本）。Replay 为
+83.34/84.36 ms（39 样本），分别低 8.9% 和 8.0%。Replay
+按行折叠比例 99.97%，单步最多 48 行 flush。C128 的样本没有
+满足同活跃行、候选数、图形状和每侧至少五个样本的对照切片。
+Native 和 Replay 的第七个草稿在 C128 被接收的比例分别
+为 40.4% 和 39.2%。
+
+Native KV 容量为 278,784 token，Replay 为 615,321 token
+（+120.7%）。C128 相对同档 Native 吞吐高约 9.0%，HTTP
+p90 低约 7.7%。三档 Replay 在该 C128 文本负载下的吞吐
+约为 MTP3 731、MTP5 692、MTP7 656 tok/s。更宽窗口放大
+了相对 Native 的容量差，但服务的绝对吞吐随窗口加大下降。
+在 C48，以 target p50 除以 1 加平均每轮已接受的草稿数作
+归一化，Replay MTP5 约 14.9 ms/token，MTP7 约 15.2。
+这个量仅覆盖 target 图，draft、采样、prefill 和排队需要另拆。
+原始报告与 MTP5 存于同一目录。
+
+### 宽窗口的候选列递推消融
+
+`b2b5c862`、逻辑 die 13、Ascend910_9362、CANN 9.2.1、
+torch-npu 2.10.0.post7、vLLM 0.30.0+empty。使用主扩展原生 RGDR
+和同一份 8-token mixed 库比较 AIV ablation 4 和 7。先用
+`diagnose_sd_sequence.py --mixed-ablation 7` 对 9B TP1、27B TP4
+单 rank 的 MTP5/7 各检查 60 个连续窗口，seed 42、T6/L12
+或 T8/L16、gate 上限 .002，使用前一节的接受计数和容差。
+四组均通过，输出对本步参考 max abs 为 3.05e-5，checkpoint
+最大差 9.77e-4。宽库 binding/kernel SHA-256 分别为
+`81752ac3fb1950d4abdcb16e5855ba2625df685b68d6b7a93ea8844d9aef04a9`
+和 `cae72ec8a5269a8094ba97b5860cf9cbb6f36ef771923ff32687f14526f0fe5f`。
+
+变体 7 把当前投影在 UB 一次转成每个候选的 V64 列。每步
+只缩放当前及后续的列，更新未来 K 和当前及未来 Q。
+保留 FP32 逐步更新顺序、历史修正、Cube 投影、折叠和 ring 写回。
+用已有 `outer_` 保存列，原 `proj_` 作为候选乘积暂存。
+每个乘积 repeat 处理连续 64 个 FP32 元素并重复读取同一
+delta 向量。没有新增显式 UB 分配。性能差异叠加了少算已用列、
+单次 Gather 和临时布局改变，需用 pipe trace 分开归因。
+
+算子探针每组 35 次图回放，base31、uniform 候选、全 batch
+flush、历史等于窗口大小。Native 由现有 BF16 RGDR 入口执行，
+误差对照用独立 dense 参考，mixed 另外核对 eager/graph 输出、
+checkpoint、D/K/G、状态和 Cube 投影。下表为单层设备
+graph p50，单位 µs。
+
+| 几何 / MTP / batch | Native | Mixed 原递推 | Mixed 候选列递推 |
+|---|---:|---:|---:|
+| 27B TP4 单 rank / 5 / B32 | 289.24 | 256.90 | 248.78 |
+| 27B TP4 单 rank / 5 / B64 | 547.28 | 460.50 | 442.72 |
+| 27B TP4 单 rank / 7 / B32 | 373.82 | 323.30 | 310.40 |
+| 27B TP4 单 rank / 7 / B64 | 718.98 | 575.04 | 552.72 |
+| 9B TP1 / 5 / B128 | 2753.20 | 2411.70 | 2326.68 |
+| 9B TP1 / 5 / B256 | 5470.16 | 4771.92 | 4608.30 |
+| 9B TP1 / 7 / B128 | 3645.62 | 3054.48 | 2936.54 |
+| 9B TP1 / 7 / B256 | 7239.72 | 6064.36 | 5830.00 |
+
+表内 p50 相比同库原递推下降约 3.2%–4.0%。27B B16/18 及
+B31/32/33 延时连续。27B T8 B1 的 p90 为候选列 73.82 µs、
+原递推 69.28 µs、Native 63.48 µs，低 batch 尾时延仍有差距。
+本表为单层合成压力，不能外推到 27B 整网。服务 A/B 用
+`additional-config.replayssm_sd_mixed_ablation=7` 显式切换，
+同一宽库的 ablation 4 为对照。
+
+```bash
+python3 experimental/replayssm_cube_910b/run.py --suite mixed --geometry 27b \
+  --device 0 --batches 1,16,18,31,32,33,64 --length 8 --pos 8 --base 31 \
+  --flush full --flush-layout random \
+  --path native mixed_fused_fold mixed_column_recurrence --mixed-library "$MIX" \
+  --mixed-check-repeats 2 --iterations 35 --output /tmp/replayssm-candidate-columns-t8.json
+```
+
+原始数据位于 Blue2 的 `horizon-die13.Qozz2D/candidate-columns.AAKioB`。

@@ -1617,12 +1617,14 @@ class TestTopLevelSwitchTypeValidation(TestBase):
             "replayssm_sd_ring_capacity": 64,
             "replayssm_sd_logical_limit": 8,
             "replayssm_sd_mixed_library": "/opt/replayssm/mixed.so",
+            "replayssm_sd_mixed_ablation": 7,
         }
         ascend_config = init_ascend_config(vc)
         self.assertTrue(ascend_config.replayssm_sd)
         self.assertEqual(ascend_config.replayssm_sd_ring_capacity, 64)
         self.assertEqual(ascend_config.replayssm_sd_logical_limit, 8)
         self.assertEqual(ascend_config.replayssm_sd_mixed_library, "/opt/replayssm/mixed.so")
+        self.assertEqual(ascend_config.replayssm_sd_mixed_ablation, 7)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

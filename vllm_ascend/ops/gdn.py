@@ -66,6 +66,7 @@ from vllm_ascend.ops.replayssm.cache import (
     append_gdn_replayssm_ar_dtypes,
     append_gdn_replayssm_ar_shapes,
     replayssm_sd_enabled,
+    replayssm_sd_mixed_ablation,
     replayssm_sd_mixed_library,
     replayssm_sd_ring_len,
     replayssm_sd_verify_variant,
@@ -422,6 +423,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 persistent=False,
             )
             if mixed_library is not None:
+                self._replayssm_sd_mixed_ablation = replayssm_sd_mixed_ablation(vllm_config)
                 local_k_heads = self.num_k_heads // self.tp_size
                 if (self.tp_size, local_k_heads, local_v_heads) not in ((4, 4, 12), (1, 16, 32)) or (
                     self.head_k_dim,
@@ -445,9 +447,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     persistent=False,
                 )
                 logger.info_once(
-                    "ReplaySSM SD grouped mixed verify and fused compact (MTP%d, max window %d): %s",
+                    "ReplaySSM SD grouped mixed verify and fused compact (MTP%d, max window %d, AIV ablation %d): %s",
                     self.num_spec,
                     mixed_tokens,
+                    self._replayssm_sd_mixed_ablation,
                     mixed_library,
                 )
                 return
@@ -559,7 +562,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 REPLAYSSM_SD_MIXED_CORES,
                 packed_panel=True,
                 bulk_qkv=True,
-                aiv_ablation=4,
+                aiv_ablation=self._replayssm_sd_mixed_ablation,
                 flush=flush,
                 token_offsets=offsets,
             )

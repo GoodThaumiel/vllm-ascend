@@ -146,6 +146,16 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "absolute path"):
                 CACHE.replayssm_sd_mixed_library(config)
 
+    def test_sd_mixed_ablation_defaults_to_the_original_recurrence(self) -> None:
+        config = SimpleNamespace(additional_config={})
+        self.assertEqual(CACHE.replayssm_sd_mixed_ablation(config), 4)
+        config.additional_config["replayssm_sd_mixed_ablation"] = 7
+        self.assertEqual(CACHE.replayssm_sd_mixed_ablation(config), 7)
+        for value in (True, "7", 6):
+            config.additional_config["replayssm_sd_mixed_ablation"] = value
+            with self.assertRaisesRegex(ValueError, "must be 4 or 7"):
+                CACHE.replayssm_sd_mixed_ablation(config)
+
     def test_sd_mixed_serve_passes_ragged_windows_and_skips_legacy_pack(self) -> None:
         # Exercise the real method with CPU tensors and a stand-in launcher.
         # This keeps the test runnable when the vLLM and NPU modules are absent.
@@ -174,12 +184,14 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
                 self.assertIs(args[10], metadata.replayssm_sd_ring_slots)
                 self.assertEqual(args[17].shape, (12, 128, 16))
                 self.assertIs(kwargs["flush"], metadata.replayssm_sd_flush)
+                self.assertEqual(kwargs["aiv_ablation"], layer._replayssm_sd_mixed_ablation)
                 torch.testing.assert_close(kwargs["token_offsets"], offsets)
                 args[14][:3].copy_(args[2][:3])
 
             verify.side_effect = launch
             layer = SimpleNamespace(
                 _replayssm_sd_use_mixed=True,
+                _replayssm_sd_mixed_ablation=7,
                 num_k_heads=16,
                 num_v_heads=48,
                 tp_size=4,
