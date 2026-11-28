@@ -918,8 +918,6 @@ def parse_args(argv=None):
     args.path = args.path or defaults
     if args.length > 4 and set(args.path) - {"native", MIXED_FUSED_FOLD_PATH, MIXED_COLUMN_RECURRENCE_PATH}:
         ap.error("six/eight-token windows require --path native, mixed_fused_fold or mixed_column_recurrence")
-    if args.length <= 4 and MIXED_COLUMN_RECURRENCE_PATH in args.path:
-        ap.error("mixed_column_recurrence requires a six/eight-token window")
     if args.flush_count is not None and not 0 <= args.flush_count <= min(args.batches):
         ap.error("flush-count must fit the smallest requested batch")
     if (args.suite != "all" or args.geometry == "9b") and any(path in CUBE_PATHS for path in args.path):

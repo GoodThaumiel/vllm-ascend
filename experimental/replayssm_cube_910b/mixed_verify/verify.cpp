@@ -232,7 +232,7 @@ class Consumer {
   static_assert(!TriangularSolve || (PanelCols == 2 * TOKENS && BulkQkv));
   static_assert(!FuseFold || (BatchHistory && !TriangularSolve));
   static_assert(!FoldPair || (FuseFold && !FoldFma));
-  static_assert(!ColumnRecurrence || (PanelCols == COLS && BulkQkv && FuseFold && TOKENS == 8));
+  static_assert(!ColumnRecurrence || (PanelCols == 2 * TOKENS && BulkQkv && FuseFold));
 
  public:
   __aicore__ inline void Run(Inputs &x) {
@@ -945,7 +945,10 @@ extern "C" __global__ __aicore__ void replayssm_sd_verify_mix_910b(
     op.Run(x);
   }
 #else
-  if (panelMode == 9) {
+  if (panelMode == 10) {
+    Consumer<2 * TOKENS, true, true, true, false, true, false, false, true> op;
+    op.Run(x);
+  } else if (panelMode == 9) {
     Consumer<2 * TOKENS, true, true, true, false, true, false, true> op;
     op.Run(x);
   } else if (panelMode == 8) {

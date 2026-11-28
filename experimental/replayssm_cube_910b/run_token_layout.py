@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from experimental.replayssm_cube_910b.run import (  # noqa: E402
     MIXED_AIV_ABLATIONS,
+    MIXED_COLUMN_RECURRENCE_PATH,
     MIXED_FOLD_FMA_PATH,
     MIXED_FOLD_PAIR_PATH,
     MIXED_FUSED_FOLD_PATH,
@@ -125,6 +126,9 @@ def trial(args, batch, device):
         fold_path = MIXED_FOLD_PAIR_PATH
     elif args.mixed_fold_fma:
         fold_path = MIXED_FOLD_FMA_PATH
+    elif args.mixed_candidate_columns:
+        fold_path = MIXED_COLUMN_RECURRENCE_PATH
+    reference_fold = MIXED_FUSED_FOLD_PATH if args.mixed_fold_pair or args.mixed_candidate_columns else fold_path
 
     def invoke_mixed(cache, inputs, out, token_offsets=None, *, ablation=fold_path):
         torch.ops.replayssm_mix_910b.verify_(
@@ -166,7 +170,6 @@ def trial(args, batch, device):
         reset_cache(case)
         reset_status()
         if path == MIXED_PATH:
-            reference_fold = MIXED_FUSED_FOLD_PATH if args.mixed_fold_pair else fold_path
             invoke_mixed(case, fixed_inputs, fixed_out, ablation=reference_fold)
         else:
             invoke(case, fixed_inputs, fixed_out)
@@ -372,6 +375,7 @@ def main():
     fold_options = parser.add_mutually_exclusive_group()
     fold_options.add_argument("--mixed-fold-fma", action="store_true", help="Fuse multiply-add in checkpoint folding")
     fold_options.add_argument("--mixed-fold-pair", action="store_true", help="Batch pairs of history row broadcasts")
+    fold_options.add_argument("--mixed-candidate-columns", action="store_true", help="Use the live-column recurrence")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.flush_fraction <= 1 or not 1 <= args.layers <= 48 or args.iterations < 1:

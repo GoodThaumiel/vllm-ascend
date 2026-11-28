@@ -430,8 +430,8 @@ def main() -> int:
         parser.error(f"logical-limit must be in [{2 * args.window}, {max_limit}]")
     if args.window > 4 and not (args.cpu_reference or args.mixed_library):
         parser.error("windows above four require the wide mixed library or --cpu-reference")
-    if args.mixed_ablation == 7 and (args.window <= 4 or args.mixed_library is None):
-        parser.error("column recurrence requires a wide window and the mixed library")
+    if args.mixed_ablation == 7 and args.mixed_library is None:
+        parser.error("column recurrence requires the mixed library")
     if args.tp not in GEOMETRIES[args.geometry] or (args.mixed_library and args.tp != GEOMETRIES[args.geometry][0]):
         parser.error("unsupported geometry/TP combination for this backend")
     if args.atol < 0 or args.rtol < 0 or not 0 <= args.gate_max <= 1:

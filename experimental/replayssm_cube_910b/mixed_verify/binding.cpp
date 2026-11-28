@@ -53,7 +53,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(!expand_head_grid || balance_heads, "An expanded grid requires value-head balancing");
   TORCH_CHECK(packed_panel || (!suffix_history && !bulk_qkv), "AIV ablations require the packed panel");
   TORCH_CHECK(!suffix_history || !bulk_qkv, "Run suffix history and bulk QKV as separate ablations");
-  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= (kMaxTokens == 8 ? 7 : 6), "Invalid AIV ablation");
+  TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= 7, "Invalid AIV ablation");
   TORCH_CHECK(aiv_ablation == 0 || (packed_panel && bulk_qkv && !suffix_history),
               "AIV ablations require the bulk-QKV packed baseline");
   TORCH_CHECK(checkpoint.dim() == 4 && d.dim() == 4, "checkpoint/D must be rank-4");
