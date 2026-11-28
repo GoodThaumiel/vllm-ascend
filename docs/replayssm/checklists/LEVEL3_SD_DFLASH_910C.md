@@ -372,6 +372,41 @@ independently checked every response.
 
 Both ordinary C1 warmups logged actual FULL replay for target and draft.
 The schema runs had fewer than K proposed tokens in some iterations, so
-per-position percentages are omitted. These runs do not separately
-measure graph coverage during structured generation. Artifacts are
+per-position percentages are omitted. The server's target graph metrics
+show four Native and five Replay FULL steps with 64 active tokens and
+zero padding. Only the C8 schema phase could produce this shape, since
+both prior phases ran at C1. The draft FULL marker is logged once, so
+the logs only establish draft graph replay for the whole service run.
+Artifacts are
 `dflash-9b-native-k7.TDuNWs` and `dflash-9b-replay-k7.TYwczo`.
+
+### 9B TP1, DFlash K1 on the final metadata fix
+
+Both modes at `0a6771a` used die 10, max-seqs 64, FULL sizes
+2/8/16/32/128 and the same mixed library. Replay used logical threshold
+18. Both target and draft logged live FULL replay. Every fixed-length
+response contained exactly 128 tokens at C1 and 160 tokens elsewhere.
+The proposed-token counter matched one draft token per counted
+iteration throughout the fixed-length tests. No flush trace was collected.
+
+| Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 31.64 | 23.45 | 30.66 | 41.71 |
+| 8 | 211.03 | 169.33 | 35.44 | 44.30 |
+| 32 | 599.01 | 500.22 | 49.28 | 59.72 |
+| 64 | 1071.76 | 938.41 | 54.65 | 62.32 |
+
+| C8 dataset | Native accepted / proposed | Replay accepted / proposed | Passed per mode |
+|---|---:|---:|---:|
+| GSM8K | 4778/5026 (95.07%) | 4790/5022 (95.38%) | 32/32 |
+| General text | 2495/3630 (68.73%) | 2474/3648 (67.82%) | 32/32 |
+| Prompt-only JSON | 436/562 (77.58%) | 439/573 (76.61%) | 16/16 |
+| Strict JSON Schema | 436/556 (78.42%) | 436/559 (78.00%) | 16/16 |
+
+All JSON responses parsed and all schema-constrained responses passed
+independent schema validation. The runtime fixes preserve the one-token
+draft case, with a C64 throughput gap of 12.4% in this short-prompt
+test. Native and Replay reported KV capacity of 275,953 and 300,360
+tokens. These values measure cache capacity, with identical max-seqs
+limits in both services. Artifacts are `dflash-9b-native-k1.0qBOe4`
+and `dflash-9b-replay-k1.bHzj44`.
