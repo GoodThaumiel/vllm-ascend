@@ -424,6 +424,8 @@ class AscendConfig:
             "replayssm_sd": false,
             "replayssm_sd_ring_capacity": null,
             "replayssm_sd_verify_variant": 13,
+            "replayssm_sd_logical_limit": null,
+            "replayssm_sd_mixed_library": null,
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
             "enable_prefill_mc2": false,
@@ -571,6 +573,8 @@ class AscendConfig:
     # effective capacity against max_num_seqs before allocating its buffers.
     replayssm_sd_ring_capacity: int | None = None
     replayssm_sd_verify_variant: int = 13
+    replayssm_sd_logical_limit: int | None = None
+    replayssm_sd_mixed_library: str | None = None
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.

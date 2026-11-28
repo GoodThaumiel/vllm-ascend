@@ -1,8 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Preallocated Replay AR operator; registration is owned by vllm_ascend_C."""
+"""ReplaySSM operator wrappers and experimental library loading."""
+
+from functools import cache
+from pathlib import Path
 
 import torch
+
+REPLAYSSM_SD_MIXED_CORES = 20
+
+
+@cache
+def load_replayssm_sd_mixed_library(path: str) -> None:
+    """Register the standalone 910B/910C mixed operator before graph capture."""
+    library = Path(path).resolve(strict=True)
+    torch.ops.load_library(str(library))
+    if not hasattr(torch.ops.replayssm_mix_910b, "verify_"):
+        raise RuntimeError(f"ReplaySSM mixed verify operator was not registered by {library}")
 
 
 def replayssm_ar_step(

@@ -122,6 +122,95 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be 13 or 20"):
                 CACHE.replayssm_sd_verify_variant(config)
 
+    def test_sd_logical_limit_changes_cursor_without_resizing_ring(self) -> None:
+        config = SimpleNamespace(cache_config=SimpleNamespace(replayssm_buffer_len=16), additional_config={})
+        for num_spec in (1, 2, 3):
+            field = "replayssm_sd_logical_limit"
+            config.additional_config[field] = None
+            self.assertEqual(CACHE.replayssm_sd_logical_limit(config, num_spec), 17 + num_spec)
+            config.additional_config[field] = 2 * (num_spec + 1)
+            self.assertEqual(CACHE.replayssm_sd_logical_limit(config, num_spec), 2 * (num_spec + 1))
+            self.assertEqual(CACHE.replayssm_sd_ring_len(16, num_spec), 32)
+        for value in (True, "8", 8.0, 7, 21):
+            config.additional_config[field] = value
+            with self.assertRaisesRegex(ValueError, "integer in"):
+                CACHE.replayssm_sd_logical_limit(config, 3)
+
+    def test_sd_mixed_library_requires_an_explicit_absolute_path(self) -> None:
+        config = SimpleNamespace(additional_config={})
+        self.assertIsNone(CACHE.replayssm_sd_mixed_library(config))
+        config.additional_config["replayssm_sd_mixed_library"] = "/opt/replayssm/mixed.so"
+        self.assertEqual(CACHE.replayssm_sd_mixed_library(config), "/opt/replayssm/mixed.so")
+        for value in ("", "mixed.so", True, 13):
+            config.additional_config["replayssm_sd_mixed_library"] = value
+            with self.assertRaisesRegex(ValueError, "absolute path"):
+                CACHE.replayssm_sd_mixed_library(config)
+
+    def test_sd_mixed_serve_passes_ragged_windows_and_skips_legacy_pack(self) -> None:
+        # Exercise the real method with CPU tensors and a stand-in launcher.
+        # This keeps the test runnable when the vLLM and NPU modules are absent.
+        tree = ast.parse((ROOT / "vllm_ascend/ops/gdn.py").read_text())
+        layer_class = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendGatedDeltaNetAttention"
+        )
+        method = next(
+            node
+            for node in layer_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_replayssm_sd_decode"
+        )
+        with patch.object(torch.ops.replayssm_mix_910b, "verify_", create=True) as verify:
+            namespace = {
+                "torch": torch,
+                "GDNAttentionMetadata": object,
+                "REPLAYSSM_SD_MAX_TOKENS": 4,
+                "REPLAYSSM_SD_MIXED_CORES": 20,
+            }
+            exec(compile(ast.Module(body=[method], type_ignores=[]), "<mixed-gdn-dispatch>", "exec"), namespace)
+
+            def launch(*args, **kwargs):
+                self.assertEqual(args[0].shape, (4, 4, 128))
+                self.assertEqual(args[2].shape, (4, 12, 128))
+                self.assertIs(args[5], layer.kv_cache[1])
+                self.assertIs(args[10], metadata.replayssm_sd_ring_slots)
+                self.assertEqual(args[17].shape, (12, 128, 16))
+                self.assertIs(kwargs["flush"], metadata.replayssm_sd_flush)
+                torch.testing.assert_close(kwargs["token_offsets"], offsets)
+                args[14][:3].copy_(args[2][:3])
+
+            verify.side_effect = launch
+            layer = SimpleNamespace(
+                _replayssm_sd_use_mixed=True,
+                num_k_heads=16,
+                num_v_heads=48,
+                tp_size=4,
+                kv_cache=(None, torch.empty(1)),
+                _replayssm_sd_d_ring=torch.empty(1),
+                _replayssm_sd_k_ring=torch.empty(1),
+                _replayssm_sd_g_ring=torch.empty(1),
+                _replayssm_sd_verify_status=torch.empty(36, dtype=torch.int32),
+                _replayssm_sd_mixed_rhs=torch.zeros(16, 128, dtype=torch.bfloat16),
+                _replayssm_sd_mixed_scratch=torch.empty(20, 128, 16),
+            )
+            offsets = torch.tensor([0, 2, 3, 3], dtype=torch.int32)
+            metadata = SimpleNamespace(
+                spec_query_start_loc=offsets,
+                replayssm_sd_block_slots=torch.tensor([11, 17, 0], dtype=torch.int32),
+                replayssm_sd_ring_slots=torch.tensor([2, 1, 0], dtype=torch.int32),
+                replayssm_sd_positions=torch.tensor([0, 4, 0], dtype=torch.int32),
+                replayssm_sd_bases=torch.tensor([0, 31, 0], dtype=torch.int32),
+                replayssm_sd_flush=torch.tensor([0, 1, 0], dtype=torch.int32),
+                replayssm_sd_lengths=torch.tensor([2, 1, 0], dtype=torch.int32),
+            )
+            query = torch.ones(1, 4, 4, 128, dtype=torch.bfloat16)
+            value = torch.ones(1, 4, 12, 128, dtype=torch.bfloat16)
+            gate = torch.zeros(1, 4, 12)
+            result = namespace["_replayssm_sd_decode"](
+                layer, query=query, key=query, value=value, g=gate, beta=gate, attn_metadata=metadata
+            )
+            verify.assert_called_once()
+            torch.testing.assert_close(result[:, :3], value[:, :3])
+            self.assertEqual(torch.count_nonzero(result[:, 3:]).item(), 0)
+
     def test_sd_serve_dispatches_selected_verify_variant(self) -> None:
         try:
             from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention

@@ -499,6 +499,8 @@ class NPUPlatform(Platform):
         # the Ascend model/cache/runner paths read additional_config directly.
         from vllm_ascend.ops.replayssm.cache import (
             replayssm_sd_enabled,
+            replayssm_sd_logical_limit,
+            replayssm_sd_mixed_library,
             replayssm_sd_ring_capacity,
             replayssm_sd_ring_len,
             replayssm_sd_verify_variant,
@@ -508,11 +510,17 @@ class NPUPlatform(Platform):
             spec = vllm_config.speculative_config
             if spec is None:
                 raise ValueError("additional_config.replayssm_sd requires MTP1/2/3 speculative decoding")
-            replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
-            replayssm_sd_ring_capacity(vllm_config)
+            ring_len = replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
+            ring_capacity = replayssm_sd_ring_capacity(vllm_config)
+            logical_limit = replayssm_sd_logical_limit(vllm_config, spec.num_speculative_tokens)
             replayssm_sd_verify_variant(vllm_config)
             if getattr(spec, "method", None) != "mtp":
                 raise ValueError("Ascend ReplaySSM SD currently supports MTP1/2/3 only")
+            if replayssm_sd_mixed_library(vllm_config) is not None:
+                if spec.num_speculative_tokens != 3:
+                    raise ValueError("ReplaySSM SD mixed verify requires MTP3")
+                if vllm_config.scheduler_config.max_num_seqs > 256 or ring_capacity > 1023:
+                    raise ValueError("ReplaySSM SD mixed verify requires max_num_seqs <= 256 and ring capacity <= 1023")
             if vllm_config.model_config.architecture not in (
                 "Qwen3NextForCausalLM",
                 "Qwen3_5ForCausalLM",
@@ -537,9 +545,10 @@ class NPUPlatform(Platform):
             if vllm_config.cache_config.mamba_cache_mode != "none":
                 raise ValueError("Ascend ReplaySSM SD currently requires --mamba-cache-mode none")
             logger.info(
-                "Enabled Ascend ReplaySSM SD for MTP%d with BF16 checkpoint and %d-entry ring",
+                "Enabled Ascend ReplaySSM SD for MTP%d with BF16 checkpoint, %d-entry ring and logical limit %d",
                 spec.num_speculative_tokens,
-                replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens),
+                ring_len,
+                logical_limit,
             )
 
         _validate_model_runner_config(vllm_config)

@@ -37,6 +37,8 @@ from vllm_ascend.ops.replayssm.cache import (
     REPLAYSSM_SD_MAX_TOKENS,
     derive_replayssm_ar_cursors,
     replayssm_sd_enabled,
+    replayssm_sd_logical_limit,
+    replayssm_sd_mixed_library,
     replayssm_sd_pack_indices,
     replayssm_sd_ring_capacity,
     replayssm_sd_ring_len,
@@ -404,7 +406,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.use_replayssm_ar = self.vllm_config.cache_config.use_replayssm and not self.use_replayssm_sd
         self.replayssm_buffer_len = self.vllm_config.cache_config.replayssm_buffer_len
         if self.use_replayssm_sd:
-            self.sd_logical_limit = self.replayssm_buffer_len + self.num_spec + 1
+            self.sd_logical_limit = replayssm_sd_logical_limit(self.vllm_config, self.num_spec)
             self.sd_ring_len = replayssm_sd_ring_len(self.replayssm_buffer_len, self.num_spec)
             self.sd_ring_capacity = replayssm_sd_ring_capacity(self.vllm_config)
             self.sd_write_pos = None
@@ -419,9 +421,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.sd_flush = torch.empty_like(self.sd_positions)
             self.sd_lengths = torch.empty_like(self.sd_positions)
             self.sd_cursor_status = torch.empty_like(self.sd_positions)
-            self.sd_pack_indices = torch.empty(
-                sequence_index_capacity * (self.num_spec + 1), dtype=torch.int64, device=device
-            )
+            self.sd_pack_indices = None
+            if replayssm_sd_mixed_library(self.vllm_config) is None:
+                self.sd_pack_indices = torch.empty(
+                    sequence_index_capacity * (self.num_spec + 1), dtype=torch.int64, device=device
+                )
         if self.use_replayssm_ar:
             if self.num_spec > 0:
                 raise ValueError(
@@ -527,11 +531,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.sd_flush[:rows].copy_(self.sd_is_flush.index_select(0, self.sd_ring_slots[:rows]).to(torch.int32))
         self.sd_lengths[:rows].copy_(query_start_loc[1 : rows + 1] - query_start_loc[:rows])
 
-        query_lens_cpu = torch.diff(m.query_start_loc_cpu)[spec_sequence_masks_cpu]
-        pack = replayssm_sd_pack_indices(query_lens_cpu, self.num_spec + 1, REPLAYSSM_SD_MAX_TOKENS)
-        if pack.numel() != attn_metadata.num_spec_decode_tokens:
-            raise ValueError("ReplaySSM SD token pack does not match speculative token count")
-        self.sd_pack_indices[: pack.numel()].copy_(pack, non_blocking=True)
+        if self.sd_pack_indices is not None:
+            query_lens_cpu = torch.diff(m.query_start_loc_cpu)[spec_sequence_masks_cpu]
+            pack = replayssm_sd_pack_indices(query_lens_cpu, self.num_spec + 1, REPLAYSSM_SD_MAX_TOKENS)
+            if pack.numel() != attn_metadata.num_spec_decode_tokens:
+                raise ValueError("ReplaySSM SD token pack does not match speculative token count")
+            self.sd_pack_indices[: pack.numel()].copy_(pack, non_blocking=True)
+            attn_metadata.replayssm_sd_pack_indices = self.sd_pack_indices[: pack.numel()]
         attn_metadata.replayssm_sd_slots = self.sd_slots[:rows]
         attn_metadata.replayssm_sd_block_slots = self.sd_slots[:rows]
         attn_metadata.replayssm_sd_ring_slots = self.sd_ring_slots[:rows]
@@ -539,7 +545,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata.replayssm_sd_bases = self.sd_bases[:rows]
         attn_metadata.replayssm_sd_flush = self.sd_flush[:rows]
         attn_metadata.replayssm_sd_lengths = self.sd_lengths[:rows]
-        attn_metadata.replayssm_sd_pack_indices = self.sd_pack_indices[: pack.numel()]
         attn_metadata.replayssm_sd_cursor_status = cursor_status
 
     def _init_reorder_batch_threshold(

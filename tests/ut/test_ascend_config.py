@@ -1612,10 +1612,17 @@ class TestTopLevelSwitchTypeValidation(TestBase):
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_replayssm_sd_ring_capacity_is_accepted(self, mock_fix):
         vc = VllmConfig()
-        vc.additional_config = {"replayssm_sd": True, "replayssm_sd_ring_capacity": 64}
+        vc.additional_config = {
+            "replayssm_sd": True,
+            "replayssm_sd_ring_capacity": 64,
+            "replayssm_sd_logical_limit": 8,
+            "replayssm_sd_mixed_library": "/opt/replayssm/mixed.so",
+        }
         ascend_config = init_ascend_config(vc)
         self.assertTrue(ascend_config.replayssm_sd)
         self.assertEqual(ascend_config.replayssm_sd_ring_capacity, 64)
+        self.assertEqual(ascend_config.replayssm_sd_logical_limit, 8)
+        self.assertEqual(ascend_config.replayssm_sd_mixed_library, "/opt/replayssm/mixed.so")
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

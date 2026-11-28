@@ -49,7 +49,13 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
-from vllm_ascend.ops.replayssm.ascendc import replayssm_ar_step, replayssm_sd_compact, replayssm_sd_verify
+from vllm_ascend.ops.replayssm.ascendc import (
+    REPLAYSSM_SD_MIXED_CORES,
+    load_replayssm_sd_mixed_library,
+    replayssm_ar_step,
+    replayssm_sd_compact,
+    replayssm_sd_verify,
+)
 from vllm_ascend.ops.replayssm.cache import (
     REPLAYSSM_AR_CORES,
     REPLAYSSM_AR_HEAD_DIM,
@@ -60,6 +66,7 @@ from vllm_ascend.ops.replayssm.cache import (
     append_gdn_replayssm_ar_dtypes,
     append_gdn_replayssm_ar_shapes,
     replayssm_sd_enabled,
+    replayssm_sd_mixed_library,
     replayssm_sd_ring_len,
     replayssm_sd_verify_variant,
 )
@@ -405,6 +412,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if replayssm_sd_enabled(vllm_config):
             self._replayssm_sd_verify_variant = replayssm_sd_verify_variant(vllm_config)
+            mixed_library = replayssm_sd_mixed_library(vllm_config)
+            self._replayssm_sd_use_mixed = mixed_library is not None
             max_rows = max(max_rows, vllm_config.compilation_config.max_cudagraph_capture_size or 0)
             tasks = max_rows * local_v_heads * (self.head_v_dim // REPLAYSSM_AR_TILE_V)
             self.register_buffer(
@@ -412,6 +421,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 torch.empty(tasks, dtype=torch.int32, device=self.A_log.device),
                 persistent=False,
             )
+            if mixed_library is not None:
+                local_k_heads = self.num_k_heads // self.tp_size
+                if (self.tp_size, local_k_heads, local_v_heads) not in ((4, 4, 12), (1, 16, 32)) or (
+                    self.head_k_dim,
+                    self.head_v_dim,
+                ) != (128, 128):
+                    raise ValueError("ReplaySSM SD mixed verify requires 27B TP4 or 9B TP1 GDN geometry")
+                load_replayssm_sd_mixed_library(mixed_library)
+                self.register_buffer(
+                    "_replayssm_sd_mixed_scratch",
+                    torch.empty((REPLAYSSM_SD_MIXED_CORES, 128, 16), dtype=torch.float32, device=self.A_log.device),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "_replayssm_sd_mixed_rhs",
+                    torch.zeros((16, 128), dtype=torch.bfloat16, device=self.A_log.device),
+                    persistent=False,
+                )
+                logger.info_once("ReplaySSM SD enabled with grouped mixed verify and fused compact: %s", mixed_library)
+                return
             self.register_buffer(
                 "_replayssm_sd_compact_status",
                 torch.empty(tasks, dtype=torch.int32, device=self.A_log.device),
@@ -485,11 +514,46 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         bases = attn_metadata.replayssm_sd_bases
         flush = attn_metadata.replayssm_sd_flush
         lengths = attn_metadata.replayssm_sd_lengths
-        pack = attn_metadata.replayssm_sd_pack_indices
         batch = slots.numel()
         max_tokens = REPLAYSSM_SD_MAX_TOKENS
         key_heads = self.num_k_heads // self.tp_size
         value_heads = self.num_v_heads // self.tp_size
+        if getattr(self, "_replayssm_sd_use_mixed", False):
+            q, k, v, gate, rate = (tensor.squeeze(0).contiguous() for tensor in (query, key, value, g, beta))
+            offsets = attn_metadata.spec_query_start_loc[: batch + 1].contiguous()
+            # The mixed operator writes live windows only. Preserve zero
+            # output for trailing graph tokens outside those windows.
+            output = torch.zeros_like(v)
+            blocks = min(REPLAYSSM_SD_MIXED_CORES, batch * key_heads)
+            torch.ops.replayssm_mix_910b.verify_(
+                q,
+                k,
+                v,
+                gate,
+                rate,
+                self.kv_cache[1],
+                self._replayssm_sd_d_ring,
+                self._replayssm_sd_k_ring,
+                self._replayssm_sd_g_ring,
+                slots,
+                ring_slots,
+                positions,
+                bases,
+                lengths,
+                output,
+                self._replayssm_sd_verify_status[: batch * value_heads],
+                self._replayssm_sd_mixed_rhs,
+                self._replayssm_sd_mixed_scratch[:blocks],
+                REPLAYSSM_SD_MIXED_CORES,
+                packed_panel=True,
+                bulk_qkv=True,
+                aiv_ablation=4,
+                flush=flush,
+                token_offsets=offsets,
+            )
+            return output.unsqueeze(0)
+
+        pack = attn_metadata.replayssm_sd_pack_indices
 
         def pack_tokens(src: torch.Tensor, tail: tuple[int, ...]) -> torch.Tensor:
             padded = src.new_zeros((batch, max_tokens, *tail))

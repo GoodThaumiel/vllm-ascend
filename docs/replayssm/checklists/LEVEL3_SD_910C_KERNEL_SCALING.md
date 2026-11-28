@@ -898,3 +898,38 @@ python3 scripts/replayssm/diagnose_sd_sequence.py --cpu-reference \
 请求的 token 输出、已接收数和吞吐。27B TP4 整网结果仍待
 四 die 环境。因第 6 张卡交给其他任务，错峰 A/B、同活跃行
 及 L8 服务脚本均已停，当前证据仅包含已完成的上述部分。
+
+### 短历史与紧凑混合算子的服务对照
+
+在 Blue2 使用同一个获准的逻辑 die 串行运行服务和探针。
+用 `npu-smi info -m` 核实映射。物理卡 6 的 chip 1 是逻辑
+die 13，进程以 `ASCEND_RT_VISIBLE_DEVICES=13` 启动时对应
+进程内 `npu:0`。本轮服务只跑 9B TP1。27B TP4 的单 die
+探针仍只模拟单 rank 的头数。
+
+使用当前源码版 vLLM Ascend、与它匹配的主扩展，以及按
+`-DSOC_VERSION=ascend910_9362` 编译的 mixed verify 实验库。
+以 [9B 服务清单](LEVEL3_SD_9B_MULTIMODAL_SERVE.md) 的启动命令
+为基础，依次替换 `--additional-config`。以实际构建路径替换
+表中的 `/abs/build/libreplayssm_sd_mix_torch.so`。
+
+| 对照 | `--additional-config` | 对比目的 |
+|---|---|---|
+| Native | `{"replayssm_sd":false}` | 整条原生 MTP3 路径 |
+| Vector L20 | `{"replayssm_sd":true,"replayssm_sd_verify_variant":20}` | V20 + compact v1 服务基线 |
+| Mixed L20 | `{"replayssm_sd":true,"replayssm_sd_mixed_library":"/abs/build/libreplayssm_sd_mix_torch.so"}` | 紧凑 token、按 key head 分组，verify 内折叠 checkpoint |
+| Mixed L8 | `{"replayssm_sd":true,"replayssm_sd_mixed_library":"/abs/build/libreplayssm_sd_mix_torch.so","replayssm_sd_logical_limit":8}` | 同一算子和缓冲布局，仅缩短折叠阈值 |
+
+每组用独立的 `VLLM_CACHE_ROOT`，记录源码 commit 和两份扩展的 hash。
+Mixed 路径限 MTP3、BF16、9B TP1 或 27B TP4、`max-num-seqs <= 256`。
+未指定阈值时 MTP3 为 20。L8 仍分配 32 项物理 ring，cache dtype 和容量
+相同，但会在每个非空 accepted 窗口后安排折叠。启动时检查 logical limit、
+mixed dispatch 日志和 FULL 图捕获。先跑单请求图回放并覆盖多轮
+fold 与 ring 绕回，再测多请求和 ragged 候选。
+
+端到端测试依次运行短文本与 4000 输入 / 400 输出，C128、C256，
+保持模型权重、预算、采样、prompt 分布和图配置一致。按实际
+`num_spec_decodes`、候选 token 数和图形状分组，单独报告纯 decode
+的 target forward p50/p90。对 Mixed L20 与 L8，检查同一批请求的
+MTP 接受率、折叠比例分布、输出及排队情况。若 Native 达不到同一
+活跃 batch，汇报可重叠的 batch 区间及各自的 HTTP 吞吐与容量。

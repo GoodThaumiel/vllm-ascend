@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import heapq
+from pathlib import Path
 
 import torch
 
@@ -36,6 +37,29 @@ def replayssm_sd_verify_variant(vllm_config) -> int:
     if not isinstance(variant, int) or variant not in (REPLAYSSM_SD_VERIFY_VARIANT, 20):
         raise ValueError("additional_config.replayssm_sd_verify_variant must be 13 or 20")
     return variant
+
+
+def replayssm_sd_logical_limit(vllm_config, num_spec: int) -> int:
+    """Resolve the cursor threshold independently of the physical ring length."""
+    window = num_spec + 1
+    minimum = 2 * window
+    maximum = vllm_config.cache_config.replayssm_buffer_len + window
+    value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd_logical_limit")
+    if value is None:
+        return maximum
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"additional_config.replayssm_sd_logical_limit must be an integer in [{minimum}, {maximum}]")
+    return value
+
+
+def replayssm_sd_mixed_library(vllm_config) -> str | None:
+    """Resolve the explicit opt-in to the standalone mixed verify library."""
+    value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd_mixed_library")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError("additional_config.replayssm_sd_mixed_library must be an absolute path")
+    return value
 
 
 def replayssm_sd_ring_capacity(vllm_config) -> int:
