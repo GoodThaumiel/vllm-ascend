@@ -204,12 +204,25 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
             query = torch.ones(1, 4, 4, 128, dtype=torch.bfloat16)
             value = torch.ones(1, 4, 12, 128, dtype=torch.bfloat16)
             gate = torch.zeros(1, 4, 12)
-            result = namespace["_replayssm_sd_decode"](
-                layer, query=query, key=query, value=value, g=gate, beta=gate, attn_metadata=metadata
-            )
-            verify.assert_called_once()
-            torch.testing.assert_close(result[:, :3], value[:, :3])
-            self.assertEqual(torch.count_nonzero(result[:, 3:]).item(), 0)
+            for output in (None, torch.zeros_like(value[0])):
+                with self.subTest(direct_output=output is not None):
+                    verify.reset_mock()
+                    result = namespace["_replayssm_sd_decode"](
+                        layer,
+                        query=query,
+                        key=query,
+                        value=value,
+                        g=gate,
+                        beta=gate,
+                        attn_metadata=metadata,
+                        output=output,
+                    )
+                    verify.assert_called_once()
+                    torch.testing.assert_close(result[:, :3], value[:, :3])
+                    self.assertEqual(torch.count_nonzero(result[:, 3:]).item(), 0)
+                    if output is not None:
+                        self.assertIs(verify.call_args.args[14], output)
+                        self.assertEqual(result.data_ptr(), output.data_ptr())
 
     def test_sd_serve_dispatches_selected_verify_variant(self) -> None:
         try:

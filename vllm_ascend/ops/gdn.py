@@ -507,6 +507,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         g: torch.Tensor,
         beta: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         slots = attn_metadata.replayssm_sd_block_slots
         ring_slots = attn_metadata.replayssm_sd_ring_slots
@@ -521,9 +522,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if getattr(self, "_replayssm_sd_use_mixed", False):
             q, k, v, gate, rate = (tensor.squeeze(0).contiguous() for tensor in (query, key, value, g, beta))
             offsets = attn_metadata.spec_query_start_loc[: batch + 1].contiguous()
-            # The mixed operator writes live windows only. Preserve zero
-            # output for trailing graph tokens outside those windows.
-            output = torch.zeros_like(v)
+            # The mixed operator writes live windows only. The caller can
+            # reuse the already-zeroed attention output for pure decode.
+            if output is None:
+                output = torch.zeros_like(v)
             blocks = min(REPLAYSSM_SD_MIXED_CORES, batch * key_heads)
             torch.ops.replayssm_mix_910b.verify_(
                 q,
@@ -927,6 +929,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2. Recurrent attention
         use_replayssm_sd = self.use_replayssm_sd and self.num_spec > 0
+        direct_sd_output = (
+            use_replayssm_sd
+            and self._replayssm_sd_use_mixed
+            and spec_sequence_masks is not None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+        )
         use_replayssm_ar = (
             self.cache_config.use_replayssm
             and not self.use_replayssm_sd
@@ -977,6 +986,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     g=g_spec,
                     beta=beta_spec,
                     attn_metadata=attn_metadata,
+                    output=core_attn_out[:num_actual_tokens] if direct_sd_output else None,
                 )
             else:
                 core_attn_out_spec = recurrent_gated_delta_rule(
@@ -1193,7 +1203,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if not direct_sd_output:
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
         maybe_save_kv_layer_to_connector("", [])
