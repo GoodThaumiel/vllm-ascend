@@ -233,3 +233,93 @@ At C8, Replay accepted 8172/11795 (69.28%) for 32 GSM8K requests,
 for 16 prompt-only JSON requests. All requests completed and all
 16 JSON outputs parsed. Schema-constrained output remains a separate
 test. The verified Replay artifact is `dflash-9b-replay-k7.El0FDU`.
+
+### 9B TP1 paired results for K4 and K7
+
+The 9B pairs used `84d8ae3`, die 13, max-seqs 64 and the same mixed
+library and launch settings as the K7 Replay run above. K4 used FULL
+sizes 5/20/40/80/320 and a 21-entry logical threshold. Both paths
+independently logged target and draft FULL replay at each K, with all
+fixed-length C1/C8/C32/C64 requests completed. One run per cell.
+
+| K | Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 1 | 41.87 | 31.87 | 22.92 | 30.37 |
+| 4 | 8 | 260.79 | 218.28 | 28.17 | 33.41 |
+| 4 | 32 | 611.92 | 553.63 | 47.22 | 52.03 |
+| 4 | 64 | 1053.08 | 970.12 | 53.98 | 58.02 |
+| 7 | 1 | 44.57 | 32.95 | 21.46 | 29.35 |
+| 7 | 8 | 264.11 | 220.52 | 27.96 | 33.66 |
+| 7 | 32 | 526.34 | 499.97 | 54.95 | 57.75 |
+| 7 | 64 | 870.17 | 859.04 | 64.76 | 66.04 |
+
+| K | C8 dataset | Native accepted / proposed | Replay accepted / proposed |
+|---:|---|---:|---:|
+| 4 | GSM8K, 32 requests | 7509/9260 (81.09%) | 7530/9272 (81.21%) |
+| 4 | General text, 32 requests | 3489/10632 (32.82%) | 3500/10584 (33.07%) |
+| 4 | Prompt-only JSON, 16 requests | 691/1340 (51.57%) | 688/1332 (51.65%) |
+| 7 | GSM8K, 32 requests | 8157/11998 (67.99%) | 8172/11795 (69.28%) |
+| 7 | General text, 32 requests | 3566/18081 (19.72%) | 3585/17920 (20.01%) |
+| 7 | Prompt-only JSON, 16 requests | 743/1974 (37.64%) | 743/1974 (37.64%) |
+
+All acceptance requests completed. All 16 JSON responses parsed in each
+cell. At C64 the K7 throughput gap was 1.3%. Absolute throughput peaked
+at K4 among these two measured windows, in both modes. No flush trace was
+collected. Artifacts are `dflash-9b-native-k4.FTbves`,
+`dflash-9b-replay-k4.0S5PHa`, `dflash-9b-native-k7.oSaKte`,
+and `dflash-9b-replay-k7.El0FDU`.
+
+### 27B TP2, DFlash2 K1
+
+Both modes at `6b02f37` used dies 11 and 15, max-seqs 32 and FULL sizes
+2/8/16/32/64. Replay used the same mixed library as K7 and an 18-entry
+logical threshold. Both passed all six cases and independently logged
+target and draft FULL replay. All fixed-length requests completed.
+
+| Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 33.24 | 19.35 | 28.71 | 41.81 |
+| 8 | 203.47 | 154.94 | 36.37 | 41.45 |
+| 32 | 615.97 | 579.30 | 46.66 | 50.09 |
+
+At C8 the accepted / proposed token counts in Native and Replay were
+4725/4904 and 4696/4872 on GSM8K, 2572/3554 and 2555/3570 on general
+text, and 455/553 and 456/552 on prompt-only JSON. All outputs completed
+and 16/16 JSON responses parsed in both modes. Compared with K4 and K6,
+Replay at K1 lost throughput at C32 for this prompt suite. No per-row
+flush trace was collected. Artifacts are `dflash-27b-native-k1.rM6O1W`
+and `dflash-27b-replay-k1.3pe2dj`.
+
+### Native ragged state-slot diagnostic
+
+The native GDR ABI expects a flat state index array of length T, the
+physical token count. It uses the previous accepted count to select
+the input state within each request's index row. A structured request
+can shorten its current query below that previous accepted count.
+
+The isolated die 10 probe
+`horizon-die13.Qozz2D/probe-dflash-native-ragged/probe.log` reproduced
+561103 on CANN 9.2.1 with packed lengths [1, 4] and two eight-slot
+rows. Padding each query to its physical width passed. The valid
+outputs and states matched the one-token recurrence reference with
+previous accepted counts [3, 2], including the row with only one
+current token. `57c388c` applies this only when Native GDR sees a
+packed query shorter than its state index table. It retains decode rows
+in the speculative state layout even if filtering removes all drafts.
+The dense path still calls the same native op directly.
+
+The original expanded mask sizing regressed a CPU graph-padding test.
+`0a6771a` keeps the existing mask sizing for other speculative modes.
+The two GDN metadata and mixed-batch modules then passed 80/80 CPU
+tests in the Blue2 environment, including the shortened DFlash query
+and anchor-only decode cases.
+
+9B TP1 Native at `57c388c` on die 10 passed strict JSON Schema over
+`vllm serve`. Settings matched the K7 matrix, with the separate device
+and mode-specific compile cache. A JSON Schema validator independently
+checked every response. C1 passed 4/4, accepting 184/420 proposed
+tokens (43.81%). C8 passed 16/16, accepting 731/1642 (44.52%).
+The ordinary C1 warmup logged actual FULL replay for both target and
+draft. This runtime check establishes the shape fix for the 9B Native
+K7 case. It does not measure graph coverage specifically during
+structured generation. Artifact `dflash-9b-native-k7.TDuNWs`.
