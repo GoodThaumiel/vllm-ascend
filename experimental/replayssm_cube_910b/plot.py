@@ -147,6 +147,8 @@ def main():
         "vector_pair": "V20 + compact v1",
         "mixed_verify": "AIC/AIV verify",
         "mixed_pair": "AIC/AIV verify + compact v1",
+        "mixed_fused_fold": "Fused mixed, original recurrence",
+        "mixed_column_recurrence": "Fused mixed, live columns",
     }
     for name, rows in by.items():
         rows.sort()
@@ -158,11 +160,13 @@ def main():
             roof.plot([r[2] for r in positive], [r[3] for r in positive], ".", color=line.get_color(), label=label)
     xs = [pt["flop_per_byte"] for pt in points if pt["flop_per_byte"] > 0]
     if xs:
-        lo = math.log10(min(xs) / 2)
-        hi = math.log10(max(max(xs) * 2, 1500 * args.cube_tflops / args.bandwidth_gbs))
+        vector_ridge = args.vector_tflops * 1000 / args.bandwidth_gbs
+        cube_ridge = args.cube_tflops * 1000 / args.bandwidth_gbs
+        lo = math.log10(min(min(xs), vector_ridge, cube_ridge) / 2)
+        hi = math.log10(2 * max(max(xs), vector_ridge, cube_ridge))
         x = [10 ** (lo + (hi - lo) * i / 199) for i in range(200)]
         for label, cap, style in (("Cube", args.cube_tflops, "--"), ("Vector", args.vector_tflops, ":")):
-            roof.plot(x, [min(v * args.bandwidth_gbs / 1000, cap) for v in x], style, label=label + " ceiling")
+            roof.plot(x, [min(v * args.bandwidth_gbs / 1000, cap) for v in x], style, label=label + " reference")
     lat.set(xlabel="Requests per batch", ylabel="Graph replay p50 (µs)", xscale="log", yscale="log")
     roof.set(
         xlabel="FLOP / byte",
@@ -177,7 +181,7 @@ def main():
     config = report["config"]
     fig.suptitle(
         f"{report.get('soc', 'Ascend')} Qwen3.5-{config.get('geometry', '27b').upper()} TP{config.get('tp', 4)} | "
-        f"T={config['length']} pos={config['pos']} flush={config['flush']} | ceilings: {args.roof_source}"
+        f"T={config['length']} pos={config['pos']} flush={config['flush']} | reference: {args.roof_source}"
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out)

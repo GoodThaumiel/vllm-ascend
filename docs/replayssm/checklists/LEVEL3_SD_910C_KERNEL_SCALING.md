@@ -1222,3 +1222,50 @@ python3 experimental/replayssm_cube_910b/run.py --suite mixed --geometry 27b \
 ```
 
 原始数据位于 Blue2 的 `horizon-die13.Qozz2D/candidate-columns.AAKioB`。
+
+#### MTP7 B1–128 扫描及重新预热
+
+沿用 `b2b5c862`、上一节的 native/mixed 库及软件环境，逻辑 die 13
+单层单 rank。T8、base31、20 AIC 与每 AIC 两个 V64 AIV，自 B1 至
+B128 逐一验证两种几何。全 flush 用 P8。混合点使用随机摆放
+（seed 42），约 1/8 行 flush（P8），其余行 P4。
+两种几何共 271 个 batch/flush 组合通过 eager 和 graph 的输出、
+checkpoint、ring、status 和投影校验。
+
+初扫每路径 20 次回放。原始样本中，每条新捕获图前两次常较慢。
+下表前三列使用同一口径去掉每组最初两次，再算 p50。另以
+`7cacf48` 对 27B 的 B1–5、B16–21、B31–33、B63–65 加两次
+不计时回放后独立跑 200 次，几何、库和全 flush 输入不变。
+
+| 场景 | Native p50 (µs) | 原 mixed p50 (µs) | 候选列 p50 (µs) |
+|---|---:|---:|---:|
+| 27B TP4 单 rank B32，4 行 flush | 378.18 | 229.62 | 215.03 |
+| 27B TP4 单 rank B64，8 行 flush | 718.53 | 416.41 | 392.25 |
+| 9B TP1 B128，16 行 flush | 3642.44 | 2084.34 | 1966.52 |
+| 9B TP1 B256，32 行 flush | 7233.77 | 4089.56 | 3855.20 |
+
+全 flush 的候选列 p50 优于 native 的点数为 27B 124/128、9B
+127/128，逐 batch 相对降幅的中位数为 20.85% / 18.88%。
+相比原 mixed，候选列 p50 的相对降幅中位数为 3.95% / 3.82%。
+混合 flush 扫描的 15 个点全部快于两个对照，候选列相对原
+mixed 的 p50 降幅中位数为 5.41% / 5.65%。
+
+200 次复测的 27B 全 flush 候选列在 B16/B18/B19 的 p50 为
+187.50/186.88/188.06 µs，p90 为 189.34/188.48/189.56 µs。
+B20→21 的 p50 从 190.39 增至 226.37 µs（+18.9%），仍低于
+同 batch 的 native 269.86 µs。当前几何有 4 个 key head，
+全 flush 时每核最多处理的 key-head 组数随 B20→21 从 4 增到 5。
+这与台阶位置一致。B1–3 的 p50 仍慢于 native。B3 和 B31 各
+出现一次明显的候选列长尾，观测最大值分别为 977.34 和
+2865.70 µs，p90 未受该单样本影响。待用同输入和交叉顺序复测
+长尾来源。该探针不含 27B 的跨卡通信以及模型服务的调度时间。
+
+同一 die 的图回放校准全部通过，测得连续 copy 1224.18 GB/s
+（读写双计）、BF16 方阵乘 243.90 TFLOP/s、FP32 UB 内
+`MulAddDst` 1.277 TFLOP/s。分别取每项校准形状中最高的 p50
+吞吐，用于 `plot.py --calibration` 的参考线。Roofline 的耗时
+来自设备事件，FLOP 和字节数来自源码中的主要计算及逻辑搬运
+模型。此轮没有片上 HBM 字节计数，图中点的斜率不能用来定性
+实际的带宽瓶颈。原始扫批及复测/校准记录位于 Blue2 的
+`horizon-die13.Qozz2D/candidate-columns-scan.3aEQf5` 和
+`horizon-die13.Qozz2D/roof-steady.gQak0U`。
