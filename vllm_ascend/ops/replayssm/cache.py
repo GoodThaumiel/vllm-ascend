@@ -18,6 +18,9 @@ REPLAYSSM_SD_MAX_HISTORY = 16
 REPLAYSSM_SD_MAX_VALUE_HEADS = 32
 REPLAYSSM_SD_VERIFY_TILE_V = 128
 REPLAYSSM_SD_VERIFY_VARIANT = 13
+REPLAYSSM_SD_DEFAULT_MIXED_LIBRARY = (
+    Path(__file__).resolve().parents[2] / "_replayssm_mixed" / "libreplayssm_sd_mix_torch.so"
+)
 
 
 def replayssm_sd_enabled(vllm_config) -> bool:
@@ -46,20 +49,45 @@ def replayssm_sd_logical_limit(vllm_config, num_spec: int) -> int:
     maximum = vllm_config.cache_config.replayssm_buffer_len + window
     value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd_logical_limit")
     if value is None:
+        if _replayssm_sd_uses_27b_tp4_geometry(vllm_config) and replayssm_sd_mixed_library(vllm_config) is not None:
+            return minimum
         return maximum
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"additional_config.replayssm_sd_logical_limit must be an integer in [{minimum}, {maximum}]")
     return value
 
 
+def _replayssm_sd_uses_27b_tp4_geometry(vllm_config) -> bool:
+    spec = getattr(vllm_config, "speculative_config", None)
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if getattr(spec, "num_speculative_tokens", None) != 3 or getattr(parallel, "tensor_parallel_size", None) != 4:
+        return False
+    text = getattr(getattr(vllm_config, "model_config", None), "hf_text_config", None)
+    return (
+        getattr(text, "linear_num_key_heads", None),
+        getattr(text, "linear_num_value_heads", None),
+        getattr(text, "linear_key_head_dim", None),
+        getattr(text, "linear_value_head_dim", None),
+    ) == (16, 48, 128, 128)
+
+
 def replayssm_sd_mixed_library(vllm_config) -> str | None:
-    """Resolve the explicit opt-in to the standalone mixed verify library."""
-    value = (getattr(vllm_config, "additional_config", None) or {}).get("replayssm_sd_mixed_library")
-    if value is None:
+    """Select mixed verify for the default 27B TP4 MTP3 configuration."""
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    value = additional_config.get("replayssm_sd_mixed_library")
+    if value is not None:
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise ValueError("additional_config.replayssm_sd_mixed_library must be an absolute path")
+        return value
+    if "replayssm_sd_verify_variant" in additional_config or not _replayssm_sd_uses_27b_tp4_geometry(vllm_config):
         return None
-    if not isinstance(value, str) or not Path(value).is_absolute():
-        raise ValueError("additional_config.replayssm_sd_mixed_library must be an absolute path")
-    return value
+    if not REPLAYSSM_SD_DEFAULT_MIXED_LIBRARY.is_file():
+        raise ValueError(
+            f"Default ReplaySSM mixed verify library missing at {REPLAYSSM_SD_DEFAULT_MIXED_LIBRARY}. "
+            "Build and install it using LEVEL3_SD_27B_TP4_SERVE.md, supply replayssm_sd_mixed_library, "
+            "or select vector verify with replayssm_sd_verify_variant=13 or 20."
+        )
+    return str(REPLAYSSM_SD_DEFAULT_MIXED_LIBRARY)
 
 
 def replayssm_sd_ring_capacity(vllm_config) -> int:

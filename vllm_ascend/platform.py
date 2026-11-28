@@ -512,11 +512,11 @@ class NPUPlatform(Platform):
                 raise ValueError("additional_config.replayssm_sd requires MTP1/2/3 speculative decoding")
             ring_len = replayssm_sd_ring_len(vllm_config.cache_config.replayssm_buffer_len, spec.num_speculative_tokens)
             ring_capacity = replayssm_sd_ring_capacity(vllm_config)
-            logical_limit = replayssm_sd_logical_limit(vllm_config, spec.num_speculative_tokens)
             replayssm_sd_verify_variant(vllm_config)
             if getattr(spec, "method", None) != "mtp":
                 raise ValueError("Ascend ReplaySSM SD currently supports MTP1/2/3 only")
-            if replayssm_sd_mixed_library(vllm_config) is not None:
+            mixed_library = replayssm_sd_mixed_library(vllm_config)
+            if mixed_library is not None:
                 if spec.num_speculative_tokens != 3:
                     raise ValueError("ReplaySSM SD mixed verify requires MTP3")
                 if vllm_config.scheduler_config.max_num_seqs > 256 or ring_capacity > 1023:
@@ -544,6 +544,15 @@ class NPUPlatform(Platform):
                 raise ValueError("Use additional_config.replayssm_sd without --use-replayssm on vLLM 0.30")
             if vllm_config.cache_config.mamba_cache_mode != "none":
                 raise ValueError("Ascend ReplaySSM SD currently requires --mamba-cache-mode none")
+            logical_limit = replayssm_sd_logical_limit(vllm_config, spec.num_speculative_tokens)
+            if mixed_library is not None:
+                # Include the resolved defaults in the config that workers and
+                # the upstream graph cache receive.
+                vllm_config.additional_config = {
+                    **vllm_config.additional_config,
+                    "replayssm_sd_mixed_library": mixed_library,
+                    "replayssm_sd_logical_limit": logical_limit,
+                }
             logger.info(
                 "Enabled Ascend ReplaySSM SD for MTP%d with BF16 checkpoint, %d-entry ring and logical limit %d",
                 spec.num_speculative_tokens,

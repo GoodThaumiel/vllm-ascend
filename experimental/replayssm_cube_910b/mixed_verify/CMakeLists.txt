@@ -67,3 +67,6 @@ target_link_options(replayssm_sd_mix_torch PRIVATE
     "LINKER:-rpath,\$ORIGIN/lib"
     "LINKER:--enable-new-dtags"
 )
+
+install(TARGETS replayssm_sd_mix_torch LIBRARY DESTINATION .)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/lib/libreplayssm_sd_mix_kernel.so" DESTINATION lib)

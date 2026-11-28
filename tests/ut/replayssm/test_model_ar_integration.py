@@ -5,6 +5,7 @@ import ast
 import importlib.util
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -145,6 +146,40 @@ class ReplaySSMModelARIntegrationTests(unittest.TestCase):
             config.additional_config["replayssm_sd_mixed_library"] = value
             with self.assertRaisesRegex(ValueError, "absolute path"):
                 CACHE.replayssm_sd_mixed_library(config)
+
+    def test_sd_27b_tp4_mtp3_selects_installed_mixed_l8(self) -> None:
+        config = SimpleNamespace(
+            additional_config={"replayssm_sd": True},
+            cache_config=SimpleNamespace(replayssm_buffer_len=16),
+            parallel_config=SimpleNamespace(tensor_parallel_size=4),
+            speculative_config=SimpleNamespace(num_speculative_tokens=3),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    linear_num_key_heads=16,
+                    linear_num_value_heads=48,
+                    linear_key_head_dim=128,
+                    linear_value_head_dim=128,
+                )
+            ),
+        )
+        with TemporaryDirectory() as directory:
+            library = Path(directory) / "libreplayssm_sd_mix_torch.so"
+            with patch.object(CACHE, "REPLAYSSM_SD_DEFAULT_MIXED_LIBRARY", library):
+                with self.assertRaisesRegex(ValueError, "Default ReplaySSM mixed verify library missing"):
+                    CACHE.replayssm_sd_mixed_library(config)
+                library.touch()
+                self.assertEqual(CACHE.replayssm_sd_mixed_library(config), str(library))
+                self.assertEqual(CACHE.replayssm_sd_logical_limit(config, 3), 8)
+                config.additional_config["replayssm_sd_logical_limit"] = 20
+                self.assertEqual(CACHE.replayssm_sd_logical_limit(config, 3), 20)
+                del config.additional_config["replayssm_sd_logical_limit"]
+                config.additional_config["replayssm_sd_verify_variant"] = 20
+                self.assertIsNone(CACHE.replayssm_sd_mixed_library(config))
+                self.assertEqual(CACHE.replayssm_sd_logical_limit(config, 3), 20)
+                del config.additional_config["replayssm_sd_verify_variant"]
+                config.parallel_config.tensor_parallel_size = 1
+                self.assertIsNone(CACHE.replayssm_sd_mixed_library(config))
+                self.assertEqual(CACHE.replayssm_sd_logical_limit(config, 3), 20)
 
     def test_sd_mixed_serve_passes_ragged_windows_and_skips_legacy_pack(self) -> None:
         # Exercise the real method with CPU tensors and a stand-in launcher.
