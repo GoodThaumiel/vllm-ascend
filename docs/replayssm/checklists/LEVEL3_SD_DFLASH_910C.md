@@ -129,6 +129,25 @@ the engine. All 16 requests failed, so its partial counters are excluded.
 The Replay schema-constrained test is pending. Artifact directories are
 `dflash-27b-native-k7.BKCgn8` and `dflash-27b-replay-k7.8KokLw` on Blue2.
 
+### 27B TP2, DFlash2 K4
+
+Both modes at `6b02f37` passed the same six performance and acceptance
+cases and independently logged FULL target and draft replay. The graph
+shapes were 5/20/40/80/160 and the Replay logical threshold was 21. The
+physical ring and mixed library were the same as K7. No per-row flush
+trace was collected. One run per mode.
+
+| Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---|---:|---:|---:|---:|
+| 1 | 47.53 | 43.22 | 19.52 | 21.55 |
+| 8 | 238.39 | 236.96 | 30.03 | 29.69 |
+| 32 | 617.73 | 631.76 | 43.81 | 43.48 |
+
+At C8, Native / Replay acceptance was 85.23% / 84.74% on GSM8K,
+38.37% / 38.71% on general text and 54.48% / 55.16% on prompt-only
+JSON. Both modes returned parseable JSON for all 16 samples. Artifacts
+are `dflash-27b-native-k4.nq1DX5` and `dflash-27b-replay-k4.Z0Z9ZN`.
+
 ### 9B TP1 mixed attention preflight
 
 The 9B draft has five sliding layers with a 4096-token window and one full
@@ -146,3 +165,14 @@ At `eb799cb`, weights loaded and the draft FULL wrapper initialized.
 Memory profiling failed because it clears dummy slot mappings before
 the per-group buffers are assigned. `c0f10e4` fixes that initialization
 order. The failed profile report is `dflash-9b-replay-k7.41b8vD`.
+
+At `c0f10e4`, both MRv1 modes passed K7 capture and logged independent
+target/draft FULL replay at C1. The two C1 requests passed per mode.
+Draft acceptance was 23/1617 (1.42%) Native and 38/1512 (2.51%) Replay,
+versus 156/714 (21.85%) for the MRv2 Native smoke on the same two prompts.
+Both MRv1 paths failed C8 with device error 507011. The CANN debug logs
+identify `ScatterPaKvCache_e1075f1c4d344a306bb205d49ce88d2b_1001` in both.
+The C1 smoke is insufficient evidence of correct draft cache addressing.
+Artifacts are `dflash-9b-native-k7.ojFKVi` and
+`dflash-9b-replay-k7.UhgQ6m`. A separate diagnostic checks the per-group
+slot mappings and active cache layout without changing the checkpoint.
