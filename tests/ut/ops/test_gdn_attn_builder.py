@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.config.cache import CacheConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.third_party.flash_linear_attention.ops import index as _fla_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -169,7 +170,7 @@ def _make_vllm_config(
     model_config.get_num_attention_heads = lambda parallel_config: num_heads
 
     return SimpleNamespace(
-        cache_config=SimpleNamespace(mamba_cache_mode=mamba_cache_mode),
+        cache_config=CacheConfig(mamba_cache_mode=mamba_cache_mode),
         compilation_config=SimpleNamespace(
             cudagraph_mode=cudagraph_mode,
             max_cudagraph_capture_size=None,

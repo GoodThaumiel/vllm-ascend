@@ -884,19 +884,23 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # DFlash grammar filtering can trim the entire current draft. A
         # decode row still needs the previous accepted state in cache mode
         # none, even when the current query only contains its anchor.
-        keep_decode_rows = self.use_replayssm_sd or (
+        keep_dflash_decode_rows = (
             self._USE_COMMON_KERNEL_METADATA
             and num_accepted_tokens is not None
             and getattr(self.vllm_config.speculative_config, "method", None) == "dflash"
             and self.vllm_config.cache_config.mamba_cache_mode == "none"
         )
-        if not self.use_spec_decode or (not keep_decode_rows and num_decode_draft_tokens_cpu is None):
+        if not self.use_spec_decode or (not keep_dflash_decode_rows and num_decode_draft_tokens_cpu is None):
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
-            num_reqs = m.num_reqs
+            if keep_dflash_decode_rows:
+                num_reqs = m.num_reqs
+            else:
+                assert num_decode_draft_tokens_cpu is not None
+                num_reqs = num_decode_draft_tokens_cpu.numel()
             spec_sequence_masks_cpu = self.spec_sequence_masks_cpu[:num_reqs]
-            if keep_decode_rows:
+            if self.use_replayssm_sd or keep_dflash_decode_rows:
                 if m.is_prefilling is None:
                     raise ValueError("GDN speculative decode requires is_prefilling metadata")
                 query_lens_cpu = torch.diff(query_start_loc_cpu)
@@ -909,9 +913,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     raise ValueError(f"GDN decode window exceeds {self.num_spec + 1} tokens")
             else:
                 assert num_decode_draft_tokens_cpu is not None
-                draft_counts = num_decode_draft_tokens_cpu[:num_reqs]
-                if draft_counts.clamp_min(0).sum().item() > 0:
-                    torch.ge(draft_counts, 0, out=spec_sequence_masks_cpu)
+                runtime_draft_tokens = num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
+                if runtime_draft_tokens.sum().item() > 0:
+                    torch.ge(num_decode_draft_tokens_cpu, 0, out=spec_sequence_masks_cpu)
                 else:
                     # No draft tokens in this batch. Keep the usual split.
                     spec_sequence_masks_cpu.zero_()
