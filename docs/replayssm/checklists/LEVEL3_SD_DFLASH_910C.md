@@ -334,6 +334,34 @@ parseable JSON responses. K2 delivered higher absolute C32 throughput
 than K1, K4 and K6 in both modes. Artifacts are
 `dflash-27b-native-k2.J63b9J` and `dflash-27b-replay-k2.Xm63ZH`.
 
+### 27B TP2, DFlash2 K3
+
+Both paths ran at `6b02f37` on dies 11 and 15, max-seqs 32, with
+FULL sizes 4/16/32/64/128. Replay used the same mixed library and
+logical threshold 20. The logs independently confirm target and draft
+FULL replay. All six cases passed. Each fixed-length case produced
+exactly three proposed draft tokens per counted iteration. No per-row
+flush trace was collected.
+
+| Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 45.23 | 40.79 | 20.57 | 22.91 |
+| 8 | 248.37 | 228.02 | 27.79 | 30.64 |
+| 32 | 708.19 | 690.08 | 39.14 | 38.52 |
+
+| C8 dataset | Native accepted / proposed | Replay accepted / proposed | Passed per mode |
+|---|---:|---:|---:|
+| GSM8K | 7079/7950 (89.04%) | 7030/7869 (89.34%) | 32/32 |
+| General text | 3573/7680 (46.52%) | 3589/7650 (46.92%) | 32/32 |
+| Prompt-only JSON | 658/1062 (61.96%) | 657/1059 (62.04%) | 16/16 |
+
+Both modes returned 16/16 parseable JSON responses. At C32, Replay had
+1.6% lower TPOT p50 and 2.6% lower throughput. The engine reported KV
+capacity of 168,580 tokens for Native and 249,977 for Replay with the
+same scheduling cap. K3 had the highest C32 throughput so far among
+the matched K1/2/3/4/6 trials in both paths. Artifacts are
+`dflash-27b-native-k3.XuyTDy` and `dflash-27b-replay-k3.XkkVwV`.
+
 ### Native ragged state-slot diagnostic
 
 The native GDR ABI expects a flat state index array of length T, the
