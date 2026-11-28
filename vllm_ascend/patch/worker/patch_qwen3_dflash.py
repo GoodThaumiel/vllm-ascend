@@ -1,9 +1,30 @@
 import torch
 import torch.nn.functional as F
+from vllm.config import get_current_vllm_config_or_none
+from vllm.model_executor.models import qwen3_dflash
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
+
+_original_resolve_layer_attention = qwen3_dflash._resolve_layer_attention
+
+
+def _resolve_layer_attention(config, layer_idx):
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None or vllm_config.use_v2_model_runner or not vllm_config._dflash_needs_multi_kv_group():
+        return _original_resolve_layer_attention(config, layer_idx)
+    # The Ascend MRv1 proposer supplies a separate block table, slot
+    # mapping and causality for each attention group.
+    sliding_window = None
+    if config.layer_types[layer_idx] == "sliding_attention":
+        sliding_window = config.dflash_config.get("swa_window_size", getattr(config, "sliding_window", None))
+        if sliding_window is None:
+            raise ValueError("DFlash sliding attention requires a configured window")
+    return sliding_window, qwen3_dflash._dflash_layer_causal(config, layer_idx)
+
+
+qwen3_dflash._resolve_layer_attention = _resolve_layer_attention
 
 
 def precompute_and_store_context_kv(

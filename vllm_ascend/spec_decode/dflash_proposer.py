@@ -1,10 +1,14 @@
+from copy import copy
 from typing import Any
 
 import torch
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
@@ -13,7 +17,7 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
-from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
+from vllm_ascend.spec_decode.utils import DynamicSpecScheduler, SlidingWindowAdapter
 
 _COPY_EXPAND_TILE_SIZE = 256
 
@@ -50,6 +54,7 @@ class AscendDflashProposer(AscendEagleProposer):
             runner=runner,
         )
 
+        self.mixed_dflash_attention = self.method == "dflash" and vllm_config._dflash_needs_multi_kv_group()
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         self.max_positions = self.max_num_tokens + self.max_query_tokens
 
@@ -97,6 +102,88 @@ class AscendDflashProposer(AscendEagleProposer):
                 device=device,
             )
 
+    def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
+        if not self.mixed_dflash_attention:
+            return super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        if self.dcp_size != 1 or self.vllm_config.parallel_config.prefill_context_parallel_size != 1:
+            raise ValueError("Mixed sliding/full DFlash on Ascend MRv1 requires DCP=PCP=1")
+        if self.draft_window_size is not None:
+            raise ValueError("Mixed sliding/full DFlash uses the checkpoint's per-layer attention windows")
+
+        names = self.model.get_draft_kv_cache_layer_names()
+        self.attn_layer_names = names
+        self._dflash_layer_causal = dict(zip(names, self.model.get_draft_attn_causal(), strict=True))
+        all_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase, names)
+        by_key = {}
+        layer_gid = {}
+        self._dflash_block_sizes = {}
+        self._dflash_sliding_windows = {}
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            for name in names:
+                if name not in group.layer_names:
+                    continue
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[name]
+                backend = all_layers[name].get_attn_backend()
+                key = (gid, backend, spec, self._dflash_layer_causal[name])
+                kernel_size = kernel_block_sizes[gid] if kernel_block_sizes is not None else spec.block_size
+                layer_gid[name] = gid
+                self._dflash_block_sizes[gid] = kernel_size
+                if key not in by_key:
+                    attn_group = AttentionGroup(backend, [], spec, gid)
+                    attn_group.create_metadata_builders(self.vllm_config, self.device, kernel_block_size=kernel_size)
+                    by_key[key] = attn_group
+                by_key[key].layer_names.append(name)
+                if isinstance(spec, SlidingWindowSpec) and gid not in self._dflash_sliding_windows:
+                    self._dflash_sliding_windows[gid] = SlidingWindowAdapter(
+                        spec.sliding_window + self.num_speculative_tokens,
+                        kernel_size,
+                        self.max_batch_size,
+                        0,
+                        self.device,
+                    )
+        if layer_gid.keys() != set(names):
+            raise RuntimeError("Missing KV cache groups for DFlash layers")
+
+        self.draft_attn_groups = list(by_key.values())
+        self.kv_cache_gid = layer_gid[names[0]]
+        self.kernel_block_size = self.block_size = self._dflash_block_sizes[self.kv_cache_gid]
+        self._dflash_layer_gids = [layer_gid[name] for name in names]
+        self._per_group_block_table_buffers = {}
+        self._dflash_input_slot_mappings = {}
+        self._per_group_query_slot_mapping_buffers = {
+            gid: torch.full_like(self._slot_mapping_buffer, -1) for gid in self._dflash_block_sizes
+        }
+        self._per_group_context_slot_mapping_buffers = {
+            gid: torch.full_like(self._context_slot_mapping_buffers, -1) for gid in self._dflash_block_sizes
+        }
+
+    def set_per_group_attn_metadata(self, gid, block_table, slot_mapping) -> None:
+        if gid in self._dflash_block_sizes:
+            self._per_group_block_table_buffers[gid] = block_table
+            self._dflash_input_slot_mappings[gid] = slot_mapping
+
+    def _dflash_group_metadata(self, common, group, num_input_tokens):
+        gid = group.kv_cache_group_id
+        view = copy(common)
+        view.causal = self._dflash_layer_causal[group.layer_names[0]]
+        view.block_table_tensor = self._adjust_tensor(self._per_group_block_table_buffers[gid], common.num_reqs)
+        view.slot_mapping = self._per_group_query_slot_mapping_buffers[gid][:num_input_tokens]
+        if adapter := self._dflash_sliding_windows.get(gid):
+            adapter.apply(view)
+        return view
+
+    def build_draft_attn_metadata(self, common_attn_metadata, num_input_tokens, num_actual_tokens):
+        if not self.mixed_dflash_attention:
+            return super().build_draft_attn_metadata(common_attn_metadata, num_input_tokens, num_actual_tokens)
+        per_layer = {}
+        for group in self.draft_attn_groups:
+            view = self._dflash_group_metadata(common_attn_metadata, group, num_input_tokens)
+            metadata = group.get_metadata_builder().build(0, view)
+            per_layer.update(dict.fromkeys(group.layer_names, metadata))
+        return [per_layer], per_layer[self.attn_layer_names[0]]
+
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,
@@ -129,36 +216,59 @@ class AscendDflashProposer(AscendEagleProposer):
 
         has_num_rejected = num_rejected_tokens_gpu is not None
 
-        copy_and_expand_dflash_and_dspark_inputs_kernel[(_compute_num_programs(num_context, num_query_total),)](
-            # Inputs
-            next_token_ids_ptr=next_token_ids,
-            target_positions_ptr=target_positions,
-            context_slot_mapping_ptr=cad.slot_mapping,
-            # Outputs
-            out_input_ids_ptr=self.input_ids,
-            out_context_positions_ptr=self._context_positions_buffer,
-            out_query_positions_ptr=self.positions,
-            out_context_slot_mapping_ptr=self._context_slot_mapping_buffers,
-            out_query_slot_mapping_ptr=self._slot_mapping_buffer,
-            out_token_indices_ptr=token_indices_to_sample,
-            # Block table
-            block_table_ptr=cad.block_table_tensor,
-            block_table_stride=cad.block_table_tensor.stride(0),
-            # Metadata
-            query_start_loc_ptr=cad.query_start_loc,
-            seq_lens_ptr=cad.seq_lens,
-            num_rejected_tokens_ptr=(num_rejected_tokens_gpu if has_num_rejected else 0),
-            # Scalars
-            parallel_drafting_token_id=self.parallel_drafting_token_id,
-            block_size=self.kernel_block_size,
-            num_query_per_req=num_query_per_req,
-            num_speculative_tokens=self.num_speculative_tokens,
-            total_input_tokens=num_context,
-            batch_size=batch_size,
-            HAS_NUM_REJECTED=has_num_rejected,
-        )
+        if self.mixed_dflash_attention:
+            group_inputs = [
+                (
+                    self._per_group_block_table_buffers[gid],
+                    self._dflash_input_slot_mappings[gid],
+                    self._per_group_context_slot_mapping_buffers[gid],
+                    self._per_group_query_slot_mapping_buffers[gid],
+                    block_size,
+                )
+                for gid, block_size in self._dflash_block_sizes.items()
+            ]
+            self._context_slot_mapping_buffers = [
+                self._per_group_context_slot_mapping_buffers[gid] for gid in self._dflash_layer_gids
+            ]
+            query_slots = self._per_group_query_slot_mapping_buffers[self.kv_cache_gid]
+        else:
+            query_slots = self._slot_mapping_buffer
+            group_inputs = [
+                (
+                    cad.block_table_tensor,
+                    cad.slot_mapping,
+                    self._context_slot_mapping_buffers,
+                    query_slots,
+                    self.kernel_block_size,
+                )
+            ]
+        num_programs = _compute_num_programs(num_context, num_query_total)
+        for block_table, context_slots, out_context_slots, out_query_slots, block_size in group_inputs:
+            copy_and_expand_dflash_and_dspark_inputs_kernel[(num_programs,)](
+                next_token_ids_ptr=next_token_ids,
+                target_positions_ptr=target_positions,
+                context_slot_mapping_ptr=context_slots,
+                out_input_ids_ptr=self.input_ids,
+                out_context_positions_ptr=self._context_positions_buffer,
+                out_query_positions_ptr=self.positions,
+                out_context_slot_mapping_ptr=out_context_slots,
+                out_query_slot_mapping_ptr=out_query_slots,
+                out_token_indices_ptr=token_indices_to_sample,
+                block_table_ptr=block_table,
+                block_table_stride=block_table.stride(0),
+                query_start_loc_ptr=cad.query_start_loc,
+                seq_lens_ptr=cad.seq_lens,
+                num_rejected_tokens_ptr=(num_rejected_tokens_gpu if has_num_rejected else 0),
+                parallel_drafting_token_id=self.parallel_drafting_token_id,
+                block_size=block_size,
+                num_query_per_req=num_query_per_req,
+                num_speculative_tokens=self.num_speculative_tokens,
+                total_input_tokens=num_context,
+                batch_size=batch_size,
+                HAS_NUM_REJECTED=has_num_rejected,
+            )
 
-        query_slot_mapping = self._slot_mapping_buffer[:num_query_total]
+        query_slot_mapping = query_slots[:num_query_total]
         new_query_start_loc = self.arange_dflash[: batch_size + 1] * num_query_per_req
 
         effective_seq_lens = cad.seq_lens
@@ -188,6 +298,14 @@ class AscendDflashProposer(AscendEagleProposer):
 
     def _clear_dummy_slot_mappings(self) -> None:
         self._slot_mapping_buffer.fill_(-1)
+        if self.mixed_dflash_attention:
+            for buffers in (
+                self._per_group_query_slot_mapping_buffers,
+                self._per_group_context_slot_mapping_buffers,
+            ):
+                for mapping in buffers.values():
+                    mapping.fill_(-1)
+            return
         self._context_slot_mapping_buffers.fill_(-1)
 
     @torch.inference_mode()
@@ -220,7 +338,6 @@ class AscendDflashProposer(AscendEagleProposer):
 
         multi_steps_attn_metadata = []
         if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
-            builder = self.draft_attn_groups[0].get_metadata_builder()
             common_attn_metadata = AscendCommonAttentionMetadata(
                 query_start_loc=self.arange_dflash[: num_reqs + 1] * num_query_per_req,
                 query_start_loc_cpu=torch.from_numpy(self.token_arange_np[: num_reqs + 1]).clone() * num_query_per_req,
@@ -240,17 +357,26 @@ class AscendDflashProposer(AscendEagleProposer):
                 ],
             )
 
-            attn_metadata_dflash = builder.build_for_graph_capture(
-                common_attn_metadata,
-                AscendAttentionState.ChunkedPrefill,
-            )
-
-            attn_metadata_dflash.attn_mask = None
-            attn_metadata_dflash.attn_state = AscendAttentionState.ChunkedPrefill
-
-            per_layer_attn_metadata = dict()
-            for layer_name in self.attn_layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata_dflash
+            per_layer_attn_metadata = {}
+            groups = self.draft_attn_groups if self.mixed_dflash_attention else self.draft_attn_groups[:1]
+            for group in groups:
+                view = common_attn_metadata
+                names = self.attn_layer_names
+                if self.mixed_dflash_attention:
+                    gid = group.kv_cache_group_id
+                    self._per_group_block_table_buffers[gid] = self.runner.input_batch.block_table[
+                        gid
+                    ].get_device_tensor()[:num_reqs]
+                    view = self._dflash_group_metadata(common_attn_metadata, group, num_query_total)
+                    names = group.layer_names
+                metadata = group.get_metadata_builder().build_for_graph_capture(
+                    view,
+                    AscendAttentionState.ChunkedPrefill,
+                )
+                if not view.causal:
+                    metadata.attn_mask = None
+                metadata.attn_state = AscendAttentionState.ChunkedPrefill
+                per_layer_attn_metadata.update(dict.fromkeys(names, metadata))
             multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         self.token_indices_to_sample.fill_(0)

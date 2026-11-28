@@ -3941,6 +3941,8 @@ class NPUModelRunner(GPUModelRunner):
                 # build per-step attention metadata for the active MTP layer.
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping)
+            elif isinstance(self.drafter, AscendDflashProposer) and self.drafter.mixed_dflash_attention:
+                self.drafter.set_per_group_attn_metadata(kv_cache_gid, cm.block_table_tensor, cm.slot_mapping)
             elif self.speculative_config and isinstance(self.drafter, AscendGemma4Proposer):
                 self.drafter.set_per_group_block_table(kv_cache_gid, cm.block_table_tensor)
             if self.speculative_config and spec_decode_common_attn_metadata is None:

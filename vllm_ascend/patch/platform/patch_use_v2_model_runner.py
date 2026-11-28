@@ -57,6 +57,10 @@ _original_get_v1_model_runner_unsupported_features = VllmConfig._get_v1_model_ru
 
 def _patched_get_v1_model_runner_unsupported_features(self) -> list[str]:
     unsupported = _original_get_v1_model_runner_unsupported_features(self)
+    if "mixed sliding/full dflash drafts" in unsupported and get_current_hardware_profile().supports(
+        HardwareCapability.STANDARD_WORKER_PATCHES
+    ):
+        unsupported.remove("mixed sliding/full dflash drafts")
     return [feature for feature in unsupported if feature not in _ASCEND_V1_SUPPORTED_FEATURES]
 
 

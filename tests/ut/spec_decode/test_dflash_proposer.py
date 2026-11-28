@@ -30,6 +30,7 @@ from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 class TestDummySlotMappingCleanup:
     def test_dummy_run_clears_single_group_buffers_before_forward(self, monkeypatch):
         proposer = AscendDflashProposer.__new__(AscendDflashProposer)
+        proposer.mixed_dflash_attention = False
         proposer._slot_mapping_buffer = torch.full((8,), 123, dtype=torch.int32)
         proposer._context_slot_mapping_buffers = torch.full((8,), 456, dtype=torch.int32)
 
@@ -64,3 +65,31 @@ class TestDummySlotMappingCleanup:
         assert torch.all(proposer._slot_mapping_buffer == -1)
         assert torch.all(proposer._context_slot_mapping_buffers == -1)
         proposer._runnable.assert_called_once()
+
+
+def test_mixed_dflash_metadata_keeps_cache_groups_and_causality_separate():
+    proposer = AscendDflashProposer.__new__(AscendDflashProposer)
+    proposer.mixed_dflash_attention = True
+    proposer.attn_layer_names = ["sliding", "full"]
+    proposer._dflash_layer_causal = {"sliding": True, "full": False}
+    proposer._dflash_sliding_windows = {}
+    proposer._per_group_block_table_buffers = {1: torch.tensor([[10]]), 2: torch.tensor([[20]])}
+    proposer._per_group_query_slot_mapping_buffers = {1: torch.tensor([101, 102]), 2: torch.tensor([201, 202])}
+    proposer.draft_attn_groups = [
+        SimpleNamespace(
+            kv_cache_group_id=gid,
+            layer_names=[name],
+            get_metadata_builder=lambda: SimpleNamespace(build=lambda _, view: view),
+        )
+        for gid, name in enumerate(proposer.attn_layer_names, start=1)
+    ]
+    common = SimpleNamespace(num_reqs=1, causal=False, block_table_tensor=None, slot_mapping=None)
+    (metadata,), primary = proposer.build_draft_attn_metadata(common, 2, 2)
+    assert primary is metadata["sliding"]
+    assert metadata["sliding"].causal
+    assert not metadata["full"].causal
+    for gid, name in enumerate(proposer.attn_layer_names, start=1):
+        torch.testing.assert_close(metadata[name].block_table_tensor, proposer._per_group_block_table_buffers[gid])
+        torch.testing.assert_close(metadata[name].slot_mapping, proposer._per_group_query_slot_mapping_buffers[gid])
+    assert common.block_table_tensor is None
+    assert common.slot_mapping is None
