@@ -549,7 +549,7 @@ def trial(args, b, dev):
             calls["fold_gemm"] = lambda: torch.bmm(dl, kh)
 
     if compare_mixed:
-        blocks = min(b * key_heads, args.mixed_cores)
+        blocks = min(b * (value_heads if args.mixed_head_grid else key_heads), args.mixed_cores)
         zeros = torch.zeros((16, 128), dtype=torch.bfloat16, device=dev)
         panel_tokens = 8 if wide else 4
         wide_offsets = torch.arange(b + 1, device=dev, dtype=torch.int32) * t if wide else None
@@ -576,6 +576,8 @@ def trial(args, b, dev):
             except AssertionError as exc:
                 summary = projection_error_summary(actual, expected_projection, panel_tokens)
                 raise AssertionError(f"{exc}\nProjection mismatch by column group: {json.dumps(summary)}") from None
+
+        grid_options = {"expand_head_grid": True} if args.mixed_head_grid else {}
 
         def verify_mixed(packed=False, cache=c, ablation=0):
             panel_options = (True,) if packed else ()
@@ -609,6 +611,7 @@ def trial(args, b, dev):
                 args.mixed_cores,
                 *panel_options,
                 *((wide_offsets,) if wide else ()),
+                **grid_options,
             )
 
         mixed_checks = [
@@ -890,6 +893,7 @@ def parse_args(argv=None):
     ap.add_argument("--mixed-cores", type=int, choices=range(1, 21), default=20)
     ap.add_argument("--mixed-workspace", choices=("per-core", "per-head"), default="per-core")
     ap.add_argument("--mixed-balanced", action="store_true", help="Balance entire value-head ranges across Cube blocks")
+    ap.add_argument("--mixed-head-grid", action="store_true", help="Let balanced tasks launch one block per value head")
     ablations = ap.add_mutually_exclusive_group()
     ablations.add_argument(
         "--mixed-suffix", action="store_true", help="Pre-scale packed AIV history rows by gate suffix"
@@ -926,6 +930,8 @@ def parse_args(argv=None):
         ap.error("mixed-suffix and mixed-qkv require a packed AIV path")
     if args.mixed_balanced and not any(path in ALL_MIXED_PATHS for path in args.path):
         ap.error("mixed-balanced requires a mixed kernel path")
+    if args.mixed_head_grid and not args.mixed_balanced:
+        ap.error("mixed-head-grid requires --mixed-balanced")
     if (
         any(path in COMPACT_PATHS and path not in IN_KERNEL_FOLD_PATHS for path in args.path)
         and not args.compact_library

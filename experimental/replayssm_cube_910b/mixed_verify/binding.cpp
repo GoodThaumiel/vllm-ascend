@@ -35,7 +35,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
             const at::Tensor& base, const at::Tensor& length, const at::Tensor& out,
             const at::Tensor& status, const at::Tensor& zeros, const at::Tensor& scratch,
             int64_t cores, bool packed_panel, bool suffix_history, bool bulk_qkv, bool balance_heads, int64_t aiv_ablation,
-            std::optional<at::Tensor> flush, std::optional<at::Tensor> tokenOffsets) {
+            std::optional<at::Tensor> flush, std::optional<at::Tensor> tokenOffsets, bool expand_head_grid) {
   const bool packedTokens = tokenOffsets.has_value();
   const auto rank = packedTokens ? 3 : 4;
   TORCH_CHECK(q.device().is_privateuseone() && q.dim() == rank && v.dim() == rank,
@@ -50,6 +50,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   TORCH_CHECK(b >= 1 && b <= 256 && ((hk == 4 && hv == 12) || (hk == 16 && hv == 32)),
               "expected B1..256 and 27B TP4 or 9B TP1");
   TORCH_CHECK(cores >= 1 && cores <= 20, "cores must be 1..20 on 910B4");
+  TORCH_CHECK(!expand_head_grid || balance_heads, "An expanded grid requires value-head balancing");
   TORCH_CHECK(packed_panel || (!suffix_history && !bulk_qkv), "AIV ablations require the packed panel");
   TORCH_CHECK(!suffix_history || !bulk_qkv, "Run suffix history and bulk QKV as separate ablations");
   TORCH_CHECK(aiv_ablation >= 0 && aiv_ablation <= (kMaxTokens == 8 ? 7 : 6), "Invalid AIV ablation");
@@ -59,7 +60,7 @@ void Verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   const auto numSlots = checkpoint.size(0), numRingSlots = d.size(0);
   TORCH_CHECK(numSlots > 1 && numSlots <= UINT32_MAX && numRingSlots > 1 && numRingSlots <= 1024,
               "checkpoint slots must fit uint32; ring slots must be 2..1024");
-  const auto blocks = std::min(cores, b * hk);
+  const auto blocks = std::min(cores, b * (expand_head_grid ? hv : hk));
   auto expect = [&](const at::Tensor& t, at::IntArrayRef shape, at::ScalarType dtype, const char* name) {
     TORCH_CHECK(t.device() == q.device() && t.is_contiguous() && t.sizes() == shape && t.scalar_type() == dtype,
                 name, " has wrong device, contiguity, shape, or dtype");
@@ -125,7 +126,8 @@ TORCH_LIBRARY(replayssm_mix_910b, m) {
         "Tensor(a!) d, Tensor(b!) keys, Tensor(c!) gates, Tensor slots, Tensor ring_slots, "
         "Tensor positions, Tensor bases, Tensor lengths, Tensor(d!) out, Tensor(e!) status, "
         "Tensor zeros, Tensor(f!) scratch, int cores, bool packed_panel=False, "
-        "bool suffix_history=False, bool bulk_qkv=False, bool balance_heads=False, int aiv_ablation=0, Tensor? flush=None, Tensor? token_offsets=None) -> ()");
+        "bool suffix_history=False, bool bulk_qkv=False, bool balance_heads=False, int aiv_ablation=0, "
+        "Tensor? flush=None, Tensor? token_offsets=None, bool expand_head_grid=False) -> ()");
 #ifdef REPLAYSSM_ROOFLINE_CALIBRATION
   m.def("roofline_vector_(Tensor(a!) out, int repeats) -> ()");
 #endif
