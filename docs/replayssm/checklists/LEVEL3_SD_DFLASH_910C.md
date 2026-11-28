@@ -31,6 +31,7 @@ Set `TARGET` and `DRAFT` to the complete local model paths. Set `TP` and
 `ASCEND_RT_VISIBLE_DEVICES` together with `MAX_SEQS=64` for 9B and
 `MAX_SEQS=32` for 27B. Use the same serve flags and same die(s) for both paths.
 Set `EXTRA='{}'` for Native. For Replay use the additional config shown below.
+Use a separate `VLLM_CACHE_ROOT` for each source version, mode and K.
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -176,3 +177,18 @@ The C1 smoke is insufficient evidence of correct draft cache addressing.
 Artifacts are `dflash-9b-native-k7.ojFKVi` and
 `dflash-9b-replay-k7.UhgQ6m`. A separate diagnostic checks the per-group
 slot mappings and active cache layout without changing the checkpoint.
+
+The Replay slot diagnostic `dflash-9b-replay-k7.5zWf7V` reproduced the
+C8 scatter failure. Logged live slots were within bounds, with an
+interleaved full-attention cache and dense sliding-layer cache views.
+The separate `horizon-die13.Qozz2D/probe-dflash-scatter` probe used
+64 BF16 token rows and 1,024 pages on die 13. It matched written K and V
+exactly in both eager and graph replay for contiguous and interleaved
+views. These checks exercised the allocator stride but not server graph
+input lifetimes. In `c0f10e4`, dummy capture used the original context
+mapping tensor and the first request rebound it to a per-layer list.
+`84d8ae3` binds the list before graph capture and masks the unused
+context slots at replay. The first retry, `dflash-9b-replay-k7.cJlvH4`,
+stopped before ACLGraph capture in a reused npugraph_ex AOT cache with
+an argument arity mismatch. The clean-cache retry uses a cache root
+specific to source version, mode and K.
