@@ -1329,3 +1329,65 @@ B1/2/3/5/16/18。七份全 flush 报告均通过 eager 与图回放，
 劣化，继续用整组轮转作为默认。混合 flush 的 27B 网格
 复测中止，之后 27B 验收由用户在另一台服务器进行。
 原始报告为 Blue2 `horizon-die13.Qozz2D/head-grid-results.hdGI4M`。
+
+#### 9B TP1 MTP3 TextVQA 服务负载
+
+Blue2 逻辑 die 13，Ascend910_9362、CANN 9.2.1、
+torch-npu 2.10.0.post7、vLLM 0.30.0+empty，vLLM Ascend 源码
+`e2a0931f` 加同一份 target graph Event 采集。对照 native
+与 mixed verify + fused compact L8，BF16 模型、conv cache 与
+checkpoint，FP16 D/K、FP32 G。mixed binding/kernel SHA-256
+为 `6a9b180fab0039f25ef3105f83f30860f02c660341629ce1b89dd77468cf744a`
+和 `a354452304e6eed7c6402f62aca9168f1b8f2b5ae7df000d120808ede8c91298`。
+
+各模式在同一 die 顺序启动，`max-model-len=4608`、
+`max-num-seqs=256`、`max-num-batched-tokens=8192`、显存利用率
+0.85，关闭 prefix cache、异步调度和多模态 processor cache。
+启用 chunked prefill，target 为 FULL_DECODE_ONLY，MTP3 proposer
+为 eager。每条压测请求使用一张不同的本地公开 TextVQA 照片、
+原图问题和补齐长度的背景文本。预估视觉 token 各为 320–672。
+HTTP 流式采集首段非空输出和完成时刻，使用服务返回的 token
+数核验模型侧总输入约 4k、输出 400。先按 80 条并发 C80，
+再按 256 条并发 C256，每种负载各一轮。此外每模式单独回答
+32 个无补长的 TextVQA 问题，保留 top-5 logprobs。
+
+Native 基线 C80/C256 分别通过 80/256 个请求，模型侧实际输入
+中位数均为 3980 token，每请求输出 400。KV 池为 418,176 token。
+两组峰值活跃 decode 行为 80/94，草稿接受率为 81.92%/81.04%。
+纯 decode 的 C80、B80（320 有效候选，图形状 128 行 / 512
+token）记录 71 次，target p50 为 89.73 ms。C256 的 B94
+同图形状记录 54 次，p50 为 96.58 ms。
+
+C80 在同实际 B80、320 个候选和相同捕获图时，native
+target p50/p90 为 89.73/89.96 ms（71 次），L8 为
+87.43/88.00 ms（72 次），分别快 2.56%/2.18%。
+Replay 行级 flush 率为 7574/7575，草稿接受率为 82.11%
+（native 81.92%）。客户端 TPOT p50 为 74.41→75.43 ms，
+单轮未观察到同幅度的端到端收益。
+
+| 客户端并发 / 路径 | 成功 | 输出 token/s | 峰值纯 decode 行 | TTFT p50/p90 (s) | TPOT p50/p90 (ms) | 请求 p50/p90 (s) | 抢占 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| C80 Native | 80/80 | 625.53 | 80 | 19.07/34.29 | 74.41/107.22 | 48.69/49.88 | 0 |
+| C80 Mixed L8 | 80/80 | 632.84 | 80 | 19.10/34.30 | 75.43/107.67 | 49.00/50.07 | 0 |
+| C256 Native | 256/256 | 637.79 | 94 | 73.29/136.10 | 128.13/145.44 | 129.12/158.93 | 11 |
+| C256 Mixed L8 | 256/256 | 662.73 | 142 | 61.98/126.40 | 184.04/202.16 | 139.77/152.63 | 8 |
+
+Replay 的 KV 池为 615,628 token（+47.2%）。C256 吞吐提高
+3.9%，TTFT p50 降 15.4%，请求 p90 降 4.0%。请求 p50 增
+8.3%，TPOT p50 增 43.6%，实际活跃批分布不同。两侧仅在
+B1 有至少五个样本的精确同形状切片，C256 数据属于
+容量和服务负载对照。两路都启用了 target Event 同步，Replay
+额外在设备计时区间外读取 flush；绝对 HTTP 数据仍需要关闭
+采集复验。C256 草稿接受率为 81.04%→82.01%。
+
+图文短答案子集两路均为 32/32，归一化后的答案全部一致，
+与数据集单参考答案字符串匹配均为 28/32。其中一条在第
+一个输出 token ID 分叉，native 与 Replay 的 top-1/top-2
+logprob 间距为 0.0 / 0.125。该小样本用于数值定位，
+长文本质量或 TextVQA 全集准确率仍待单独评估。
+本轮结束后 die 13 无残留进程。
+
+原始报告位于 Blue2 `horizon-die13.Qozz2D/textvqa-serve.bAZqfC`。
+同一父目录下的 `prepare_textvqa.py`、`textvqa_client.py`、
+`serve_textvqa_compare.sh` 和 `summarize_textvqa.py` 分别用于
+准备输入、发送请求、启动对照和按实际活跃批聚合。
