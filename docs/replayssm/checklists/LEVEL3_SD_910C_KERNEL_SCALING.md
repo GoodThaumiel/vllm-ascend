@@ -1029,3 +1029,72 @@ Native 高约 0.7%。目前证据是单次服务流量的整网差异，尚未�
 基线。C128/256 同活跃批、多模态、不同输入分布及 27B TP4
 整网仍需独立对照。原始文件位于 Blue2 的
 `horizon-die13.Qozz2D/matched.TuehSM`。
+
+### MTP5/7 宽窗口消融
+
+实验分支以 `180e0d4` 为基线。MTP5/7 的 target 分别验证
+6/8 token。Cube 投影沿用 16 列输出，每个 key head 的 K/Q
+分别占最多八列。有效窗口为 6 时，两段各清零末尾两列。
+AIV 使用完整 16 列 O(窗口) 候选递推，候选数学和 ring dtype
+沿用 MTP3。启用整组轮转、紧凑 token 输入和 verify 内折叠。
+短阈值分别为 L12 或 L16，物理 ring 均为 32。
+
+按显式缓冲预算估算，每个 AIV 为 183,840 B。宽模式中
+历史 K 常驻 `historyKeys_`，`historyRows_` 只存本 AIV
+的 64 列 D tile。另计编译器临时区。RHS 保持 Cube 的 16 列
+fractal，从投影 scratch 进 UB 的 64 B 行可连续搬运。设计核对
+引用 CANNBot 的 tiling 及 API 指南中的 A2/A3 UB 与 DataCopy 对齐约束。
+
+```bash
+P=experimental/replayssm_cube_910b/mixed_verify
+BUILD="$P/build-wide-a3"
+cmake -S "$P" -B "$BUILD" -DSOC_VERSION=ascend910_9362 \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.1 \
+  -DREPLAYSSM_VERIFY_MAX_TOKENS=8 -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build "$BUILD" -j8
+MIX="$BUILD/libreplayssm_sd_mix_torch.so"
+python3 scripts/replayssm/diagnose_sd_sequence.py --mixed-library "$MIX" \
+  --geometry 9b --tp 1 --window 6 --logical-limit 12 \
+  --steps 60 --accepted 6,1,5,2,4,3 --gate-max .002 --beta-native-precision \
+  --atol .001 --rtol .03 --output /tmp/replayssm-mtp5-sequence.json
+```
+
+首轮 CANN 9.2.1 构建的 device AIC/AIV 编译成功，但
+legacy CMake 的 `ascendc_compile_definitions` 没有传入 host
+BiSheng 编译。通过 `-forward-options-to-host-compiler` 明确传入
+同一窗口宏后重建成功，Python 加载查询 `max_tokens() = 8`。
+宽库 binding 和 kernel 的 SHA-256 分别为
+`d49f42f9a7989064539ee9ed9266c45fc20cbdd046441d2e68e81d263484f9cb`
+和 `e8f4a67dcd7ab627934c0725a62f437059a91760fc91608e765402111782b909`。
+
+服务 A/B 按相同 MTP 设置比较。9B TP1 的单份 BF16 SSM
+checkpoint payload 为 24 MiB/请求，27B TP4 为 18 MiB/请求/卡。
+Native 若为 MTP3→5 / 7 多保留 2 / 4 个完整状态槽，
+对应 9B 的 48 / 96 MiB 和 27B 的 36 / 72 MiB 增量，
+未计入页对齐、卷积和共享 KV 预算。Replay 的独立 ring 容量与
+物理窗口长度可以相同。实际收益以启动时 KV token 容量、
+有效 decode 并发、草稿在各位置的接受率和 token/s 为准。
+
+#### 宽窗口连续正确性
+
+`180e0d454`，逻辑 die 13，Ascend910_9362、CANN 9.2.1、
+torch-npu 2.10.0.post7、vLLM 0.30.0+empty。使用同一主扩展 cursor
+与上述宽库。B1 每组 60 个连续窗口、seed 42、BF16 beta 往返、
+gate 上限 0.002，输出与本地参考容差 `atol=.001, rtol=.03`。
+T6 接受计数模式为 6/1/5/2/4/3，T8 为 8/1/7/2/6/3/4，
+均覆盖拒绝后的 ring 复用和跨环尾。
+
+| 几何 / MTP / 阈值 | 折叠次数 | 最大历史 | 输出对本步参考 max abs | 输出对 FP64 dense max abs |
+|---|---:|---:|---:|---:|
+| 9B TP1 / 5 / L12 | 59 | 6 | 3.05e-5 | 1.53e-4 |
+| 9B TP1 / 5 / L22 | 15 | 15 | 1.53e-5 | 1.22e-4 |
+| 9B TP1 / 7 / L16 | 59 | 8 | 3.05e-5 | 1.83e-4 |
+| 9B TP1 / 7 / L24 | 25 | 12 | 3.05e-5 | 1.22e-4 |
+| 27B TP4 单 rank / 5 / L12 | 59 | 6 | 3.05e-5 | 1.53e-4 |
+| 27B TP4 单 rank / 7 / L16 | 59 | 8 | 3.05e-5 | 1.41e-4 |
+
+六组均通过，无 cursor / verify 状态错误。D ring 最大差为
+1.22e-4，K/G 一致，checkpoint 最大差 9.77e-4。短阈值在
+9B 的这两组输入仍增加相对 FP64 的累计舍入。该阶段在设备上
+逐窗口验证精度，服务 graph 和时延用独立负载实测。原始 JSON
+位于 Blue2 的 `horizon-die13.Qozz2D/wide-sequence.B6D22r`。
