@@ -785,6 +785,10 @@ B256 为 60.30 和 58.02 µs。各 25 次回放，运行中常规
 整组轮转 verify，数据存于
 `/home/lmt_infer/replayssm/serve-stagger.qZP3qP`。
 算子报告位于 `cursor-stagger.o9PMAu/results`。
+上述服务目录中，短/长文本服务对照的错峰实验组在启动阶段于
+`npugraph_ex` 生成的执行函数报 `too many values to unpack
+(expected 20)`，隔离重试也没有产出 HTTP 对照结果。
+错峰收益目前只取自合成 cursor 探针。
 
 ### 按两条历史记录批量广播的折叠消融
 
@@ -1269,3 +1273,28 @@ B20→21 的 p50 从 190.39 增至 226.37 µs（+18.9%），仍低于
 实际的带宽瓶颈。原始扫批及复测/校准记录位于 Blue2 的
 `horizon-die13.Qozz2D/candidate-columns-scan.3aEQf5` 和
 `horizon-die13.Qozz2D/roof-steady.gQak0U`。
+
+#### MTP7 候选列的服务对照
+
+`e2a0931f`（外加与宽窗口对照相同的 Event 采集 patch），Blue2
+逻辑 die 13、Ascend910_9362、CANN 9.2.1、torch-npu 2.10.0.post7、
+vLLM 0.30.0+empty。9B TP1 / MTP7 / L16，BF16 checkpoint、
+FP16 D/K、FP32 G，物理 ring 32。两组同库、同 4000/400 文本、
+相同 FULL_DECODE_ONLY 配置，一轮原递推 4 后一轮候选列 7。
+两组启动、图捕获及 96-token 冒烟通过，KV 均为 615,321 token。
+
+固定 B48、384 个有效候选、64 行/512 token 图，每侧 35 个
+样本。target graph p50/p90 从 82.872/84.076 ms 降至
+81.825/83.081 ms（1.26%/1.18%）。两侧按行 flush 均约 99.97%，
+该负载属于短历史全折叠。C48 均通过，HTTP p50/p90 从
+30.426/31.704 s 降至 30.207/31.426 s。吞吐按整秒统计，
+1 秒差值不足以单独证明 HTTP 层的收益。
+
+C128 两组均为 128/128，完成 51,200 token 各用了 78 秒
+（约 656 tok/s），均达到 125 行峰值纯 decode。HTTP p50/p90
+从 73.292/76.612 s 到 73.035/76.438 s。除 B1–2 外，同
+实际行、候选数和图形状的切片没有每侧至少五个样本的对照。
+平均接受草稿数为原版 4.395、候选列 4.405。C128 单轮不能
+证明吞吐增加，也不能直接归因同活跃大批时延。原始数据在
+Blue2 `horizon-die13.Qozz2D/columns-serve.gzrlft`，两组结束
+后 die 13 无残留进程。
