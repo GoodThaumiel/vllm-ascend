@@ -272,6 +272,27 @@ Artifacts are `dflash-9b-native-k4.FTbves`,
 `dflash-9b-replay-k4.0S5PHa`, `dflash-9b-native-k7.oSaKte`,
 and `dflash-9b-replay-k7.El0FDU`.
 
+### 9B TP1, DFlash K6
+
+Both modes at `84d8ae3` used die 13, max-seqs 64, FULL sizes
+7/28/56/112/448 and the same mixed library. Replay's logical threshold
+was 23. All seven cases completed and independent target and draft
+FULL replay were confirmed. No per-row flush trace was collected.
+
+| Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 44.69 | 32.90 | 21.42 | 29.40 |
+| 8 | 259.96 | 214.91 | 28.04 | 33.33 |
+| 32 | 559.09 | 513.51 | 51.85 | 54.38 |
+| 64 | 930.52 | 916.72 | 60.71 | 60.67 |
+
+At C8, Native and Replay accepted 8008/11154 and 7991/11088 on GSM8K,
+3561/15528 and 3593/15330 on general text, and 731/1752 and 734/1752
+on prompt-only JSON. Both returned parseable JSON for 16/16 samples.
+At C64, TPOT p50 was essentially equal and Replay throughput was 1.5%
+lower in this run. Artifacts are `dflash-9b-native-k6.FCmswx` and
+`dflash-9b-replay-k6.6YXAlY`.
+
 ### 27B TP2, DFlash2 K1
 
 Both modes at `6b02f37` used dies 11 and 15, max-seqs 32 and FULL sizes
@@ -292,6 +313,26 @@ and 16/16 JSON responses parsed in both modes. Compared with K4 and K6,
 Replay at K1 lost throughput at C32 for this prompt suite. No per-row
 flush trace was collected. Artifacts are `dflash-27b-native-k1.rM6O1W`
 and `dflash-27b-replay-k1.3pe2dj`.
+
+### 27B TP2, DFlash2 K2
+
+Both modes at `6b02f37` used dies 11 and 15, max-seqs 32, FULL sizes
+3/12/24/48/96 and the same mixed library. Replay used logical threshold 19.
+Both passed the six cases and logged independent target and draft FULL
+replay. No per-row flush trace was collected. One run per mode.
+
+| Concurrency | Native tok/s | Replay tok/s | Native TPOT p50 (ms) | Replay TPOT p50 (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 42.49 | 37.76 | 22.08 | 24.95 |
+| 8 | 239.39 | 221.29 | 30.20 | 32.72 |
+| 32 | 691.67 | 674.24 | 40.58 | 41.75 |
+
+At C8 the Native and Replay acceptance rates were 92.79% and 92.66%
+on GSM8K, 58.20% and 57.68% on text, and 71.86% and 72.15% on
+prompt-only JSON. All requests completed and both returned 16/16
+parseable JSON responses. K2 delivered higher absolute C32 throughput
+than K1, K4 and K6 in both modes. Artifacts are
+`dflash-27b-native-k2.J63b9J` and `dflash-27b-replay-k2.Xm63ZH`.
 
 ### Native ragged state-slot diagnostic
 
