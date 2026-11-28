@@ -152,11 +152,14 @@ def test_forward_non_pa_branches_receive_contiguous_kv(branch, contiguous, cross
     torch.testing.assert_close(output, torch.ones_like(query))
 
 
-@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("v2,noncausal_draft", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("use_pa", [False, True])
-def test_graph_workspace_and_task_preserve_fia_layout_contract(v2, use_pa):
+def test_graph_workspace_and_task_preserve_fia_layout_contract(v2, noncausal_draft, use_pa):
     impl = _make_impl()
     metadata = _make_metadata(AscendAttentionState.DecodeOnly if use_pa else AscendAttentionState.PrefillNoCache)
+    if noncausal_draft:
+        impl.sliding_window = 2048
+        metadata.causal = False
     query = torch.zeros(3, 2, 4)
     key, value = _strided_kv(), _strided_kv()
     if use_pa:
@@ -170,7 +173,7 @@ def test_graph_workspace_and_task_preserve_fia_layout_contract(v2, use_pa):
     )
     op_name = "npu_fused_infer_attention_score_v2" if v2 else "npu_fused_infer_attention_score"
     with (
-        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False)),
+        patch.object(attn_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=noncausal_draft)),
         patch.object(attn_module.torch_npu, op_name, create=True),
         patch.object(attn_module.torch_npu, workspace_name, create=True) as get_workspace,
         patch.object(attn_module, "get_capture_resource", side_effect=lambda _, factory, *args: factory()),
@@ -187,6 +190,10 @@ def test_graph_workspace_and_task_preserve_fia_layout_contract(v2, use_pa):
     expected_value = impl.value_cache.view(2, 3, 4) if use_pa else value
     for kwargs in (workspace_kwargs, task_kwargs):
         assert kwargs["block_table"] is (metadata.block_tables if use_pa else None)
+        if noncausal_draft:
+            assert kwargs["sparse_mode"] == 0
+            assert kwargs["atten_mask"] is None
+            assert kwargs["pre_tokens"] == kwargs["next_tokens"] == attn_module.SWA_INT_MAX
         for name, original in (("key", expected_key), ("value", expected_value)):
             assert kwargs[name].is_contiguous() == (not use_pa)
             torch.testing.assert_close(kwargs[name], original)
